@@ -55,7 +55,7 @@ ID:
 
 An example routing configuration:
 
-```
+```sh
 baidu:
         Path("/baidu")
         -> setRequestHeader("Host", "www.baidu.com")
@@ -142,7 +142,8 @@ HTTP->HTTPS redirects if skipper is started with `-kubernetes-https-redirect`.
 
 Dataclients:
 
-- [eskip-file](../data-clients/eskip-file.md)
+- [eskip file](../data-clients/eskip-file.md)
+- [remote eskip](../data-clients/eskip-remote.md)
 - [route string](../data-clients/route-string.md)
 - [kubernetes](../data-clients/kubernetes.md)
 - [etcd](../data-clients/etcd.md)
@@ -221,7 +222,7 @@ The route matching logic can be summed up as follows:
 
 2. _If_ step #1 matches multiple routes, which means there are multiple
    routes in the same position of the path tree, and all other predicates
-   match the request, too, then the route with the highest 
+   match the request, too, then the route with the highest
    [weight](../reference/predicates.md#weight) is matched.
 
     * this is an O(n) lookup, but only on the same leaf
@@ -235,16 +236,39 @@ The route matching logic can be summed up as follows:
 
 See more details about the predicates here: [Predicates](../reference/predicates.md).
 
-## Building skipper
+### Route creation
 
-We use Go modules to build skipper, therefore you need [Go](https://golang.org/dl) version `>= 1.11`.
+Skipper has two kind of routes:
+
+1. [eskip.Route](https://pkg.go.dev/github.com/zalando/skipper/eskip#Route)
+2. [routing.Route](https://pkg.go.dev/github.com/zalando/skipper/routing#Route)
+
+An `eskip.Route` is the parsed representation of user input. This will
+be converted to a `routing.Route`, when the routing table is built. A
+tree of `routing.Route` will be used to match an incoming Request to a route.
+
+Route creation steps:
+
+1. Skipper's route creation starts with the [Dataclient](https://pkg.go.dev/github.com/zalando/skipper/routing#DataClient)
+   to fetch routes (`[]*eskip.Route`).
+2. These will be first processed by
+   `[]routing.PreProcessor`. [PreProcessors](https://pkg.go.dev/github.com/zalando/skipper/routing#PreProcessor) are able to add, remove,
+   modify all `[]*eskip.Route`.
+3. After that `[]*eskip.Route` are converted to `[]*routing.Route`.
+4. `[]routing.PostProcessor` are executed. [PostProcessors](https://pkg.go.dev/github.com/zalando/skipper/routing#PostProcessor) are a ble to
+   add, remove, modify all `[]*routing.Route`.
+5. Last the active routing table is swapped. Now all incoming requests
+   are handled by the new routing table
+
+
+## Building skipper
 
 ### Local build
 
 To get a local build of skipper for your CPU architecture, you can run
 `make skipper`. To cross compile to non Linux platforms you can use:
 
-- `make build.osx` for Mac OS X (amd64)
+- `make build.darwin` for Mac OS X (amd64)
 - `make build.windows` for Windows (amd64)
 
 The local build will write into `./bin/` directory.
@@ -270,7 +294,7 @@ use a local `eskip` file on disk and use `-routes-file=<filepath>`.
 
 Example:
 
-```
+```sh
 ./bin/skipper -address :9999 -inline-routes 'r: * -> setQuery("lang", "pt") -> "http://127.0.0.1:8080/"'
 ```
 
@@ -282,7 +306,7 @@ local browser.
 
 Local backend example:
 
-```
+```sh
 ./bin/skipper -address :8080 -inline-routes 'r: * -> inlineContent("Hello world!") -> status(200) -> <shunt>'
 ```
 
@@ -292,7 +316,7 @@ Mac OS X computers.
 
 Example client call to our defined proxy:
 
-```
+```sh
 % curl localhost:8080 -v
 * Rebuilt URL to: localhost:8080/
 *   Trying ::1...
@@ -328,7 +352,6 @@ address: ":8080"
 enable-ratelimits: true
 experimental-upgrade: true
 metrics-exp-decay-sample: true
-lb-healthcheck-interval: "3s"
 metrics-flavour: ["codahale","prometheus"]
 enable-connection-metrics: true
 whitelisted-healthcheck-cidr: "172.20.0.0/16"
@@ -339,7 +362,7 @@ inline-routes: 'r: * -> inlineContent("Hello world!") -> status(200) -> <shunt>'
 Considering that this file would be named `config.yaml` you can use it to populate
 the flags using the `config-file` flag:
 
-```
+```sh
 ./bin/skipper -config-file=config.yaml
 ```
 
@@ -354,7 +377,7 @@ memory, you can use the `-support-listener`, which defaults to port
 
 Example:
 
-```
+```sh
 % curl localhost:9911/routes
 r: *
   -> setQuery("lang", "pt")
@@ -386,14 +409,14 @@ If there is more than 1024 routes used, then the paging the results is
 possible with the `offset` and `limit` query parameters:
 
 ```
-curl locahost:9911/routes?offset=2048&limit=512
+curl localhost:9911/routes?offset=2048&limit=512
 ```
 
 ### Route IDs
 
 In the following example **rid** is the route ID:
 
-```
+```sh
 % curl localhost:9911/routes
 rid: *
   -> setQuery("lang", "pt")

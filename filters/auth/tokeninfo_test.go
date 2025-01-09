@@ -2,189 +2,230 @@ package auth
 
 import (
 	"encoding/json"
+	"fmt"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
+	"sync/atomic"
 	"testing"
 	"time"
 
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 	"github.com/zalando/skipper/eskip"
 	"github.com/zalando/skipper/filters"
+	"github.com/zalando/skipper/filters/annotate"
+	"github.com/zalando/skipper/filters/filtertest"
 	"github.com/zalando/skipper/proxy/proxytest"
 )
 
 const testAuthTimeout = 100 * time.Millisecond
 
+func newOAuthTokeninfoSpec(authType string, options TokeninfoOptions) filters.Spec {
+	switch authType {
+	case filters.OAuthTokeninfoAnyScopeName:
+		return NewOAuthTokeninfoAnyScopeWithOptions(options)
+	case filters.OAuthTokeninfoAllScopeName:
+		return NewOAuthTokeninfoAllScopeWithOptions(options)
+	case filters.OAuthTokeninfoAnyKVName:
+		return NewOAuthTokeninfoAnyKVWithOptions(options)
+	case filters.OAuthTokeninfoAllKVName:
+		return NewOAuthTokeninfoAllKVWithOptions(options)
+	default:
+		panic("unsupported auth type: " + authType)
+	}
+}
+
 func TestOAuth2Tokeninfo(t *testing.T) {
+	const N = 5
+
 	for _, ti := range []struct {
-		msg         string
-		authType    string
-		authBaseURL string
-		args        []interface{}
-		hasAuth     bool
-		auth        string
-		expected    int
+		msg            string
+		authType       string
+		options        TokeninfoOptions
+		args           []interface{}
+		auth           string
+		expected       int
+		expectRequests int32
 	}{{
-		msg:      "uninitialized filter, no authorization header, scope check",
-		authType: filters.OAuthTokeninfoAnyScopeName,
-		expected: http.StatusNotFound,
+		msg:            "oauthTokeninfoAnyScope: invalid token",
+		authType:       filters.OAuthTokeninfoAnyScopeName,
+		args:           []interface{}{"not-matching-scope"},
+		auth:           "invalid-token",
+		expected:       http.StatusUnauthorized,
+		expectRequests: N,
 	}, {
-		msg:         "invalid token",
-		authType:    filters.OAuthTokeninfoAnyScopeName,
-		authBaseURL: testAuthPath,
-		args:        []interface{}{"not-matching-scope"},
-		hasAuth:     true,
-		auth:        "invalid-token",
-		expected:    http.StatusUnauthorized,
+		msg:            "oauthTokeninfoAnyScope: one invalid scope",
+		authType:       filters.OAuthTokeninfoAnyScopeName,
+		args:           []interface{}{"not-matching-scope"},
+		auth:           testToken,
+		expected:       http.StatusForbidden,
+		expectRequests: N,
 	}, {
-		msg:         "invalid scope",
-		authType:    filters.OAuthTokeninfoAnyScopeName,
-		authBaseURL: testAuthPath,
-		args:        []interface{}{"not-matching-scope"},
-		hasAuth:     true,
-		auth:        testToken,
-		expected:    http.StatusForbidden,
+		msg:            "oauthTokeninfoAnyScope: two invalid scopes",
+		authType:       filters.OAuthTokeninfoAnyScopeName,
+		args:           []interface{}{"not-matching-scope1", "not-matching-scope2"},
+		auth:           testToken,
+		expected:       http.StatusForbidden,
+		expectRequests: N,
 	}, {
-		msg:         "oauthTokeninfoAnyScope: valid token, one valid scope",
-		authType:    filters.OAuthTokeninfoAnyScopeName,
-		authBaseURL: testAuthPath,
-		args:        []interface{}{testScope},
-		hasAuth:     true,
-		auth:        testToken,
-		expected:    http.StatusOK,
+		msg:            "oauthTokeninfoAnyScope: missing token",
+		authType:       filters.OAuthTokeninfoAnyScopeName,
+		args:           []interface{}{testScope},
+		auth:           "",
+		expected:       http.StatusUnauthorized,
+		expectRequests: 0,
 	}, {
-		msg:         "OAuthTokeninfoAnyScopeName: valid token, one valid scope, one invalid scope",
-		authType:    filters.OAuthTokeninfoAnyScopeName,
-		authBaseURL: testAuthPath,
-		args:        []interface{}{testScope, "other-scope"},
-		hasAuth:     true,
-		auth:        testToken,
-		expected:    http.StatusOK,
+		msg:            "oauthTokeninfoAnyScope: valid token, one valid scope",
+		authType:       filters.OAuthTokeninfoAnyScopeName,
+		args:           []interface{}{testScope},
+		auth:           testToken,
+		expected:       http.StatusOK,
+		expectRequests: N,
 	}, {
-		msg:         "oauthTokeninfoAllScope(): valid token, valid scopes",
-		authType:    filters.OAuthTokeninfoAllScopeName,
-		authBaseURL: testAuthPath,
-		args:        []interface{}{testScope, testScope2, testScope3},
-		hasAuth:     true,
-		auth:        testToken,
-		expected:    http.StatusOK,
+		msg:            "oauthTokeninfoAnyScope: valid token, one valid scope, one invalid scope",
+		authType:       filters.OAuthTokeninfoAnyScopeName,
+		args:           []interface{}{testScope, "other-scope"},
+		auth:           testToken,
+		expected:       http.StatusOK,
+		expectRequests: N,
 	}, {
-		msg:         "oauthTokeninfoAllScope(): valid token, one valid scope, one invalid scope",
-		authType:    filters.OAuthTokeninfoAllScopeName,
-		authBaseURL: testAuthPath,
-		args:        []interface{}{testScope, "other-scope"},
-		hasAuth:     true,
-		auth:        testToken,
-		expected:    http.StatusForbidden,
+		msg:            "oauthTokeninfoAnyScope: valid token, one invalid scope, one valid scope",
+		authType:       filters.OAuthTokeninfoAnyScopeName,
+		args:           []interface{}{"other-scope", testScope},
+		auth:           testToken,
+		expected:       http.StatusOK,
+		expectRequests: N,
 	}, {
-		msg:         "anyKV(): invalid key",
-		authType:    filters.OAuthTokeninfoAnyKVName,
-		authBaseURL: testAuthPath,
-		args:        []interface{}{"not-matching-scope"},
-		hasAuth:     true,
-		auth:        testToken,
-		expected:    http.StatusOK,
+		msg:            "oauthTokeninfoAllScope: valid token, all valid scopes",
+		authType:       filters.OAuthTokeninfoAllScopeName,
+		args:           []interface{}{testScope, testScope2, testScope3},
+		auth:           testToken,
+		expected:       http.StatusOK,
+		expectRequests: N,
 	}, {
-		msg:         "anyKV(): valid token, one valid key, wrong value",
-		authType:    filters.OAuthTokeninfoAnyKVName,
-		authBaseURL: testAuthPath,
-		args:        []interface{}{testKey, "other-value"},
-		hasAuth:     true,
-		auth:        testToken,
-		expected:    http.StatusForbidden,
+		msg:            "oauthTokeninfoAllScope: valid token, two valid scopes",
+		authType:       filters.OAuthTokeninfoAllScopeName,
+		args:           []interface{}{testScope, testScope2},
+		auth:           testToken,
+		expected:       http.StatusOK,
+		expectRequests: N,
 	}, {
-		msg:         "anyKV(): valid token, one valid key value pair",
-		authType:    filters.OAuthTokeninfoAnyKVName,
-		authBaseURL: testAuthPath,
-		args:        []interface{}{testKey, testValue},
-		hasAuth:     true,
-		auth:        testToken,
-		expected:    http.StatusOK,
+		msg:            "oauthTokeninfoAllScope: valid token, one valid scope",
+		authType:       filters.OAuthTokeninfoAllScopeName,
+		args:           []interface{}{testScope},
+		auth:           testToken,
+		expected:       http.StatusOK,
+		expectRequests: N,
 	}, {
-		msg:         "anyKV(): valid token, one valid kv, multiple key value pairs1",
-		authType:    filters.OAuthTokeninfoAnyKVName,
-		authBaseURL: testAuthPath,
-		args:        []interface{}{testKey, testValue, "wrongKey", "wrongValue"},
-		hasAuth:     true,
-		auth:        testToken,
-		expected:    http.StatusOK,
+		msg:            "oauthTokeninfoAllScope: valid token, one valid scope, one invalid scope",
+		authType:       filters.OAuthTokeninfoAllScopeName,
+		args:           []interface{}{testScope, "other-scope"},
+		auth:           testToken,
+		expected:       http.StatusForbidden,
+		expectRequests: N,
 	}, {
-		msg:         "anyKV(): valid token, one valid kv, multiple key value pairs2",
-		authType:    filters.OAuthTokeninfoAnyKVName,
-		authBaseURL: testAuthPath,
-		args:        []interface{}{"wrongKey", "wrongValue", testKey, testValue},
-		hasAuth:     true,
-		auth:        testToken,
-		expected:    http.StatusOK,
+		msg:            "oauthTokeninfoAnyKV: valid token, one valid key, wrong value",
+		authType:       filters.OAuthTokeninfoAnyKVName,
+		args:           []interface{}{testKey, "other-value"},
+		auth:           testToken,
+		expected:       http.StatusForbidden,
+		expectRequests: N,
 	}, {
-		msg:         "anyKV(): valid token, one valid kv, same key multiple times should pass",
-		authType:    filters.OAuthTokeninfoAnyKVName,
-		authBaseURL: testAuthPath,
-		args:        []interface{}{testKey, testValue, testKey, "someValue"},
-		hasAuth:     true,
-		auth:        testToken,
-		expected:    http.StatusOK,
+		msg:            "oauthTokeninfoAnyKV: valid token, one valid key value pair",
+		authType:       filters.OAuthTokeninfoAnyKVName,
+		args:           []interface{}{testKey, testValue},
+		auth:           testToken,
+		expected:       http.StatusOK,
+		expectRequests: N,
 	}, {
-		msg:         "allKV(): invalid key",
-		authType:    filters.OAuthTokeninfoAllKVName,
-		authBaseURL: testAuthPath,
-		args:        []interface{}{"not-matching-scope"},
-		hasAuth:     true,
-		auth:        testToken,
-		expected:    http.StatusNotFound,
+		msg:            "oauthTokeninfoAnyKV: valid token, one valid kv, multiple key value pairs1",
+		authType:       filters.OAuthTokeninfoAnyKVName,
+		args:           []interface{}{testKey, testValue, "wrongKey", "wrongValue"},
+		auth:           testToken,
+		expected:       http.StatusOK,
+		expectRequests: N,
 	}, {
-		msg:         "allKV(): valid token, one valid key, wrong value",
-		authType:    filters.OAuthTokeninfoAllKVName,
-		authBaseURL: testAuthPath,
-		args:        []interface{}{testKey, "other-value"},
-		hasAuth:     true,
-		auth:        testToken,
-		expected:    http.StatusForbidden,
+		msg:            "oauthTokeninfoAnyKV: valid token, one valid kv, multiple key value pairs2",
+		authType:       filters.OAuthTokeninfoAnyKVName,
+		args:           []interface{}{"wrongKey", "wrongValue", testKey, testValue},
+		auth:           testToken,
+		expected:       http.StatusOK,
+		expectRequests: N,
 	}, {
-		msg:         "allKV(): valid token, one valid key value pair",
-		authType:    filters.OAuthTokeninfoAllKVName,
-		authBaseURL: testAuthPath,
-		args:        []interface{}{testKey, testValue},
-		hasAuth:     true,
-		auth:        testToken,
-		expected:    http.StatusOK,
+		msg:            "oauthTokeninfoAnyKV: valid token, one valid kv, same key multiple times should pass",
+		authType:       filters.OAuthTokeninfoAnyKVName,
+		args:           []interface{}{testKey, testValue, testKey, "someValue"},
+		auth:           testToken,
+		expected:       http.StatusOK,
+		expectRequests: N,
 	}, {
-		msg:         "allKV(): valid token, one valid key value pair, check realm",
-		authType:    filters.OAuthTokeninfoAllKVName,
-		authBaseURL: testAuthPath,
-		args:        []interface{}{testRealmKey, testRealm, testKey, testValue},
-		hasAuth:     true,
-		auth:        testToken,
-		expected:    http.StatusOK,
+		msg:            "oauthTokeninfoAllKV: valid token, one valid key, wrong value",
+		authType:       filters.OAuthTokeninfoAllKVName,
+		args:           []interface{}{testKey, "other-value"},
+		auth:           testToken,
+		expected:       http.StatusForbidden,
+		expectRequests: N,
 	}, {
-		msg:         "allKV(): valid token, valid key value pairs",
-		authType:    filters.OAuthTokeninfoAllKVName,
-		authBaseURL: testAuthPath,
-		args:        []interface{}{testKey, testValue, testKey, testValue},
-		hasAuth:     true,
-		auth:        testToken,
-		expected:    http.StatusOK,
+		msg:            "oauthTokeninfoAllKV: valid token, one valid key value pair",
+		authType:       filters.OAuthTokeninfoAllKVName,
+		args:           []interface{}{testKey, testValue},
+		auth:           testToken,
+		expected:       http.StatusOK,
+		expectRequests: N,
 	}, {
-		msg:         "allKV(): valid token, one valid kv, multiple key value pairs1",
-		authType:    filters.OAuthTokeninfoAllKVName,
-		authBaseURL: testAuthPath,
-		args:        []interface{}{testKey, testValue, "wrongKey", "wrongValue"},
-		hasAuth:     true,
-		auth:        testToken,
-		expected:    http.StatusForbidden,
+		msg:            "oauthTokeninfoAllKV: valid token, one valid key value pair, check realm",
+		authType:       filters.OAuthTokeninfoAllKVName,
+		args:           []interface{}{testRealmKey, testRealm, testKey, testValue},
+		auth:           testToken,
+		expected:       http.StatusOK,
+		expectRequests: N,
 	}, {
-		msg:         "allKV(): valid token, one valid kv, multiple key value pairs2",
-		authType:    filters.OAuthTokeninfoAllKVName,
-		authBaseURL: testAuthPath,
-		args:        []interface{}{"wrongKey", "wrongValue", testKey, testValue},
-		hasAuth:     true,
-		auth:        testToken,
-		expected:    http.StatusForbidden,
+		msg:            "oauthTokeninfoAllKV: valid token, valid key value pairs",
+		authType:       filters.OAuthTokeninfoAllKVName,
+		args:           []interface{}{testKey, testValue, testKey, testValue},
+		auth:           testToken,
+		expected:       http.StatusOK,
+		expectRequests: N,
+	}, {
+		msg:            "oauthTokeninfoAllKV: valid token, one valid kv, multiple key value pairs1",
+		authType:       filters.OAuthTokeninfoAllKVName,
+		args:           []interface{}{testKey, testValue, "wrongKey", "wrongValue"},
+		auth:           testToken,
+		expected:       http.StatusForbidden,
+		expectRequests: N,
+	}, {
+		msg:            "oauthTokeninfoAllKV: valid token, one valid kv, multiple key value pairs2",
+		authType:       filters.OAuthTokeninfoAllKVName,
+		args:           []interface{}{"wrongKey", "wrongValue", testKey, testValue},
+		auth:           testToken,
+		expected:       http.StatusForbidden,
+		expectRequests: N,
+	}, {
+		msg:            "caches valid token",
+		authType:       filters.OAuthTokeninfoAnyScopeName,
+		options:        TokeninfoOptions{CacheSize: 1},
+		args:           []interface{}{testScope},
+		auth:           testToken,
+		expected:       http.StatusOK,
+		expectRequests: 1,
+	}, {
+		msg:            "does not cache invalid token",
+		authType:       filters.OAuthTokeninfoAnyScopeName,
+		options:        TokeninfoOptions{CacheSize: 1},
+		args:           []interface{}{testScope},
+		auth:           "invalid-token",
+		expected:       http.StatusUnauthorized,
+		expectRequests: N,
 	}} {
 		t.Run(ti.msg, func(t *testing.T) {
 			backend := httptest.NewServer(http.HandlerFunc(func(_ http.ResponseWriter, r *http.Request) {}))
+			defer backend.Close()
 
+			var authRequests int32
 			authServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				atomic.AddInt32(&authRequests, 1)
 
 				if r.URL.Path != testAuthPath {
 					w.WriteHeader(http.StatusNotFound)
@@ -197,45 +238,30 @@ func TestOAuth2Tokeninfo(t *testing.T) {
 					return
 				}
 
-				d := map[string]interface{}{
-					"uid":        testUID,
-					testRealmKey: testRealm,
-					"scope":      []string{testScope, testScope2, testScope3}}
-
-				e := json.NewEncoder(w)
-				if err := e.Encode(&d); err != nil {
-					t.Error(err)
-				}
+				fmt.Fprintf(w, `{"uid": "%s", "%s": "%s", "scope":["%s", "%s", "%s"], "expires_in": 600}`,
+					testUID, testRealmKey, testRealm, testScope, testScope2, testScope3)
 			}))
+			defer authServer.Close()
 
-			var spec filters.Spec
-			args := []interface{}{}
-			u := authServer.URL + ti.authBaseURL
-			switch ti.authType {
-			case filters.OAuthTokeninfoAnyScopeName:
-				spec = NewOAuthTokeninfoAnyScope(u, testAuthTimeout)
-			case filters.OAuthTokeninfoAllScopeName:
-				spec = NewOAuthTokeninfoAllScope(u, testAuthTimeout)
-			case filters.OAuthTokeninfoAnyKVName:
-				spec = NewOAuthTokeninfoAnyKV(u, testAuthTimeout)
-			case filters.OAuthTokeninfoAllKVName:
-				spec = NewOAuthTokeninfoAllKV(u, testAuthTimeout)
-			}
+			ti.options.URL = authServer.URL + testAuthPath
+			ti.options.Timeout = testAuthTimeout
 
-			args = append(args, ti.args...)
-			f, err := spec.CreateFilter(args)
+			t.Logf("ti.options: %#v", ti.options)
+
+			spec := newOAuthTokeninfoSpec(ti.authType, ti.options)
+
+			_, err := spec.CreateFilter(ti.args)
 			if err != nil {
-				t.Logf("error in creating filter")
-				return
+				t.Fatalf("error creating filter: %v", err)
 			}
-			f2 := f.(*tokeninfoFilter)
-			defer f2.Close()
 
 			fr := make(filters.Registry)
 			fr.Register(spec)
-			r := &eskip.Route{Filters: []*eskip.Filter{{Name: spec.Name(), Args: args}}, Backend: backend.URL}
+			r := &eskip.Route{Filters: []*eskip.Filter{{Name: spec.Name(), Args: ti.args}}, Backend: backend.URL}
 
 			proxy := proxytest.New(fr, r)
+			defer proxy.Close()
+
 			reqURL, err := url.Parse(proxy.URL)
 			if err != nil {
 				t.Errorf("Failed to parse url %s: %v", proxy.URL, err)
@@ -247,21 +273,58 @@ func TestOAuth2Tokeninfo(t *testing.T) {
 				return
 			}
 
-			if ti.hasAuth {
+			if ti.auth != "" {
 				req.Header.Set(authHeaderName, authHeaderPrefix+ti.auth)
 			}
 
-			rsp, err := http.DefaultClient.Do(req)
-			if err != nil {
-				t.Error(err)
+			for i := 0; i < N; i++ {
+				rsp, err := http.DefaultClient.Do(req)
+				if err != nil {
+					t.Fatal(err)
+				}
+				rsp.Body.Close()
+
+				if rsp.StatusCode != ti.expected {
+					t.Errorf("auth filter failed got=%d, expected=%d, route=%s", rsp.StatusCode, ti.expected, r)
+				}
 			}
 
-			defer rsp.Body.Close()
+			if ti.expectRequests != authRequests {
+				t.Errorf("expected %d auth requests, got: %d", ti.expectRequests, authRequests)
+			}
+		})
+	}
+}
 
-			if rsp.StatusCode != ti.expected {
-				t.Errorf("auth filter failed got=%d, expected=%d, route=%s", rsp.StatusCode, ti.expected, r)
-				buf := make([]byte, rsp.ContentLength)
-				rsp.Body.Read(buf)
+func TestOAuth2TokeninfoInvalidArguments(t *testing.T) {
+	for _, ti := range []struct {
+		msg      string
+		authType string
+		args     []interface{}
+	}{
+		{
+			msg:      "missing arguments",
+			authType: filters.OAuthTokeninfoAnyScopeName,
+		}, {
+			msg:      "anyKV(): wrong number of arguments",
+			authType: filters.OAuthTokeninfoAnyKVName,
+			args:     []interface{}{"not-matching-scope"},
+		}, {
+			msg:      "allKV(): wrong number of arguments",
+			authType: filters.OAuthTokeninfoAllKVName,
+			args:     []interface{}{"not-matching-scope"},
+		},
+	} {
+		t.Run(ti.msg, func(t *testing.T) {
+			tio := TokeninfoOptions{
+				URL:     "https://authserver.test/info",
+				Timeout: testAuthTimeout,
+			}
+			spec := newOAuthTokeninfoSpec(ti.authType, tio)
+
+			f, err := spec.CreateFilter(ti.args)
+			if err == nil {
+				t.Fatalf("expected error, got filter: %v", f)
 			}
 		})
 	}
@@ -324,13 +387,11 @@ func TestOAuth2TokenTimeout(t *testing.T) {
 			spec := NewOAuthTokeninfoAnyScope(u, ti.timeout)
 
 			scopes := []interface{}{"read-x"}
-			f, err := spec.CreateFilter(scopes)
+			_, err := spec.CreateFilter(scopes)
 			if err != nil {
 				t.Error(err)
 				return
 			}
-			f2 := f.(*tokeninfoFilter)
-			defer f2.Close()
 
 			fr := make(filters.Registry)
 			fr.Register(spec)
@@ -369,22 +430,360 @@ func TestOAuth2TokenTimeout(t *testing.T) {
 	}
 }
 
-func BenchmarkOAuthTokeninfoFilter(b *testing.B) {
-	allF := make([]*tokeninfoFilter, 0)
+func TestOAuth2Tokeninfo5xx(t *testing.T) {
+	backend := httptest.NewServer(http.HandlerFunc(func(_ http.ResponseWriter, r *http.Request) {}))
+	defer backend.Close()
+
+	authServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusInternalServerError)
+	}))
+	defer authServer.Close()
+
+	opts := TokeninfoOptions{
+		URL:     authServer.URL + testAuthPath,
+		Timeout: testAuthTimeout,
+	}
+	t.Logf("ti.options: %#v", opts)
+
+	spec := newOAuthTokeninfoSpec(filters.OAuthTokeninfoAnyScopeName, opts)
+
+	fr := make(filters.Registry)
+	fr.Register(spec)
+	r := eskip.MustParse(fmt.Sprintf(`* -> oauthTokeninfoAnyScope("%s") -> "%s"`, testScope, backend.URL))
+
+	proxy := proxytest.New(fr, r...)
+	defer proxy.Close()
+
+	req, err := http.NewRequest("GET", proxy.URL, nil)
+	require.NoError(t, err)
+
+	req.Header.Set(authHeaderName, authHeaderPrefix+testToken)
+
+	rsp, err := proxy.Client().Do(req)
+	require.NoError(t, err)
+	rsp.Body.Close()
+
+	// We return 401 for 5xx responses from the auth server, but log the error for visibility.
+	require.Equal(t, http.StatusUnauthorized, rsp.StatusCode, "auth filter failed got=%d, expected=%d, route=%s", rsp.StatusCode, http.StatusUnauthorized, r)
+}
+
+func BenchmarkOAuthTokeninfoCreateFilter(b *testing.B) {
 	for i := 0; i < b.N; i++ {
 		var spec filters.Spec
 		args := []interface{}{"uid"}
 		spec = NewOAuthTokeninfoAnyScope("https://127.0.0.1:12345/token", 3*time.Second)
-		f, err := spec.CreateFilter(args)
+		_, err := spec.CreateFilter(args)
 		if err != nil {
-			b.Logf("error in creating filter")
+			b.Logf("error creating filter")
 			break
 		}
-		f2 := f.(*tokeninfoFilter)
-		allF = append(allF, f2)
+	}
+}
+
+func BenchmarkOAuthTokeninfoRequest(b *testing.B) {
+	b.Run("oauthTokeninfoAllScope", func(b *testing.B) {
+		spec := NewOAuthTokeninfoAllScope("https://127.0.0.1:12345/token", 3*time.Second)
+		f, err := spec.CreateFilter([]interface{}{"foobar.read", "foobar.write"})
+		require.NoError(b, err)
+
+		ctx := &filtertest.Context{
+			FStateBag: map[string]interface{}{
+				tokeninfoCacheKey: map[string]interface{}{
+					scopeKey: []interface{}{"uid", "foobar.read", "foobar.write"},
+				},
+			},
+			FResponse: &http.Response{},
+		}
+
+		f.Request(ctx)
+		require.False(b, ctx.FServed)
+
+		b.ResetTimer()
+		b.ReportAllocs()
+
+		for i := 0; i < b.N; i++ {
+			f.Request(ctx)
+		}
+	})
+
+	b.Run("oauthTokeninfoAnyScope", func(b *testing.B) {
+		spec := NewOAuthTokeninfoAnyScope("https://127.0.0.1:12345/token", 3*time.Second)
+		f, err := spec.CreateFilter([]interface{}{"foobar.read", "foobar.write"})
+		require.NoError(b, err)
+
+		ctx := &filtertest.Context{
+			FStateBag: map[string]interface{}{
+				tokeninfoCacheKey: map[string]interface{}{
+					scopeKey: []interface{}{"uid", "foobar.write", "foobar.exec"},
+				},
+			},
+			FResponse: &http.Response{},
+		}
+
+		f.Request(ctx)
+		require.False(b, ctx.FServed)
+
+		b.ResetTimer()
+		b.ReportAllocs()
+
+		for i := 0; i < b.N; i++ {
+			f.Request(ctx)
+		}
+	})
+}
+
+func TestOAuthTokeninfoAllocs(t *testing.T) {
+	tio := TokeninfoOptions{
+		URL:     "https://127.0.0.1:12345/token",
+		Timeout: 3 * time.Second,
 	}
 
-	for i := range allF {
-		allF[i].Close()
+	fr := make(filters.Registry)
+	fr.Register(NewOAuthTokeninfoAllScopeWithOptions(tio))
+	fr.Register(NewOAuthTokeninfoAnyScopeWithOptions(tio))
+	fr.Register(NewOAuthTokeninfoAllKVWithOptions(tio))
+	fr.Register(NewOAuthTokeninfoAnyKVWithOptions(tio))
+
+	var filters []filters.Filter
+	for _, def := range eskip.MustParseFilters(`
+		oauthTokeninfoAnyScope("foobar.read", "foobar.write") ->
+		oauthTokeninfoAllScope("foobar.read", "foobar.write") ->
+		oauthTokeninfoAnyKV("k1", "v1", "k2", "v2") ->
+		oauthTokeninfoAllKV("k1", "v1", "k2", "v2")
+	`) {
+		f, err := fr[def.Name].CreateFilter(def.Args)
+		require.NoError(t, err)
+
+		filters = append(filters, f)
 	}
+
+	ctx := &filtertest.Context{
+		FStateBag: map[string]interface{}{
+			tokeninfoCacheKey: map[string]interface{}{
+				scopeKey: []interface{}{"uid", "foobar.read", "foobar.write", "foobar.exec"},
+				"k1":     "v1",
+				"k2":     "v2",
+			},
+		},
+		FResponse: &http.Response{},
+	}
+
+	allocs := testing.AllocsPerRun(100, func() {
+		for _, f := range filters {
+			f.Request(ctx)
+		}
+		require.False(t, ctx.FServed)
+	})
+	if allocs != 0.0 {
+		t.Errorf("Expected zero allocations, got %f", allocs)
+	}
+}
+
+func TestOAuthTokeninfoValidate(t *testing.T) {
+	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Write([]byte("OK"))
+	}))
+	defer backend.Close()
+
+	const validAuthHeader = "Bearer foobarbaz"
+
+	var authRequestsTotal atomic.Int32
+	testAuthServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		authRequestsTotal.Add(1)
+		if r.Header.Get("Authorization") != validAuthHeader {
+			w.WriteHeader(http.StatusUnauthorized)
+		} else {
+			w.Write([]byte(`{"uid": "foobar", "scope":["foo", "bar"]}`))
+		}
+	}))
+	defer testAuthServer.Close()
+
+	tio := TokeninfoOptions{
+		URL:     testAuthServer.URL,
+		Timeout: testAuthTimeout,
+	}
+
+	const (
+		unauthorizedResponse = `Authentication required, see https://auth.test/foo`
+
+		oauthTokeninfoValidateDef = `oauthTokeninfoValidate("{optOutAnnotations: [oauth.disabled], optOutHosts: [ '^.+[.]domain[.]test$', '^exact[.]test$' ], unauthorizedResponse: '` + unauthorizedResponse + `'}")`
+	)
+
+	for _, tc := range []struct {
+		name               string
+		precedingFilters   string
+		host               string
+		authHeader         string
+		expectStatus       int
+		expectAuthRequests int32
+	}{
+		{
+			name:               "reject missing token",
+			authHeader:         "",
+			expectStatus:       http.StatusUnauthorized,
+			expectAuthRequests: 0,
+		},
+		{
+			name:               "reject invalid token",
+			authHeader:         "Bearer invalid",
+			expectStatus:       http.StatusUnauthorized,
+			expectAuthRequests: 1,
+		},
+		{
+			name:               "reject invalid token type",
+			authHeader:         "Basic foobarbaz",
+			expectStatus:       http.StatusUnauthorized,
+			expectAuthRequests: 0,
+		},
+		{
+			name:               "reject missing token when opt-out is invalid",
+			precedingFilters:   `annotate("oauth.invalid", "invalid opt-out")`,
+			authHeader:         "",
+			expectStatus:       http.StatusUnauthorized,
+			expectAuthRequests: 0,
+		},
+		{
+			name:               "allow valid token",
+			authHeader:         validAuthHeader,
+			expectStatus:       http.StatusOK,
+			expectAuthRequests: 1,
+		},
+		{
+			name:               "allow already validated by a preceding filter",
+			precedingFilters:   `oauthTokeninfoAllScope("foo", "bar")`,
+			authHeader:         validAuthHeader,
+			expectStatus:       http.StatusOK,
+			expectAuthRequests: 1, // called once by oauthTokeninfoAllScope
+		},
+		{
+			name:               "allow missing token when opted-out",
+			precedingFilters:   `annotate("oauth.disabled", "this endpoint is public")`,
+			authHeader:         "",
+			expectStatus:       http.StatusOK,
+			expectAuthRequests: 0,
+		},
+		{
+			name:               "allow invalid token when opted-out",
+			precedingFilters:   `annotate("oauth.disabled", "this endpoint is public")`,
+			authHeader:         "Bearer invalid",
+			expectStatus:       http.StatusOK,
+			expectAuthRequests: 0,
+		},
+		{
+			name:               "allow invalid token type when opted-out",
+			precedingFilters:   `annotate("oauth.disabled", "this endpoint is public")`,
+			authHeader:         "Basic foobarbaz",
+			expectStatus:       http.StatusOK,
+			expectAuthRequests: 0,
+		},
+		{
+			name:               "allow missing token when request host matches opted-out domain",
+			host:               "foo.domain.test",
+			authHeader:         "",
+			expectStatus:       http.StatusOK,
+			expectAuthRequests: 0,
+		},
+		{
+			name:               "allow missing token when request second level host matches opted-out domain",
+			host:               "foo.bar.domain.test",
+			authHeader:         "",
+			expectStatus:       http.StatusOK,
+			expectAuthRequests: 0,
+		},
+		{
+			name:               "allow missing token when request host matches opted-out host exactly",
+			host:               "exact.test",
+			authHeader:         "",
+			expectStatus:       http.StatusOK,
+			expectAuthRequests: 0,
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			fr := make(filters.Registry)
+			fr.Register(annotate.New())
+			fr.Register(NewOAuthTokeninfoAllScopeWithOptions(tio))
+			fr.Register(NewOAuthTokeninfoValidate(tio))
+
+			filters := oauthTokeninfoValidateDef
+			if tc.precedingFilters != "" {
+				filters = tc.precedingFilters + " -> " + filters
+			}
+
+			p := proxytest.New(fr, eskip.MustParse(fmt.Sprintf(`* -> %s -> "%s"`, filters, backend.URL))...)
+			defer p.Close()
+
+			authRequestsBefore := authRequestsTotal.Load()
+
+			req, err := http.NewRequest("GET", p.URL, nil)
+			require.NoError(t, err)
+
+			if tc.host != "" {
+				req.Host = tc.host
+			}
+
+			if tc.authHeader != "" {
+				req.Header.Set(authHeaderName, tc.authHeader)
+			}
+
+			resp, err := p.Client().Do(req)
+			require.NoError(t, err)
+			defer resp.Body.Close()
+
+			assert.Equal(t, tc.expectStatus, resp.StatusCode)
+			assert.Equal(t, tc.expectAuthRequests, authRequestsTotal.Load()-authRequestsBefore)
+
+			if resp.StatusCode == http.StatusUnauthorized {
+				assert.Equal(t, resp.ContentLength, int64(len(unauthorizedResponse)))
+
+				b, err := io.ReadAll(resp.Body)
+				require.NoError(t, err)
+
+				assert.Equal(t, unauthorizedResponse, string(b))
+			}
+		})
+	}
+}
+
+func TestOAuthTokeninfoValidateArgs(t *testing.T) {
+	tio := TokeninfoOptions{
+		URL:     "https://auth.test",
+		Timeout: testAuthTimeout,
+	}
+	spec := NewOAuthTokeninfoValidate(tio)
+
+	t.Run("valid", func(t *testing.T) {
+		for _, def := range []string{
+			`oauthTokeninfoValidate("{}")`,
+			`oauthTokeninfoValidate("{optOutAnnotations: [oauth.disabled], optOutHosts: [ '^.+[.]domain[.]test$', '^exact[.]test$' ]}")`,
+			`oauthTokeninfoValidate("{unauthorizedResponse: 'Authentication required, see https://auth.test/foo'}")`,
+			`oauthTokeninfoValidate("{optOutAnnotations: [oauth.disabled], optOutHosts: [ '^.+[.]domain[.]test$', '^exact[.]test$' ], unauthorizedResponse: 'Authentication required, see https://auth.test/foo'}")`,
+		} {
+			t.Run(def, func(t *testing.T) {
+				f := eskip.MustParseFilters(def)[0]
+				require.Equal(t, spec.Name(), f.Name)
+
+				_, err := spec.CreateFilter(f.Args)
+				assert.NoError(t, err)
+			})
+		}
+	})
+
+	t.Run("invalid", func(t *testing.T) {
+		for _, def := range []string{
+			`oauthTokeninfoValidate()`,
+			`oauthTokeninfoValidate("iss")`,
+			`oauthTokeninfoValidate(1)`,
+			`oauthTokeninfoValidate("{optOutAnnotations: [oauth.disabled]}", "extra arg")`,
+			`oauthTokeninfoValidate("{optOutHosts: [ '[' ]}")`, // invalid regexp
+		} {
+			t.Run(def, func(t *testing.T) {
+				f := eskip.MustParseFilters(def)[0]
+				require.Equal(t, spec.Name(), f.Name)
+
+				_, err := spec.CreateFilter(f.Args)
+				t.Logf("%v", err)
+				assert.Error(t, err)
+			})
+		}
+	})
 }

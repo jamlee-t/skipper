@@ -49,8 +49,8 @@ func newFileSecretSource(file string) SecretSource {
 }
 
 type Encrypter struct {
+	mu           sync.RWMutex
 	cipherSuites []cipher.AEAD
-	mux          sync.RWMutex
 	secretSource SecretSource
 	closer       chan struct{}
 	closedHook   chan struct{}
@@ -60,7 +60,7 @@ func newEncrypter(secretsFile string) (*Encrypter, error) {
 	secretSource := newFileSecretSource(secretsFile)
 	_, err := secretSource.GetSecret()
 	if err != nil {
-		return nil, fmt.Errorf("failed to read secrets from secret source: %v", err)
+		return nil, fmt.Errorf("failed to read secrets from secret source: %w", err)
 	}
 	return &Encrypter{
 		secretSource: secretSource,
@@ -78,8 +78,8 @@ func WithSource(s SecretSource) (*Encrypter, error) {
 }
 
 func (e *Encrypter) CreateNonce() ([]byte, error) {
-	e.mux.RLock()
-	defer e.mux.RUnlock()
+	e.mu.RLock()
+	defer e.mu.RUnlock()
 	if len(e.cipherSuites) > 0 {
 		nonce := make([]byte, e.cipherSuites[0].NonceSize())
 		if _, err := io.ReadFull(crand.Reader, nonce); err != nil {
@@ -92,8 +92,8 @@ func (e *Encrypter) CreateNonce() ([]byte, error) {
 
 // Encrypt encrypts given plaintext
 func (e *Encrypter) Encrypt(plaintext []byte) ([]byte, error) {
-	e.mux.RLock()
-	defer e.mux.RUnlock()
+	e.mu.RLock()
+	defer e.mu.RUnlock()
 	if len(e.cipherSuites) > 0 {
 		nonce, err := e.CreateNonce()
 		if err != nil {
@@ -106,8 +106,8 @@ func (e *Encrypter) Encrypt(plaintext []byte) ([]byte, error) {
 
 // Decrypt decrypts given cipher text
 func (e *Encrypter) Decrypt(cipherText []byte) ([]byte, error) {
-	e.mux.RLock()
-	defer e.mux.RUnlock()
+	e.mu.RLock()
+	defer e.mu.RUnlock()
 	for _, c := range e.cipherSuites {
 		nonceSize := c.NonceSize()
 		if len(cipherText) < nonceSize {
@@ -134,21 +134,21 @@ func (e *Encrypter) RefreshCiphers() error {
 
 		key, err := scrypt.Key(s, []byte{}, 1<<15, 8, 1, 32)
 		if err != nil {
-			return fmt.Errorf("failed to create key: %v", err)
+			return fmt.Errorf("failed to create key: %w", err)
 		}
 		//key has to be 16 or 32 byte
 		block, err := aes.NewCipher(key)
 		if err != nil {
-			return fmt.Errorf("failed to create new cipher: %v", err)
+			return fmt.Errorf("failed to create new cipher: %w", err)
 		}
 		aesgcm, err := cipher.NewGCM(block)
 		if err != nil {
-			return fmt.Errorf("failed to create new GCM: %v", err)
+			return fmt.Errorf("failed to create new GCM: %w", err)
 		}
 		suites[i] = aesgcm
 	}
-	e.mux.Lock()
-	defer e.mux.Unlock()
+	e.mu.Lock()
+	defer e.mu.Unlock()
 	e.cipherSuites = suites
 	return nil
 }
@@ -156,10 +156,11 @@ func (e *Encrypter) RefreshCiphers() error {
 func (e *Encrypter) runCipherRefresher(refreshInterval time.Duration) error {
 	err := e.RefreshCiphers()
 	if err != nil {
-		return err
+		return fmt.Errorf("failed to refresh ciphers: %w", err)
 	}
 	go func() {
 		ticker := time.NewTicker(refreshInterval)
+		defer ticker.Stop()
 		for {
 			select {
 			case <-e.closer:
@@ -172,7 +173,7 @@ func (e *Encrypter) runCipherRefresher(refreshInterval time.Duration) error {
 				log.Debug("started refresh of ciphers")
 				err := e.RefreshCiphers()
 				if err != nil {
-					log.Error("failed to refresh the ciphers")
+					log.Errorf("failed to refresh the ciphers: %v", err)
 				}
 				log.Debug("finished refresh of ciphers")
 			}

@@ -18,7 +18,7 @@ type EntryPoint interface {
 	Nodes() []*NodeInfo
 }
 
-// NodeInfo is a value object tat contains information about swarm
+// NodeInfo is a value object that contains information about swarm
 // cluster nodes, that is required to access member nodes.
 type NodeInfo struct {
 	Name string
@@ -34,7 +34,7 @@ func NewStaticNodeInfo(name, addr string) (*NodeInfo, error) {
 	ip := net.ParseIP(ipString)
 	portInt, err := strconv.ParseUint(portString, 10, 16)
 	if err != nil {
-		return nil, fmt.Errorf("invalid port in addr '%s': %v", portString, err)
+		return nil, fmt.Errorf("invalid port in addr '%s': %w", portString, err)
 	}
 
 	return &NodeInfo{

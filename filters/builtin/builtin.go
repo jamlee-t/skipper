@@ -6,6 +6,7 @@ package builtin
 import (
 	"github.com/zalando/skipper/filters"
 	"github.com/zalando/skipper/filters/accesslog"
+	"github.com/zalando/skipper/filters/annotate"
 	"github.com/zalando/skipper/filters/auth"
 	"github.com/zalando/skipper/filters/circuit"
 	"github.com/zalando/skipper/filters/consistenthash"
@@ -19,6 +20,7 @@ import (
 	"github.com/zalando/skipper/filters/scheduler"
 	"github.com/zalando/skipper/filters/sed"
 	"github.com/zalando/skipper/filters/tee"
+	"github.com/zalando/skipper/filters/tls"
 	"github.com/zalando/skipper/filters/tracing"
 	"github.com/zalando/skipper/filters/xforward"
 	"github.com/zalando/skipper/script"
@@ -112,13 +114,11 @@ const (
 	BackendTimeoutName = filters.BackendTimeoutName
 )
 
-// Returns a Registry object initialized with the default set of filter
-// specifications found in the filters package. (including the builtin
-// and the flowid subdirectories.)
-func MakeRegistry() filters.Registry {
-	r := make(filters.Registry)
-	for _, s := range []filters.Spec{
+func Filters() []filters.Spec {
+	return []filters.Spec{
 		NewBackendIsProxy(),
+		NewComment(),
+		annotate.New(),
 		NewRequestHeader(),
 		NewSetRequestHeader(),
 		NewAppendRequestHeader(),
@@ -138,6 +138,7 @@ func MakeRegistry() filters.Registry {
 		NewModPath(),
 		NewSetPath(),
 		NewModRequestHeader(),
+		NewModResponseHeader(),
 		NewDropQuery(),
 		NewSetQuery(),
 		NewHealthCheck(),
@@ -159,6 +160,8 @@ func MakeRegistry() filters.Registry {
 		NewHeaderToQuery(),
 		NewQueryToHeader(),
 		NewBackendTimeout(),
+		NewReadTimeout(),
+		NewWriteTimeout(),
 		NewSetDynamicBackendHostFromHeader(),
 		NewSetDynamicBackendSchemeFromHeader(),
 		NewSetDynamicBackendUrlFromHeader(),
@@ -168,19 +171,26 @@ func MakeRegistry() filters.Registry {
 		NewOriginMarkerSpec(),
 		diag.NewRandom(),
 		diag.NewRepeat(),
+		diag.NewRepeatHex(),
+		diag.NewWrap(),
+		diag.NewWrapHex(),
 		diag.NewLatency(),
 		diag.NewBandwidth(),
 		diag.NewChunks(),
 		diag.NewBackendLatency(),
 		diag.NewBackendBandwidth(),
 		diag.NewBackendChunks(),
+		diag.NewTarpit(),
 		diag.NewAbsorb(),
 		diag.NewAbsorbSilent(),
 		diag.NewLogHeader(),
+		diag.NewLogBody(),
 		diag.NewUniformRequestLatency(),
-		diag.NewNormalRequestLatency(),
 		diag.NewUniformResponseLatency(),
+		diag.NewNormalRequestLatency(),
 		diag.NewNormalResponseLatency(),
+		diag.NewHistogramRequestLatency(),
+		diag.NewHistogramResponseLatency(),
 		tee.NewTee(),
 		tee.NewTeeDeprecated(),
 		tee.NewTeeNoFollow(),
@@ -190,6 +200,7 @@ func MakeRegistry() filters.Registry {
 		sed.NewRequest(),
 		sed.NewDelimitedRequest(),
 		auth.NewBasicAuth(),
+		cookie.NewDropRequestCookie(),
 		cookie.NewRequestCookie(),
 		cookie.NewResponseCookie(),
 		cookie.NewJSCookie(),
@@ -202,12 +213,17 @@ func MakeRegistry() filters.Registry {
 		tracing.NewSpanName(),
 		tracing.NewBaggageToTagFilter(),
 		tracing.NewTag(),
+		tracing.NewTagFromResponse(),
+		tracing.NewTagFromResponseIfStatus(),
 		tracing.NewStateBagToTag(),
+		//lint:ignore SA1019 due to backward compatibility
 		accesslog.NewAccessLogDisabled(),
 		accesslog.NewDisableAccessLog(),
 		accesslog.NewEnableAccessLog(),
 		auth.NewForwardToken(),
 		auth.NewForwardTokenField(),
+		scheduler.NewFifo(),
+		scheduler.NewFifoWithBody(),
 		scheduler.NewLIFO(),
 		scheduler.NewLIFOGroup(),
 		rfc.NewPath(),
@@ -216,9 +232,17 @@ func MakeRegistry() filters.Registry {
 		fadein.NewEndpointCreated(),
 		consistenthash.NewConsistentHashKey(),
 		consistenthash.NewConsistentHashBalanceFactor(),
-	} {
+		tls.New(),
+	}
+}
+
+// Returns a Registry object initialized with the default set of filter
+// specifications found in the filters package. (including the builtin
+// and the flowid subdirectories.)
+func MakeRegistry() filters.Registry {
+	r := make(filters.Registry)
+	for _, s := range Filters() {
 		r.Register(s)
 	}
-
 	return r
 }

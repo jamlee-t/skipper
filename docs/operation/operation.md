@@ -49,7 +49,7 @@ the number for all backends such that we do not run out of sockets.
 
 This will set DisableKeepAlives on the
 [http.Transport](https://golang.org/pkg/net/http/#Transport) to disable
-HTTP keep-alives and to only use the connection for single request.
+HTTP keep-alive and to only use the connection for single request.
 
     -max-idle-connection-backend int
         sets the maximum idle connections for all backend connections
@@ -123,6 +123,16 @@ combinations of idle timeouts can lead to a few unexpected HTTP 502.
 
     -idle-timeout-server duration
         maximum idle connections per backend host (default 1m0s)
+
+This configures maximum number of requests served by server connections:
+
+    -keepalive-requests-server int
+        sets maximum number of requests for http server connections. The connection is closed after serving this number of requests. Default is 0 for unlimited.
+
+This configures maximum age for server connections:
+
+    -keepalive-server duration
+        sets maximum age for http server connections. The connection is closed after it existed for this duration. Default is 0 for unlimited.
 
 This will set MaxHeaderBytes in
 [http.Server](https://golang.org/pkg/net/http/#Server) to limit the
@@ -213,6 +223,8 @@ To monitor skipper we recommend the following queries:
 - P99 response filter duration (depends on label selector): `histogram_quantile(0.99, sum(rate(skipper_filter_response_duration_seconds_bucket{application="skipper-ingress"}[1m])) by (le) )`
 - If you use Kubernetes limits or Linux cgroup CFS quotas (depends on label selector): `sum(rate(container_cpu_cfs_throttled_periods_total{container_name="skipper-ingress"}[1m]))`
 
+You may add static metrics labels like `version` using Prometheus [relabeling feature](https://prometheus.io/docs/prometheus/latest/configuration/configuration/#relabel_config).
+
 ### Connection metrics
 
 This option will enable known loadbalancer connections metrics, like
@@ -226,23 +238,25 @@ uses a counter to collect
 
 It will expose them in /metrics, for example json structure looks like this example:
 
-    {
-      "counters": {
-        "skipper.lb-conn-active": {
-          "count": 6
-        },
-        "skipper.lb-conn-closed": {
-          "count": 6
-        },
-        "skipper.lb-conn-idle": {
-          "count": 6
-        },
-        "skipper.lb-conn-new": {
-          "count": 6
-        }
-      },
-      /* stripped a lot of metrics here */
+```json
+{
+  "counters": {
+    "skipper.lb-conn-active": {
+      "count": 6
+    },
+    "skipper.lb-conn-closed": {
+      "count": 6
+    },
+    "skipper.lb-conn-idle": {
+      "count": 6
+    },
+    "skipper.lb-conn-new": {
+      "count": 6
     }
+  },
+  /* stripped a lot of metrics here */
+}
+```
 
 ### LIFO metrics
 
@@ -256,16 +270,18 @@ filters, use the command line option:
 
 When queried, it will return metrics like:
 
-    {
-      "gauges": {
-        "skipper.lifo.routeXYZ.active": {
-          "value": 245
-        },
-        "skipper.lifo.routeXYZ.queued": {
-          "value": 27
-        }
-      }
+```json
+{
+  "gauges": {
+    "skipper.lifo.routeXYZ.active": {
+      "value": 245
+    },
+    "skipper.lifo.routeXYZ.queued": {
+      "value": 27
     }
+  }
+}
+```
 
 ### Application metrics
 
@@ -280,56 +296,58 @@ This will make sure you will get stats for each "Host" header or the
 route name as "timers". The following is an example for
 `-serve-host-metrics`:
 
-    "timers": {
-      "skipper.servehost.app1_example_com.GET.200": {
-        "15m.rate": 0.06830666203045982,
-        "1m.rate": 2.162612637718806e-06,
-        "5m.rate": 0.008312609284452856,
-        "75%": 236603815,
-        "95%": 236603815,
-        "99%": 236603815,
-        "99.9%": 236603815,
-        "count": 3,
-        "max": 236603815,
-        "mean": 116515451.66666667,
-        "mean.rate": 0.0030589345776699827,
-        "median": 91273391,
-        "min": 21669149,
-        "stddev": 89543653.71950394
-      },
-      "skipper.servehost.app1_example_com.GET.304": {
-        "15m.rate": 0.3503336738177459,
-        "1m.rate": 0.07923086447313292,
-        "5m.rate": 0.27019839341602214,
-        "75%": 99351895.25,
-        "95%": 105381847,
-        "99%": 105381847,
-        "99.9%": 105381847,
-        "count": 4,
-        "max": 105381847,
-        "mean": 47621612,
-        "mean.rate": 0.03087161486272533,
-        "median": 41676170.5,
-        "min": 1752260,
-        "stddev": 46489302.203724876
-      },
-      "skipper.servehost.app1_example_com.GET.401": {
-        "15m.rate": 0.16838468990057648,
-        "1m.rate": 0.01572861413072501,
-        "5m.rate": 0.1194724817779537,
-        "75%": 91094832,
-        "95%": 91094832,
-        "99%": 91094832,
-        "99.9%": 91094832,
-        "count": 2,
-        "max": 91094832,
-        "mean": 58090623,
-        "mean.rate": 0.012304914018033056,
-        "median": 58090623,
-        "min": 25086414,
-        "stddev": 33004209
-      }
-    },
+```json
+"timers": {
+  "skipper.servehost.app1_example_com.GET.200": {
+    "15m.rate": 0.06830666203045982,
+    "1m.rate": 2.162612637718806e-06,
+    "5m.rate": 0.008312609284452856,
+    "75%": 236603815,
+    "95%": 236603815,
+    "99%": 236603815,
+    "99.9%": 236603815,
+    "count": 3,
+    "max": 236603815,
+    "mean": 116515451.66666667,
+    "mean.rate": 0.0030589345776699827,
+    "median": 91273391,
+    "min": 21669149,
+    "stddev": 89543653.71950394
+  },
+  "skipper.servehost.app1_example_com.GET.304": {
+    "15m.rate": 0.3503336738177459,
+    "1m.rate": 0.07923086447313292,
+    "5m.rate": 0.27019839341602214,
+    "75%": 99351895.25,
+    "95%": 105381847,
+    "99%": 105381847,
+    "99.9%": 105381847,
+    "count": 4,
+    "max": 105381847,
+    "mean": 47621612,
+    "mean.rate": 0.03087161486272533,
+    "median": 41676170.5,
+    "min": 1752260,
+    "stddev": 46489302.203724876
+  },
+  "skipper.servehost.app1_example_com.GET.401": {
+    "15m.rate": 0.16838468990057648,
+    "1m.rate": 0.01572861413072501,
+    "5m.rate": 0.1194724817779537,
+    "75%": 91094832,
+    "95%": 91094832,
+    "99%": 91094832,
+    "99.9%": 91094832,
+    "count": 2,
+    "max": 91094832,
+    "mean": 58090623,
+    "mean.rate": 0.012304914018033056,
+    "median": 58090623,
+    "min": 25086414,
+    "stddev": 33004209
+  }
+},
+```
 
 Note you can reduce the dimension of the metrics by removing the HTTP
 status code and method from it. Use the `-serve-method-metric=false`
@@ -353,111 +371,237 @@ utilized applications (less than 100 requests per second):
 Metrics from the
 [go runtime memstats](https://golang.org/pkg/runtime/#MemStats)
 are exposed from skipper to the metrics endpoint, default listener
-:9911, on path /metrics :
+:9911, on path /metrics
 
-    "gauges": {
-      "skipper.runtime.MemStats.Alloc": {
-        "value": 3083680
-      },
-      "skipper.runtime.MemStats.BuckHashSys": {
-        "value": 1452675
-      },
-      "skipper.runtime.MemStats.DebugGC": {
-        "value": 0
-      },
-      "skipper.runtime.MemStats.EnableGC": {
-        "value": 1
-      },
-      "skipper.runtime.MemStats.Frees": {
-        "value": 121
-      },
-      "skipper.runtime.MemStats.HeapAlloc": {
-        "value": 3083680
-      },
-      "skipper.runtime.MemStats.HeapIdle": {
-        "value": 778240
-      },
-      "skipper.runtime.MemStats.HeapInuse": {
-        "value": 4988928
-      },
-      "skipper.runtime.MemStats.HeapObjects": {
-        "value": 24005
-      },
-      "skipper.runtime.MemStats.HeapReleased": {
-        "value": 0
-      },
-      "skipper.runtime.MemStats.HeapSys": {
-        "value": 5767168
-      },
-      "skipper.runtime.MemStats.LastGC": {
-        "value": 1516098381155094500
-      },
-      "skipper.runtime.MemStats.Lookups": {
-        "value": 2
-      },
-      "skipper.runtime.MemStats.MCacheInuse": {
-        "value": 6944
-      },
-      "skipper.runtime.MemStats.MCacheSys": {
-        "value": 16384
-      },
-      "skipper.runtime.MemStats.MSpanInuse": {
-        "value": 77368
-      },
-      "skipper.runtime.MemStats.MSpanSys": {
-        "value": 81920
-      },
-      "skipper.runtime.MemStats.Mallocs": {
-        "value": 1459
-      },
-      "skipper.runtime.MemStats.NextGC": {
-        "value": 4194304
-      },
-      "skipper.runtime.MemStats.NumGC": {
-        "value": 0
-      },
-      "skipper.runtime.MemStats.PauseTotalNs": {
-        "value": 683352
-      },
-      "skipper.runtime.MemStats.StackInuse": {
-        "value": 524288
-      },
-      "skipper.runtime.MemStats.StackSys": {
-        "value": 524288
-      },
-      "skipper.runtime.MemStats.Sys": {
-        "value": 9246968
-      },
-      "skipper.runtime.MemStats.TotalAlloc": {
-        "value": 35127624
-      },
-      "skipper.runtime.NumCgoCall": {
-        "value": 0
-      },
-      "skipper.runtime.NumGoroutine": {
-        "value": 11
-      },
-      "skipper.runtime.NumThread": {
-        "value": 9
-      }
-    },
-    "histograms": {
-      "skipper.runtime.MemStats.PauseNs": {
-        "75%": 82509.25,
-        "95%": 132609,
-        "99%": 132609,
-        "99.9%": 132609,
-        "count": 12,
-        "max": 132609,
-        "mean": 56946,
-        "median": 39302.5,
-        "min": 28749,
-        "stddev": 31567.015005117817
-      }
-   }
+#### Go metrics - Codahale
 
+```json
+"gauges": {
+  "skipper.runtime.MemStats.Alloc": {
+    "value": 3083680
+  },
+  "skipper.runtime.MemStats.BuckHashSys": {
+    "value": 1452675
+  },
+  "skipper.runtime.MemStats.DebugGC": {
+    "value": 0
+  },
+  "skipper.runtime.MemStats.EnableGC": {
+    "value": 1
+  },
+  "skipper.runtime.MemStats.Frees": {
+    "value": 121
+  },
+  "skipper.runtime.MemStats.HeapAlloc": {
+    "value": 3083680
+  },
+  "skipper.runtime.MemStats.HeapIdle": {
+    "value": 778240
+  },
+  "skipper.runtime.MemStats.HeapInuse": {
+    "value": 4988928
+  },
+  "skipper.runtime.MemStats.HeapObjects": {
+    "value": 24005
+  },
+  "skipper.runtime.MemStats.HeapReleased": {
+    "value": 0
+  },
+  "skipper.runtime.MemStats.HeapSys": {
+    "value": 5767168
+  },
+  "skipper.runtime.MemStats.LastGC": {
+    "value": 1516098381155094500
+  },
+  "skipper.runtime.MemStats.Lookups": {
+    "value": 2
+  },
+  "skipper.runtime.MemStats.MCacheInuse": {
+    "value": 6944
+  },
+  "skipper.runtime.MemStats.MCacheSys": {
+    "value": 16384
+  },
+  "skipper.runtime.MemStats.MSpanInuse": {
+    "value": 77368
+  },
+  "skipper.runtime.MemStats.MSpanSys": {
+    "value": 81920
+  },
+  "skipper.runtime.MemStats.Mallocs": {
+    "value": 1459
+  },
+  "skipper.runtime.MemStats.NextGC": {
+    "value": 4194304
+  },
+  "skipper.runtime.MemStats.NumGC": {
+    "value": 0
+  },
+  "skipper.runtime.MemStats.PauseTotalNs": {
+    "value": 683352
+  },
+  "skipper.runtime.MemStats.StackInuse": {
+    "value": 524288
+  },
+  "skipper.runtime.MemStats.StackSys": {
+    "value": 524288
+  },
+  "skipper.runtime.MemStats.Sys": {
+    "value": 9246968
+  },
+  "skipper.runtime.MemStats.TotalAlloc": {
+    "value": 35127624
+  },
+  "skipper.runtime.NumCgoCall": {
+    "value": 0
+  },
+  "skipper.runtime.NumGoroutine": {
+    "value": 11
+  },
+  "skipper.runtime.NumThread": {
+    "value": 9
+  }
+},
+"histograms": {
+  "skipper.runtime.MemStats.PauseNs": {
+    "75%": 82509.25,
+    "95%": 132609,
+    "99%": 132609,
+    "99.9%": 132609,
+    "count": 12,
+    "max": 132609,
+    "mean": 56946,
+    "median": 39302.5,
+    "min": 28749,
+    "stddev": 31567.015005117817
+  }
+}
+```
+
+#### Go metrics - Prometheus
+
+```
+# HELP go_gc_duration_seconds A summary of the pause duration of garbage collection cycles.
+# TYPE go_gc_duration_seconds summary
+go_gc_duration_seconds{quantile="0"} 4.7279e-05
+go_gc_duration_seconds{quantile="0.25"} 5.9291e-05
+go_gc_duration_seconds{quantile="0.5"} 7.4e-05
+go_gc_duration_seconds{quantile="0.75"} 9.55e-05
+go_gc_duration_seconds{quantile="1"} 0.000199667
+go_gc_duration_seconds_sum 0.001108339
+go_gc_duration_seconds_count 13
+# HELP go_goroutines Number of goroutines that currently exist.
+# TYPE go_goroutines gauge
+go_goroutines 13
+# HELP go_info Information about the Go environment.
+# TYPE go_info gauge
+go_info{version="go1.21.3"} 1
+# HELP go_memstats_alloc_bytes Number of bytes allocated and still in use.
+# TYPE go_memstats_alloc_bytes gauge
+go_memstats_alloc_bytes 6.4856e+06
+# HELP go_memstats_alloc_bytes_total Total number of bytes allocated, even if freed.
+# TYPE go_memstats_alloc_bytes_total counter
+go_memstats_alloc_bytes_total 4.1797384e+07
+# HELP go_memstats_buck_hash_sys_bytes Number of bytes used by the profiling bucket hash table.
+# TYPE go_memstats_buck_hash_sys_bytes gauge
+go_memstats_buck_hash_sys_bytes 1.462151e+06
+# HELP go_memstats_frees_total Total number of frees.
+# TYPE go_memstats_frees_total counter
+go_memstats_frees_total 507460
+# HELP go_memstats_gc_sys_bytes Number of bytes used for garbage collection system metadata.
+# TYPE go_memstats_gc_sys_bytes gauge
+go_memstats_gc_sys_bytes 4.549296e+06
+# HELP go_memstats_heap_alloc_bytes Number of heap bytes allocated and still in use.
+# TYPE go_memstats_heap_alloc_bytes gauge
+go_memstats_heap_alloc_bytes 6.4856e+06
+# HELP go_memstats_heap_idle_bytes Number of heap bytes waiting to be used.
+# TYPE go_memstats_heap_idle_bytes gauge
+go_memstats_heap_idle_bytes 7.421952e+06
+# HELP go_memstats_heap_inuse_bytes Number of heap bytes that are in use.
+# TYPE go_memstats_heap_inuse_bytes gauge
+go_memstats_heap_inuse_bytes 8.372224e+06
+# HELP go_memstats_heap_objects Number of allocated objects.
+# TYPE go_memstats_heap_objects gauge
+go_memstats_heap_objects 70159
+# HELP go_memstats_heap_released_bytes Number of heap bytes released to OS.
+# TYPE go_memstats_heap_released_bytes gauge
+go_memstats_heap_released_bytes 6.47168e+06
+# HELP go_memstats_heap_sys_bytes Number of heap bytes obtained from system.
+# TYPE go_memstats_heap_sys_bytes gauge
+go_memstats_heap_sys_bytes 1.5794176e+07
+# HELP go_memstats_last_gc_time_seconds Number of seconds since 1970 of last garbage collection.
+# TYPE go_memstats_last_gc_time_seconds gauge
+go_memstats_last_gc_time_seconds 1.6987664839728708e+09
+# HELP go_memstats_lookups_total Total number of pointer lookups.
+# TYPE go_memstats_lookups_total counter
+go_memstats_lookups_total 0
+# HELP go_memstats_mallocs_total Total number of mallocs.
+# TYPE go_memstats_mallocs_total counter
+go_memstats_mallocs_total 577619
+# HELP go_memstats_mcache_inuse_bytes Number of bytes in use by mcache structures.
+# TYPE go_memstats_mcache_inuse_bytes gauge
+go_memstats_mcache_inuse_bytes 19200
+# HELP go_memstats_mcache_sys_bytes Number of bytes used for mcache structures obtained from system.
+# TYPE go_memstats_mcache_sys_bytes gauge
+go_memstats_mcache_sys_bytes 31200
+# HELP go_memstats_mspan_inuse_bytes Number of bytes in use by mspan structures.
+# TYPE go_memstats_mspan_inuse_bytes gauge
+go_memstats_mspan_inuse_bytes 302904
+# HELP go_memstats_mspan_sys_bytes Number of bytes used for mspan structures obtained from system.
+# TYPE go_memstats_mspan_sys_bytes gauge
+go_memstats_mspan_sys_bytes 309624
+# HELP go_memstats_next_gc_bytes Number of heap bytes when next garbage collection will take place.
+# TYPE go_memstats_next_gc_bytes gauge
+go_memstats_next_gc_bytes 8.206808e+06
+# HELP go_memstats_other_sys_bytes Number of bytes used for other system allocations.
+# TYPE go_memstats_other_sys_bytes gauge
+go_memstats_other_sys_bytes 2.402169e+06
+# HELP go_memstats_stack_inuse_bytes Number of bytes in use by the stack allocator.
+# TYPE go_memstats_stack_inuse_bytes gauge
+go_memstats_stack_inuse_bytes 983040
+# HELP go_memstats_stack_sys_bytes Number of bytes obtained from system for stack allocator.
+# TYPE go_memstats_stack_sys_bytes gauge
+go_memstats_stack_sys_bytes 983040
+# HELP go_memstats_sys_bytes Number of bytes obtained from system.
+# TYPE go_memstats_sys_bytes gauge
+go_memstats_sys_bytes 2.5531656e+07
+# HELP go_threads Number of OS threads created.
+# TYPE go_threads gauge
+go_threads 22
+# HELP process_cpu_seconds_total Total user and system CPU time spent in seconds.
+# TYPE process_cpu_seconds_total counter
+process_cpu_seconds_total 0.42
+# HELP process_max_fds Maximum number of open file descriptors.
+# TYPE process_max_fds gauge
+process_max_fds 60000
+# HELP process_open_fds Number of open file descriptors.
+# TYPE process_open_fds gauge
+process_open_fds 10
+# HELP process_resident_memory_bytes Resident memory size in bytes.
+# TYPE process_resident_memory_bytes gauge
+process_resident_memory_bytes 4.2811392e+07
+# HELP process_start_time_seconds Start time of the process since unix epoch in seconds.
+# TYPE process_start_time_seconds gauge
+process_start_time_seconds 1.69876646736e+09
+# HELP process_virtual_memory_bytes Virtual memory size in bytes.
+# TYPE process_virtual_memory_bytes gauge
+process_virtual_memory_bytes 2.823462912e+09
+# HELP process_virtual_memory_max_bytes Maximum amount of virtual memory available in bytes.
+# TYPE process_virtual_memory_max_bytes gauge
+process_virtual_memory_max_bytes 1.8446744073709552e+19
+```
 
 ### Redis - Rate limiting metrics
+
+System metrics exposed by the redisclient:
+
+- skipper.swarm.redis.shards: known Redis shards to the skipper ringclient
+- skipper.swarm.redis.hits: number of times free connection was found in the pool
+- skipper.swarm.redis.misses: number of times free connection was NOT found in the pool
+- skipper.swarm.redis.timeouts: number of times a wait timeout occurred
+- skipper.swarm.redis.staleconns: number of stale connections removed from the pool
+- skipper.swarm.redis.idleconns: number of idle connections in the pool
+- skipper.swarm.redis.totalconns: number of total connections in the pool
 
 Timer metrics for the latencies and errors of the communication with the auxiliary Redis instances are enabled
 by the default, and exposed among the timers via the following keys:
@@ -471,6 +615,99 @@ by the default, and exposed among the timers via the following keys:
   where the redis communication faileds, grouped by the rate limiter group name when used
 
 See more details about rate limiting at [Rate limiting](../reference/filters.md#clusterclientratelimit).
+
+### Open Policy Agent metrics
+
+If Open Policy Agent filters are enabled, the following counters show up in the `/metrics` endpoint. The bundle-name is the first parameter of the filter so that for example increased error codes can be attributed to a specific source bundle / system.
+
+- `skipper.opaAuthorizeRequest.custom.decision.allow.<bundle-name>`
+- `skipper.opaAuthorizeRequest.custom.decision.deny.<bundle-name>`
+- `skipper.opaAuthorizeRequest.custom.decision.err.<bundle-name>`
+- `skipper.opaServeResponse.custom.decision.allow.<bundle-name>`
+- `skipper.opaServeResponse.custom.decision.deny.<bundle-name>`
+- `skipper.opaServeResponse.custom.decision.err.<bundle-name>`
+
+The following timer metrics are exposed per used bundle-name:
+
+- `skipper.opaAuthorizeRequest.custom.eval_time.<bundle-name>`
+- `skipper.opaServeResponse.custom.eval_time.<bundle-name>`
+
+### RouteSRV metrics
+
+RouteSRV metrics expose the following metrics in Prometheus format:
+
+```
+% curl http://127.0.0.1:9911/metrics
+# 8< Go metrics >8
+
+# HELP routesrv_backend_combined_duration_seconds Duration in seconds of a proxy backend combined.
+# TYPE routesrv_backend_combined_duration_seconds histogram
+routesrv_backend_combined_duration_seconds_bucket{le="0.005"} 5
+routesrv_backend_combined_duration_seconds_bucket{le="0.01"} 5
+routesrv_backend_combined_duration_seconds_bucket{le="0.025"} 5
+routesrv_backend_combined_duration_seconds_bucket{le="0.05"} 5
+routesrv_backend_combined_duration_seconds_bucket{le="0.1"} 5
+routesrv_backend_combined_duration_seconds_bucket{le="0.25"} 5
+routesrv_backend_combined_duration_seconds_bucket{le="0.5"} 5
+routesrv_backend_combined_duration_seconds_bucket{le="1"} 5
+routesrv_backend_combined_duration_seconds_bucket{le="2.5"} 5
+routesrv_backend_combined_duration_seconds_bucket{le="5"} 5
+routesrv_backend_combined_duration_seconds_bucket{le="10"} 5
+routesrv_backend_combined_duration_seconds_bucket{le="+Inf"} 5
+routesrv_backend_combined_duration_seconds_sum 0.001349441
+routesrv_backend_combined_duration_seconds_count 5
+# HELP routesrv_backend_duration_seconds Duration in seconds of a proxy backend.
+# TYPE routesrv_backend_duration_seconds histogram
+routesrv_backend_duration_seconds_bucket{host="",route="routersv",le="0.005"} 5
+routesrv_backend_duration_seconds_bucket{host="",route="routersv",le="0.01"} 5
+routesrv_backend_duration_seconds_bucket{host="",route="routersv",le="0.025"} 5
+routesrv_backend_duration_seconds_bucket{host="",route="routersv",le="0.05"} 5
+routesrv_backend_duration_seconds_bucket{host="",route="routersv",le="0.1"} 5
+routesrv_backend_duration_seconds_bucket{host="",route="routersv",le="0.25"} 5
+routesrv_backend_duration_seconds_bucket{host="",route="routersv",le="0.5"} 5
+routesrv_backend_duration_seconds_bucket{host="",route="routersv",le="1"} 5
+routesrv_backend_duration_seconds_bucket{host="",route="routersv",le="2.5"} 5
+routesrv_backend_duration_seconds_bucket{host="",route="routersv",le="5"} 5
+routesrv_backend_duration_seconds_bucket{host="",route="routersv",le="10"} 5
+routesrv_backend_duration_seconds_bucket{host="",route="routersv",le="+Inf"} 5
+routesrv_backend_duration_seconds_sum{host="",route="routersv"} 0.001349441
+routesrv_backend_duration_seconds_count{host="",route="routersv"} 5
+# HELP routesrv_custom_gauges Gauges number of custom metrics.
+# TYPE routesrv_custom_gauges gauge
+routesrv_custom_gauges{key="polling_started_timestamp"} 1.69876646881321e+09
+routesrv_custom_gauges{key="redis_endpoints"} 1
+routesrv_custom_gauges{key="routes.byte"} 91378
+routesrv_custom_gauges{key="routes.initialized_timestamp"} 1.6987664689696188e+09
+routesrv_custom_gauges{key="routes.total"} 258
+routesrv_custom_gauges{key="routes.updated_timestamp"} 1.698766468969631e+09
+# HELP routesrv_custom_total Total number of custom metrics.
+# TYPE routesrv_custom_total counter
+routesrv_custom_total{key="200"} 5
+```
+
+Metrics explanation:
+
+- `routesrv_custom_total{key="200"} 5`:
+  5 requests were responded with status code 200 by the current routesrv
+  version `v0.18.38`.
+- `routesrv_custom_gauges{key="polling_started_timestamp"} 1.69876646881321e+09`:
+  routesrv started to poll at 1.69876646881321e+09 seconds of UNIX beginning
+  (2023-10-31 16:34:28 1705425/2097152 +0100).
+- `routesrv_custom_gauges{key="redis_endpoints"} 1`:
+  The routes endpoint `/swarm/redis/shards` was called 1 times
+- `routesrv_custom_gauges{key="routes.byte"} 91378`:
+  The number of bytes that are served at `/routes` is 91378.
+- `routesrv_custom_gauges{key="routes.initialized_timestamp"} 1.6987664689696188e+09`:
+  routesrv initialized the routes at 1.6987664689696188e+09 seconds of UNIX beginning.
+  (2023-10-31 16:34:28 1016719/1048576 +0100)
+- `routesrv_custom_gauges{key="routes.total"} 258`:
+  The number of routes that are served at `/routes` are 258.
+- `routesrv_custom_gauges{key="routes.updated_timestamp"} 1.698766468969631e+09`:
+  The last update of routes by routesrv was at 1.698766468969631e+09.
+  (2023-10-31 16:34:28 4066927/4194304 +0100)
+
+
+If you want to read more about RouteSRV see [deploy RouteSRV](../kubernetes/ingress-controller.md#routesrv).
 
 ## OpenTracing
 
@@ -566,18 +803,19 @@ runtime. Full logs of the Proxy span:
 
 ### Request filters span
 
-The request filters span logs shows `start` and `end` values for each
-filter applied.
+The request filters span logs show `start` and `end` events for each filter applied.
 
 ![request filter span with logs](../img/skipper_opentracing_request_filters_span_with_logs.png)
 
 
 ### Response filters span
 
-The response filters span logs shows `start` and `end` values for each
-filter applied.
+The response filters span logs show `start` and `end` events for each filter applied.
 
 ![response filter span with logs](../img/skipper_opentracing_response_filters_span_with_logs.png)
+
+Request and response filters event logging can be disabled by setting the `-opentracing-log-filter-lifecycle-events=false` flag and
+span creation can be disabled altogether by the `-opentracing-disable-filter-spans` flag.
 
 ### Auth filters span
 
@@ -593,6 +831,16 @@ The auth filters have trace log values `start` and `end` for DNS, TCP
 connect, TLS handshake and connection pool:
 
 ![tokeninfo auth filter span with logs](../img/skipper_opentracing_auth_filter_tokeninfo_span_with_logs.png)
+
+### Open Policy Agent span
+
+When one of the Open Policy Agent filters is used, child spans with the operation name `open-policy-agent` are added to the Trace.
+
+The following tags are added to the Span, labels are taken from the OPA configuration YAML file as is and are not interpreted:
+- `opa.decision_id=<decision id that was recorded>`
+- `opa.labels.<label1>=<value1>`
+
+The labels can for example be used to link to a specific decision in the control plane if they contain URL fragments for the receiving entity.
 
 ### Redis rate limiting spans
 
@@ -627,7 +875,7 @@ Skipper allows you to get some runtime insights. You can get the
 current routing table from skipper with in the
 [eskip file format](https://godoc.org/github.com/zalando/skipper/eskip):
 
-```
+```sh
 curl localhost:9911/routes
 *
 -> "http://localhost:12345/"
@@ -636,7 +884,7 @@ curl localhost:9911/routes
 You also can get the number of routes `X-Count` and the UNIX timestamp
 of the last route table update `X-Timestamp`, using a HEAD request:
 
-```
+```sh
 curl -I localhost:9911/routes
 HTTP/1.1 200 OK
 Content-Type: text/plain
@@ -651,9 +899,56 @@ In order to control this limits, there are two parameters: `limit` and
 `offset` where to start the list. Thanks to this, it's possible
 to get the results paginated or getting all of them at the same time.
 
-```
+```sh
 curl localhost:9911/routes?offset=200&limit=100
 ```
+
+## Passive health check (*experimental*)
+
+Skipper has an option to automatically detect and mitigate faulty backend endpoints, this feature is called
+Passive Health Check(PHC).
+
+PHC works the following way: the entire uptime is divided in chunks of `period`, per every period Skipper calculates
+the total amount of requests and amount of requests failed per every endpoint. While next period is going on,
+the Skipper takes a look at previous period and if the amount of requests in the previous period is more than `min-requests`
+and failed requests ratio is more than `min-drop-probability` for the given endpoints
+then Skipper will send reduced (the more `max-drop-probability` and failed requests ratio
+in previous period are, the stronger reduction is) amount of requests compared to amount sent without PHC.
+If the ratio of unhealthy endpoints is more than `max-unhealthy-endpoints-ratio` then PHC becomes fail-open. This effectively means
+if there are too many unhealthy endpoints PHC does not try to mitigate them any more and requests are sent like there is no PHC at all.
+
+Having this, we expect less requests to fail because a lot of them would be sent to endpoints that seem to be healthy instead.
+
+To enable this feature, you need to provide `-passive-health-check` option having forementioned parameters
+(`period`, `min-requests`, `min-drop-probability`, `max-drop-probability`, `max-unhealthy-endpoints-ratio`) defined.
+`period`, `min-requests`, `max-drop-probability` are required parameters, it is not possible for PHC to be enabled without
+them explicitly defined by user. `min-drop-probability` is implicitly defined as `0.0` if not explicitly set by user.
+`max-unhealthy-endpoints-ratio` is defined as `1.0` if not explicitly set by user.
+Valid examples of `-passive-health-check` are:
+
++ `-passive-health-check=period=1s,min-requests=10,min-drop-probability=0.05,max-drop-probability=0.9,max-unhealthy-endpoints-ratio=0.3`
++ `-passive-health-check=period=1s,min-requests=10,max-drop-probability=0.9,max-unhealthy-endpoints-ratio=0.3`
++ `-passive-health-check=period=1s,min-requests=10,min-drop-probability=0.05,max-drop-probability=0.9`
++ `-passive-health-check=period=1s,min-requests=10,max-drop-probability=0.9`
+
+If `-passive-health-check` option is provided, but some required parameters are not defined, Skipper will not start.
+Skipper will run without this feature, if no `-passive-health-check` is provided at all.
+
+The parameters of `-passive-health-check` option are:
+
++ `period=<duration>` - the duration of stats reset period
++ `min-requests=<int>` - the minimum number of requests per `period` per backend endpoint required to activate PHC for this endpoint
++ `min-drop-probabilty=[0.0 <= p < max-drop-probability)` - the minimum possible probability of unhealthy endpoint being not considered while choosing the endpoint for the given request. The same value is in fact used as minimal failed requests ratio for PHC to be enabled for this endpoint
++ `max-drop-probabilty=(min-drop-probability < p <= 1.0]` - the maximum possible probability of unhealthy endpoint being not considered
+while choosing the endpoint for the given request
++ `max-unhealthy-endpoints-ratio=[0.0 <= r <= 1.0]` - the maximum ratio of unhealthy endpoints for PHC to try to mitigate ongoing requests
+
+### Metrics
+
+A set of metrics will be exposed to track passive health check:
+
+* `passive-health-check.endpoints.dropped`: Number of all endpoints dropped before load balancing a request, so after N requests and M endpoints are being dropped this counter would be N*M.
+* `passive-health-check.requests.passed`: Number of unique requests where PHC was able to avoid sending them to unhealthy endpoints.
 
 ## Memory consumption
 
@@ -687,7 +982,7 @@ If you enable route based `-route-backend-metrics`
 it can count up. Please check the support listener endpoint (default
 9911) to understand the usage:
 
-```
+```sh
 % curl localhost:9911/metrics
 ```
 
@@ -854,7 +1149,7 @@ by the route, Skipper will respond with information that show you the
 matched route, the incoming request, the transformed request and all
 predicates and filters involved in the route processing:
 
-```
+```json
 % curl -s http://127.0.0.1:9922/ -H"Host: foo.teapot.example.org" | jq .
 {
   "route_id": "kube_default__foo__foo_teapot_example_org_____foo",
@@ -918,10 +1213,12 @@ predicates and filters involved in the route processing:
 }
 ```
 
-## Profiling skipper
+## Profiling
 
 Go profiling is explained in Go's
 [diagnostics](https://golang.org/doc/diagnostics.html) documentation.
+
+### Profiling skipper or RouteSRV
 
 To enable profiling in skipper you have to use `-enable-profile`. This
 will start a profiling route at `/debug/pprof/profile` on the support
@@ -937,8 +1234,8 @@ skipper -inline-routes='r1: * -> inlineContent("hello") -> <shunt>' -enable-prof
 
 Use Go tool pprof to download profiling sample to analyze (sample is not from the example):
 
-```
-go tool pprof http://127.0.0.1:9911
+```sh
+% go tool pprof http://127.0.0.1:9911
 Fetching profile over HTTP from http://127.0.0.1:9911/debug/pprof/profile
 Saved profile in /$HOME/pprof/pprof.skipper.samples.cpu.004.pb.gz
 File: skipper
@@ -1004,7 +1301,7 @@ copy.
 Example:
 
 A route with `edit-route`
-```
+```sh
 % skipper -inline-routes='Path("/foo") -> setResponseHeader("X-Foo","bar") -> inlineContent("hi") -> <shunt>' \
 -edit-route='/inlineContent[(]["](.*)["][)]/inlineContent("modified \"$1\" response")/'
 [APP]INFO[0000] Expose metrics in codahale format
@@ -1017,7 +1314,7 @@ A route with `edit-route`
 ```
 
 Modified route:
-```
+```sh
 curl localhost:9911/routes
 Path("/foo")
   -> setResponseHeader("X-Foo", "bar")
@@ -1026,7 +1323,7 @@ Path("/foo")
 ```
 
 Modified response body:
-```
+```sh
 % curl -v http://localhost:9090/foo
 *   Trying ::1...
 * Connected to localhost (::1) port 9090 (#0)
@@ -1062,3 +1359,14 @@ r: SourceFromLast("9.0.0.0/8","2001:67c:20a0::/48") -> ...`
 clone_r: ClientIP("9.0.0.0/8","2001:67c:20a0::/48") -> ...`
 ```
 for migration time.
+
+`/` symbol is not the only option for the separator for `-edit-route` and `-clone-route`, any
+first symbol you will specify in those options could be used as separator. This could be useful
+for IP mask changes, for example, you can use `-edit-route='#/26#/24#`. In this case
+```
+r: SourceFromLast("9.0.0.0/26","2001:67c:20a0::/48") -> ...`
+```
+will be changed to
+```
+r: SourceFromLast("9.0.0.0/24","2001:67c:20a0::/48") -> ...`
+```

@@ -7,23 +7,24 @@ https://developer.mozilla.org/en-US/docs/Web/HTTP/Headers/Forwarded
 
 Examples:
 
-    // only match requests to "example.com"
-    example1: ForwardedHost("example.com") -> "http://example.org";
+	// only match requests to "example.com"
+	example1: ForwardedHost("example.com") -> "http://example.org";
 
-    // only match requests to http
-    example2: ForwardedProtocol("http") -> "http://example.org";
+	// only match requests to http
+	example2: ForwardedProtocol("http") -> "http://example.org";
 
-    // only match requests to https
-    example3: ForwardedProtocol("https") -> "http://example.org";
+	// only match requests to https
+	example3: ForwardedProtocol("https") -> "http://example.org";
 */
 package forwarded
 
 import (
-	"github.com/zalando/skipper/predicates"
-	"github.com/zalando/skipper/routing"
 	"net/http"
 	"regexp"
 	"strings"
+
+	"github.com/zalando/skipper/predicates"
+	"github.com/zalando/skipper/routing"
 )
 
 const (
@@ -134,9 +135,9 @@ func parseForwarded(fh string) *forwarded {
 
 	for _, forwardedFull := range strings.Split(fh, ",") {
 		for _, forwardedPair := range strings.Split(strings.TrimSpace(forwardedFull), ";") {
-			if tv := strings.SplitN(forwardedPair, "=", 2); len(tv) == 2 {
-				token, value := tv[0], tv[1]
-				value = strings.Trim(value, `"`)
+			token, value, found := strings.Cut(forwardedPair, "=")
+			value = strings.Trim(value, `"`)
+			if found && value != "" {
 				switch token {
 				case "proto":
 					f.proto = value

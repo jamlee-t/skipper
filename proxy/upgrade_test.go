@@ -22,6 +22,9 @@ import (
 	"github.com/zalando/skipper/routing"
 	"github.com/zalando/skipper/routing/testdataclient"
 	"golang.org/x/net/websocket"
+
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 )
 
 func getEmptyUpgradeRequest() *http.Request {
@@ -86,14 +89,15 @@ func TestValidGetUpgradeRequest(t *testing.T) {
 
 func TestServeHTTP(t *testing.T) {
 	for _, ti := range []struct {
-		msg                     string
-		route                   string
-		method                  string
-		backendClosesConnection bool
-		backendHangs            bool
-		noBackend               bool
-		backendStatusCode       int
-		expectedResponseBody    string
+		msg                        string
+		route                      string
+		method                     string
+		backendClosesConnection    bool
+		backendHangs               bool
+		noBackend                  bool
+		backendStatusCode          int
+		expectedResponseStatusCode int
+		expectedResponseBody       string
 	}{
 		{
 			msg:               "Load balanced route",
@@ -114,26 +118,37 @@ func TestServeHTTP(t *testing.T) {
 			backendStatusCode: http.StatusSwitchingProtocols,
 		},
 		{
-			msg:                     "Closed connection",
-			route:                   `route: Path("/ws") -> "%s";`,
-			method:                  http.MethodGet,
-			backendClosesConnection: true,
-			backendStatusCode:       http.StatusSwitchingProtocols,
+			msg:                        "Closed connection 101",
+			route:                      `route: Path("/ws") -> "%s";`,
+			method:                     http.MethodGet,
+			backendClosesConnection:    true,
+			backendStatusCode:          http.StatusSwitchingProtocols,
+			expectedResponseStatusCode: http.StatusServiceUnavailable,
 		},
 		{
-			msg:               "No backend",
-			route:             `route: Path("/ws") -> "%s";`,
-			method:            http.MethodGet,
-			noBackend:         true,
-			backendStatusCode: http.StatusSwitchingProtocols,
+			msg:                        "Closed connection 204",
+			route:                      `route: Path("/ws") -> "%s";`,
+			method:                     http.MethodGet,
+			backendClosesConnection:    true,
+			backendStatusCode:          http.StatusNoContent,
+			expectedResponseStatusCode: http.StatusNoContent,
 		},
 		{
-			msg:                     "backend reject upgrade",
-			route:                   `route: Path("/ws") -> "%s";`,
-			method:                  http.MethodPost,
-			backendStatusCode:       http.StatusBadRequest,
-			expectedResponseBody:    "BACKEND ERROR",
-			backendClosesConnection: true,
+			msg:                        "No backend",
+			route:                      `route: Path("/ws") -> "%s";`,
+			method:                     http.MethodGet,
+			noBackend:                  true,
+			backendStatusCode:          http.StatusSwitchingProtocols,
+			expectedResponseStatusCode: http.StatusServiceUnavailable,
+		},
+		{
+			msg:                        "backend reject upgrade",
+			route:                      `route: Path("/ws") -> "%s";`,
+			method:                     http.MethodPost,
+			backendClosesConnection:    true,
+			backendStatusCode:          http.StatusBadRequest,
+			expectedResponseStatusCode: http.StatusBadRequest,
+			expectedResponseBody:       "BACKEND ERROR",
 		},
 		{
 			msg:               "backend hangs",
@@ -145,36 +160,36 @@ func TestServeHTTP(t *testing.T) {
 	} {
 		t.Run(ti.msg, func(t *testing.T) {
 			ti := ti // trick race detector
-			var clientConnClosed atomic.Value
-			clientAlive := func() bool {
-				return clientConnClosed.Load() == nil
-			}
+			var clientConnClosed atomic.Bool
 
 			backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-				w.WriteHeader(ti.backendStatusCode)
 				if ti.backendClosesConnection {
+					// Set header first as 1xx headers are sent immediately by w.WriteHeader
 					w.Header().Set("Connection", "close")
+					w.WriteHeader(ti.backendStatusCode)
 					if len(ti.expectedResponseBody) > 0 {
 						w.Write([]byte(ti.expectedResponseBody))
 					}
 					return
 				}
+
+				w.WriteHeader(ti.backendStatusCode)
+
 				hj, ok := w.(http.Hijacker)
-				if !ok {
-					t.Error("webserver doesn't support hijacking")
-					return
-				}
+				require.True(t, ok, "webserver doesn't support hijacking")
+
 				conn, bufrw, err := hj.Hijack()
-				if err != nil {
-					t.Error(err.Error())
-					return
-				}
+				require.NoError(t, err)
+
+				// Closing server does not close hijacked connections so do it explicitly
 				defer conn.Close()
 
 				for {
 					s, err := bufrw.ReadString('\n')
-					if err != nil && clientAlive() {
-						t.Errorf("error reading string: %v", err)
+					if err != nil {
+						if !clientConnClosed.Load() {
+							t.Error(err)
+						}
 						return
 					}
 
@@ -190,40 +205,42 @@ func TestServeHTTP(t *testing.T) {
 					}
 
 					_, err = bufrw.WriteString(resp)
-					if err != nil && clientAlive() {
-						t.Error(err)
+					if err != nil {
+						if !clientConnClosed.Load() {
+							t.Error(err)
+						}
 						return
 					}
 					err = bufrw.Flush()
-					if err != nil && clientAlive() {
-						t.Error(err)
+					if err != nil {
+						if !clientConnClosed.Load() {
+							t.Error(err)
+						}
 						return
 					}
 				}
 			}))
-			defer backend.Close()
+
 			routes := fmt.Sprintf(ti.route, backend.URL)
+
 			if ti.noBackend {
 				backend.Close()
+			} else {
+				defer backend.Close()
 			}
+
 			tp, err := newTestProxyWithParams(routes, Params{ExperimentalUpgrade: true})
-			if err != nil {
-				t.Error(err)
-				return
-			}
+			require.NoError(t, err)
+
 			defer tp.close()
 
-			skipper := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-				tp.proxy.ServeHTTP(w, r)
-			}))
+			skipper := httptest.NewServer(tp.proxy)
 			defer skipper.Close()
 
 			skipperUrl, _ := url.Parse(skipper.URL)
 			conn, err := net.Dial("tcp", skipperUrl.Host)
-			if err != nil {
-				t.Error(err)
-				return
-			}
+			require.NoError(t, err)
+
 			defer func() {
 				clientConnClosed.Store(true)
 				conn.Close()
@@ -239,63 +256,33 @@ func TestServeHTTP(t *testing.T) {
 				},
 			}
 			err = r.Write(conn)
-			if err != nil {
-				t.Error(err)
-				return
-			}
+			require.NoError(t, err)
 
 			reader := bufio.NewReader(conn)
 			resp, err := http.ReadResponse(reader, r)
-			if err != nil {
-				t.Error(err)
-				return
-			}
-			if resp.StatusCode != http.StatusSwitchingProtocols {
-				if resp.StatusCode == ti.backendStatusCode {
-					// check Body
-					data, err := io.ReadAll(resp.Body)
-					if err != nil {
-						t.Error(err)
-						return
-					}
-					if string(data) != ti.expectedResponseBody {
-						t.Errorf("wrong response body: %s, expected %s", string(data), ti.expectedResponseBody)
-					}
-					return
-				}
+			require.NoError(t, err)
 
-				if ti.method == http.MethodPost || ti.noBackend {
-					return
+			if resp.StatusCode != http.StatusSwitchingProtocols {
+				assert.Equal(t, ti.expectedResponseStatusCode, resp.StatusCode)
+
+				if ti.expectedResponseBody != "" {
+					data, err := io.ReadAll(resp.Body)
+					require.NoError(t, err)
+
+					assert.Equal(t, ti.expectedResponseBody, string(data))
 				}
-				t.Errorf("wrong response status <%d>, expected <%d>", resp.StatusCode, ti.backendStatusCode)
 				return
 			}
 
 			_, err = conn.Write([]byte("ping\n"))
-			if err != nil {
-				t.Error(err)
-				return
-			}
+			require.NoError(t, err)
+
 			pong, err := reader.ReadString('\n')
 			if ti.backendHangs {
-				if err != io.EOF {
-					t.Error("expected EOF on closed connection read")
-				}
-				return
-			}
-			if err != nil {
-				t.Error(err)
-				return
-			}
-			if ti.backendClosesConnection {
-				if pong != "HTTP/1.1 400 Bad Request\r\n" {
-					t.Errorf("wrong bad response <%s>", pong)
-				}
-				return
-			}
-			if pong != "pong\n" {
-				t.Errorf("wrong response <%s>", pong)
-				return
+				assert.Equal(t, io.EOF, err, "expected EOF on closed connection read")
+			} else {
+				require.NoError(t, err)
+				assert.Equal(t, "pong\n", pong)
 			}
 		})
 	}
@@ -353,24 +340,26 @@ func TestInvalidHTTPDialBackend(t *testing.T) {
 
 func TestAuditLogging(t *testing.T) {
 	message := strconv.Itoa(rand.Int())
-	test := func(enabled bool, check func(*testing.T, *bytes.Buffer, *bytes.Buffer)) func(t *testing.T) {
+	test := func(enabled bool, check func(*testing.T, string, string)) func(t *testing.T) {
 		return func(t *testing.T) {
 			wss := httptest.NewServer(websocket.Handler(func(ws *websocket.Conn) {
 				if _, err := io.Copy(ws, ws); err != nil {
-					t.Fatal(err)
+					t.Error(err)
 				}
 			}))
-
 			defer wss.Close()
 
 			// only used as poor man's sync, the audit log in question goes stdout and stderr,
 			// see below
 			tl := loggingtest.New()
+			defer tl.Close()
+
+			dc := testdataclient.New([]*eskip.Route{{Backend: wss.URL}})
+			defer dc.Close()
+
 			rt := routing.New(routing.Options{
-				DataClients: []routing.DataClient{
-					testdataclient.New([]*eskip.Route{{Backend: wss.URL}}),
-				},
-				Log: tl,
+				DataClients: []routing.DataClient{dc},
+				Log:         tl,
 			})
 			defer rt.Close()
 
@@ -422,18 +411,18 @@ func TestAuditLogging(t *testing.T) {
 				<-p.auditLogHook
 			}
 
-			check(t, sout, serr)
+			check(t, sout.String(), serr.String())
 		}
 	}
 
-	t.Run("off", test(false, func(t *testing.T, sout, serr *bytes.Buffer) {
-		if sout.Len() != 0 || serr.Len() != 0 {
-			t.Error("failed to disable audit log")
+	t.Run("off", test(false, func(t *testing.T, sout, serr string) {
+		if sout != "" || len(serr) != 0 {
+			t.Errorf("failed to disable audit log: %s", sout)
 		}
 	}))
 
-	t.Run("on", test(true, func(t *testing.T, sout, serr *bytes.Buffer) {
-		if !strings.Contains(sout.String(), message) || serr.Len() == 0 {
+	t.Run("on", test(true, func(t *testing.T, sout, serr string) {
+		if !strings.Contains(sout, message) || len(serr) == 0 {
 			t.Error("failed to enable audit log")
 		}
 	}))

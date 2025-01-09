@@ -1,6 +1,3 @@
-//go:build !race
-// +build !race
-
 package proxy_test
 
 import (
@@ -44,7 +41,8 @@ const (
 )
 
 func urlHostNerr(u string) string {
-	return strings.Split(u, "//")[1]
+	_, v, _ := strings.Cut(u, "//")
+	return v
 }
 
 func newBreakerProxy(

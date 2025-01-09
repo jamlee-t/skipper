@@ -19,19 +19,19 @@ backend skippers.
 
 Start the proxy that listens on port 9999 and serves all requests with a single route, that
 proxies to two backends using the round robin algorithm:
-```
+```sh
 ./bin/skipper -inline-routes='r1: * -> <roundRobin, "http://127.0.0.1:9001", "http://127.0.0.1:9002">' --address :9999
 ```
 
 Start two backends, with similar routes, one responds with "1" and the
 other with "2" in the HTTP response body:
-```
+```sh
 ./bin/skipper -inline-routes='r1: * -> inlineContent("1") -> <shunt>' --address :9001 &
 ./bin/skipper -inline-routes='r1: * -> inlineContent("2") -> <shunt>' --address :9002
 ```
 
 Test the proxy with curl as a client:
-```
+```sh
 curl -s http://localhost:9999/foo
 1
 curl -s http://localhost:9999/foo
@@ -41,12 +41,51 @@ curl -s http://localhost:9999/foo
 curl -s http://localhost:9999/foo
 2
 ```
+
+### Debugging Skipper
+
+It can be helpful to run Skipper in a debug session locally that enables one to inspect variables and do other debugging activities in order to analyze filter and token states.
+
+For *Visual Studion Code* users, a simple setup could be to create following *launch configuration* that compiles Skipper, runs it in a *Delve* debug session, and then opens the default web browser creating the request. By setting a breakpoint, you can inspect the state of the filter or application. This setup is especially useful when inspecting *oauth* flows and tokens as it allows stepping through the states.
+
+<details>
+<summary>Example `.vscode/launch.json` file</summary>
+
+```json
+{
+    "version": "0.2.0",
+    "configurations": [
+        {
+            "name": "Launch Package",
+            "type": "go",
+            "request": "launch",
+            "mode": "debug",
+            "program": "${workspaceFolder}/cmd/skipper/main.go",
+            "args": [
+                "-application-log-level=debug",
+                "-address=:9999",
+                "-inline-routes=PathSubtree(\"/\") -> inlineContent(\"Hello World\") -> <shunt>",
+               // example OIDC setup, using https://developer.microsoft.com/en-us/microsoft-365/dev-program
+               //  "-oidc-secrets-file=${workspaceFolder}/.vscode/launch.json",
+               //  "-inline-routes=* -> oauthOidcAnyClaims(\"https://login.microsoftonline.com/<tenant Id>/v2.0\",\"<application id>\",\"<client secret>\",\"http://localhost:9999/authcallback\", \"profile\", \"\", \"\", \"x-auth-email:claims.email x-groups:claims.groups\") -> inlineContent(\"restricted access\") -> <shunt>",
+            ],
+            "serverReadyAction": {
+                "pattern": "route settings applied",
+                "uriFormat": "http://localhost:9999",
+                "action": "openExternally"
+            }
+        }
+    ]
+}
+```
+
+</details>
 
 ## Docs
 
 We have user documentation and developer documentation separated.
 In `docs/` you find the user documentation in [mkdocs](https://www.mkdocs.org/) format and
-rendered at [https://opensource.zalando.com/skipper](https://opensource.zalando.com/skipper).
+rendered at [https://opensource.zalando.com/skipper](https://opensource.zalando.com/skipper) which is updated automatically with each `docs/` change merged to `master` branch.
 Developer documentation for skipper as library users
 [godoc format](https://blog.golang.org/godoc-documenting-go-code) is used and rendered at [https://godoc.org/github.com/zalando/skipper](https://godoc.org/github.com/zalando/skipper).
 
@@ -70,8 +109,6 @@ process. A spec has to satisfy the `filters.Spec` interface `Name() string` and
 
 The actual filter implementation has to satisfy the `filter.Filter`
 interface `Request(filters.FilterContext)` and `Response(filters.FilterContext)`.
-If you need to clean up for example a goroutine you can do it in
-`Close()`, which will be called on filter shutdown.
 
 The simplest filter possible is, if `filters.Spec` and
 `filters.Filter` are the same type:
@@ -79,7 +116,7 @@ The simplest filter possible is, if `filters.Spec` and
 ```go
 type myFilter struct{}
 
-func NewMyFilter() filters.Spec {
+func NewMyFilter() *myFilter {
 	return &myFilter{}
 }
 
@@ -99,6 +136,86 @@ func (f *myFilter) Response(ctx filters.FilterContext) {
 ```
 
 Find a detailed example at [how to develop a filter](../reference/development.md#how-to-develop-a-filter).
+
+### Filters with cleanup
+
+Sometimes your filter needs to cleanup resources on shutdown. In Go
+functions that do this have often the name `Close()`.
+There is the `filters.FilterCloser` interface that if you comply with
+it, the routing.Route will make sure your filters are closed in case
+of `routing.Routing` was closed.
+
+```go
+type myFilter struct{}
+
+func NewMyFilter() *myFilter {
+	return &myFilter{}
+}
+
+func (spec *myFilter) Name() string { return "myFilter" }
+
+func (spec *myFilter) CreateFilter(config []interface{}) (filters.Filter, error) {
+     return NewMyFilter(), nil
+}
+
+func (f *myFilter) Request(ctx filters.FilterContext) {
+     // change data in ctx.Request() for example
+}
+
+func (f *myFilter) Response(ctx filters.FilterContext) {
+     // change data in ctx.Response() for example
+}
+
+func (f *myFilter) Close() error {
+     // cleanup your filter
+}
+```
+
+### Filters with error handling
+
+Sometimes you want to have a filter that wants to get called
+`Response()` even if the proxy will not send a response from the
+backend, for example you want to count error status codes, like
+the [admissionControl](../reference/filters.md#admissioncontrol)
+filter.
+In this case you need to comply with the following proxy interface:
+
+```go
+// errorHandlerFilter is an opt-in for filters to get called
+// Response(ctx) in case of errors.
+type errorHandlerFilter interface {
+	// HandleErrorResponse returns true in case a filter wants to get called
+	HandleErrorResponse() bool
+}
+```
+
+Example:
+```go
+type myFilter struct{}
+
+func NewMyFilter() *myFilter {
+	return &myFilter{}
+}
+
+func (spec *myFilter) Name() string { return "myFilter" }
+
+func (spec *myFilter) CreateFilter(config []interface{}) (filters.Filter, error) {
+     return NewMyFilter(), nil
+}
+
+func (f *myFilter) Request(ctx filters.FilterContext) {
+     // change data in ctx.Request() for example
+}
+
+func (f *myFilter) Response(ctx filters.FilterContext) {
+     // change data in ctx.Response() for example
+}
+
+func (f *myFilter) HandleErrorResponse() bool() {
+     return true
+}
+```
+
 
 ## Predicates
 

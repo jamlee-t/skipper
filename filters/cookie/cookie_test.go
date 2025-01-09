@@ -1,11 +1,11 @@
 package cookie
 
 import (
-	"github.com/zalando/skipper/filters"
-	"github.com/zalando/skipper/filters/filtertest"
 	"net/http"
 	"testing"
-	"time"
+
+	"github.com/zalando/skipper/filters"
+	"github.com/zalando/skipper/filters/filtertest"
 )
 
 func TestCreateFilter(t *testing.T) {
@@ -64,7 +64,7 @@ func TestCreateFilter(t *testing.T) {
 		filter{},
 		true,
 	}, {
-		"wrong ttl type",
+		"wrong Max-Age type",
 		response,
 		[]interface{}{"test-cookie", "A", "42"},
 		filter{},
@@ -88,7 +88,7 @@ func TestCreateFilter(t *testing.T) {
 		filter{},
 		true,
 	}, {
-		"wrong ttl type, JS",
+		"wrong Max-Age type, JS",
 		responseJS,
 		[]interface{}{"test-cookie", "A", "42"},
 		filter{},
@@ -109,19 +109,19 @@ func TestCreateFilter(t *testing.T) {
 		"response persistent cookie",
 		response,
 		[]interface{}{"test-cookie", "A", 42.0},
-		filter{typ: response, name: "test-cookie", value: "A", ttl: 42 * time.Second},
+		filter{typ: response, name: "test-cookie", value: "A", maxAge: 42},
 		false,
 	}, {
 		"response persistent cookie, not change only, explicit",
 		response,
 		[]interface{}{"test-cookie", "A", 42.0, "always"},
-		filter{typ: response, name: "test-cookie", value: "A", ttl: 42 * time.Second},
+		filter{typ: response, name: "test-cookie", value: "A", maxAge: 42},
 		false,
 	}, {
 		"response persistent cookie, change only",
 		response,
 		[]interface{}{"test-cookie", "A", 42.0, ChangeOnlyArg},
-		filter{typ: response, name: "test-cookie", value: "A", ttl: 42 * time.Second, changeOnly: true},
+		filter{typ: response, name: "test-cookie", value: "A", maxAge: 42, changeOnly: true},
 		false,
 	}, {
 		"response session cookie, JS",
@@ -133,19 +133,19 @@ func TestCreateFilter(t *testing.T) {
 		"response persistent cookie, JS",
 		responseJS,
 		[]interface{}{"test-cookie", "A", 42.0},
-		filter{typ: response, name: "test-cookie", value: "A", ttl: 42 * time.Second},
+		filter{typ: response, name: "test-cookie", value: "A", maxAge: 42},
 		false,
 	}, {
 		"response persistent cookie, not change only, explicit, JS",
 		responseJS,
 		[]interface{}{"test-cookie", "A", 42.0, "always"},
-		filter{typ: response, name: "test-cookie", value: "A", ttl: 42 * time.Second},
+		filter{typ: response, name: "test-cookie", value: "A", maxAge: 42},
 		false,
 	}, {
 		"response persistent cookie, change only, JS",
 		responseJS,
 		[]interface{}{"test-cookie", "A", 42.0, ChangeOnlyArg},
-		filter{typ: response, name: "test-cookie", value: "A", ttl: 42 * time.Second, changeOnly: true},
+		filter{typ: response, name: "test-cookie", value: "A", maxAge: 42, changeOnly: true},
 		false,
 	}} {
 		var s filters.Spec
@@ -176,8 +176,8 @@ func TestCreateFilter(t *testing.T) {
 				t.Error(ti.msg, "value", ff.value, ti.check.value)
 			}
 
-			if ff.ttl != ti.check.ttl {
-				t.Error(ti.msg, "ttl", ff.ttl, ti.check.ttl)
+			if ff.maxAge != ti.check.maxAge {
+				t.Error(ti.msg, "Max-Age", ff.maxAge, ti.check.maxAge)
 			}
 		}
 	}
@@ -213,7 +213,7 @@ func TestSetCookie(t *testing.T) {
 			Domain:   domain,
 			Path:     "/"},
 	}, {
-		"response cookie, with ttl",
+		"response cookie, with Max-Age",
 		response,
 		[]interface{}{"test-cookie", "A", 42.0},
 		"",
@@ -225,7 +225,20 @@ func TestSetCookie(t *testing.T) {
 			Path:     "/",
 			MaxAge:   42},
 	}, {
-		"response cookie, with non-sliding ttl",
+		"delete response cookie",
+		response,
+		[]interface{}{"test-cookie", "deleted", 0.0},
+		"",
+		&http.Cookie{
+			Name:     "test-cookie",
+			Value:    "deleted",
+			HttpOnly: true,
+			Domain:   domain,
+			Path:     "/",
+			MaxAge:   -1,
+		},
+	}, {
+		"response cookie, with non-sliding Max-Age",
 		response,
 		[]interface{}{"test-cookie", "A", 42.0, ChangeOnlyArg},
 		"",
@@ -237,7 +250,7 @@ func TestSetCookie(t *testing.T) {
 			Path:     "/",
 			MaxAge:   42},
 	}, {
-		"response cookie, with non-sliding ttl, request contains different value",
+		"response cookie, with non-sliding Max-Age, request contains different value",
 		response,
 		[]interface{}{"test-cookie", "A", 42.0, ChangeOnlyArg},
 		"B",
@@ -249,7 +262,7 @@ func TestSetCookie(t *testing.T) {
 			Path:     "/",
 			MaxAge:   42},
 	}, {
-		"response cookie, with non-sliding ttl, request contains the same value",
+		"response cookie, with non-sliding Max-Age, request contains the same value",
 		response,
 		[]interface{}{"test-cookie", "A", 42.0, ChangeOnlyArg},
 		"A",
@@ -265,7 +278,7 @@ func TestSetCookie(t *testing.T) {
 			Domain: domain,
 			Path:   "/"},
 	}, {
-		"response cookie, with ttl, JS",
+		"response cookie, with Max-Age, JS",
 		responseJS,
 		[]interface{}{"test-cookie", "A", 42.0},
 		"",
@@ -276,7 +289,19 @@ func TestSetCookie(t *testing.T) {
 			Path:   "/",
 			MaxAge: 42},
 	}, {
-		"response cookie, with non-sliding ttl, JS",
+		"delete response js cookie",
+		responseJS,
+		[]interface{}{"test-cookie", "deleted", 0.0},
+		"",
+		&http.Cookie{
+			Name:   "test-cookie",
+			Value:  "deleted",
+			Domain: domain,
+			Path:   "/",
+			MaxAge: -1,
+		},
+	}, {
+		"response cookie, with non-sliding Max-Age, JS",
 		responseJS,
 		[]interface{}{"test-cookie", "A", 42.0, ChangeOnlyArg},
 		"",
@@ -287,7 +312,7 @@ func TestSetCookie(t *testing.T) {
 			Path:   "/",
 			MaxAge: 42},
 	}, {
-		"response cookie, with non-sliding ttl, request contains different value, JS",
+		"response cookie, with non-sliding Max-Age, request contains different value, JS",
 		responseJS,
 		[]interface{}{"test-cookie", "A", 42.0, ChangeOnlyArg},
 		"B",
@@ -298,7 +323,7 @@ func TestSetCookie(t *testing.T) {
 			Path:   "/",
 			MaxAge: 42},
 	}, {
-		"response cookie, with non-sliding ttl, request contains the same value, JS",
+		"response cookie, with non-sliding Max-Age, request contains the same value, JS",
 		responseJS,
 		[]interface{}{"test-cookie", "A", 42.0, ChangeOnlyArg},
 		"A",
@@ -381,4 +406,303 @@ func TestSetCookie(t *testing.T) {
 			}
 		}
 	}
+}
+
+func TestDropRequestCookie(t *testing.T) {
+	for _, tt := range []struct {
+		name        string
+		arg         string
+		cookies     http.Header
+		wantCookies map[string][]string
+	}{
+		{
+			name:        "test no cookies",
+			arg:         "no-cookie",
+			cookies:     nil,
+			wantCookies: nil,
+		},
+		{
+			name: "test one cookie not match",
+			arg:  "no-match",
+			cookies: http.Header{
+				"Cookie": []string{
+					"foo=foo1",
+				},
+			},
+			wantCookies: map[string][]string{"foo": {"foo1"}},
+		},
+		{
+			name: "test one cookie with match",
+			arg:  "foo",
+			cookies: http.Header{
+				"Cookie": []string{
+					"foo=foo1",
+				},
+			},
+			wantCookies: nil,
+		},
+		{
+			name: "test two cookies and one cookie with match",
+			arg:  "foo",
+			cookies: http.Header{
+				"Cookie": []string{
+					"foo=foo1",
+					"bar=baz",
+				},
+			},
+			wantCookies: map[string][]string{"bar": {"baz"}},
+		},
+		{
+			name: "test two cookies with the same name and no match",
+			arg:  "foo",
+			cookies: http.Header{
+				"Cookie": []string{
+					"bar=foo1",
+					"bar=baz",
+				},
+			},
+			wantCookies: map[string][]string{"bar": {"foo1", "baz"}},
+		},
+		{
+			name: "test two cookies with the same name and both match match",
+			arg:  "foo",
+			cookies: http.Header{
+				"Cookie": []string{
+					"foo=foo1",
+					"foo=baz",
+				},
+			},
+			wantCookies: nil,
+		},
+		{
+			name: "test one multivalue cookie with 2 names and no match",
+			arg:  "foo",
+			cookies: http.Header{
+				"Cookie": []string{
+					"bar=foo1;qux=baz",
+				},
+			},
+			wantCookies: map[string][]string{"bar": {"foo1"}, "qux": {"baz"}},
+		},
+		{
+			name: "test one multivalue cookie with 2 same names and no match",
+			arg:  "foo",
+			cookies: http.Header{
+				"Cookie": []string{
+					"bar=foo1;bar=baz",
+				},
+			},
+			wantCookies: map[string][]string{"bar": {"foo1", "baz"}},
+		},
+		{
+			name: "test one multivalue cookie with 2 names and one match",
+			arg:  "foo",
+			cookies: http.Header{
+				"Cookie": []string{
+					"bar=foo1;foo=baz",
+				},
+			},
+			wantCookies: map[string][]string{"bar": {"foo1"}},
+		},
+		{
+			name: "test one multivalue cookie with the same name and both match",
+			arg:  "foo",
+			cookies: http.Header{
+				"Cookie": []string{
+					"foo=foo1;foo=bar",
+				},
+			},
+			wantCookies: nil,
+		}} {
+		t.Run(tt.name, func(t *testing.T) {
+			spec := NewDropRequestCookie()
+			f, err := spec.CreateFilter([]interface{}{tt.arg})
+			if err != nil {
+				t.Fatalf("Failed to create filter: %v", err)
+			}
+
+			if f == nil {
+				t.Fatal("Failed to create filter: filter nil")
+			}
+
+			ctx := &filtertest.Context{
+				FRequest: &http.Request{
+					Header: tt.cookies,
+					Host:   "foo"},
+				FStateBag: map[string]interface{}{},
+				FResponse: &http.Response{Header: http.Header{}},
+			}
+
+			f.Request(ctx)
+
+			if c, err := ctx.Request().Cookie(tt.arg); err != http.ErrNoCookie {
+				t.Fatalf("Failed to delete cookie %s: %q", tt.arg, c)
+			}
+
+			for k, a := range tt.wantCookies {
+				cookie, err := ctx.Request().Cookie(k)
+				if err != nil {
+					t.Fatalf("Failed to get cookie %q: %v", k, err)
+				}
+
+				v := a[0]
+				if cookie.Value != v {
+					t.Fatalf("Failed to get cookie value %q, got: %q", v, cookie.Value)
+				}
+			}
+
+			for _, cookie := range ctx.Request().Cookies() {
+				if a, ok := tt.wantCookies[cookie.Name]; !ok {
+					t.Fatalf("Failed to delete cookie: %s", cookie.Name)
+				} else {
+					found := false
+					for _, v := range a {
+						if v == cookie.Value {
+							found = true
+							break
+						}
+					}
+					if !found {
+						t.Fatalf("Failed to get the expected cookie value, got: %s", cookie.Value)
+					}
+
+				}
+			}
+		})
+	}
+
+}
+
+func TestDropResponseCookie(t *testing.T) {
+	for _, tt := range []struct {
+		name        string
+		arg         string
+		cookies     http.Header
+		wantCookies map[string][]string
+	}{
+		{
+			name:        "test no cookies",
+			arg:         "no-cookie",
+			cookies:     nil,
+			wantCookies: nil,
+		},
+		{
+			name: "test one cookie not match",
+			arg:  "no-match",
+			cookies: http.Header{
+				"Set-Cookie": []string{
+					"foo=foo1",
+				},
+			},
+			wantCookies: map[string][]string{"foo": {"foo1"}},
+		},
+		{
+			name: "test one cookie with match",
+			arg:  "foo",
+			cookies: http.Header{
+				"Set-Cookie": []string{
+					"foo=foo1",
+				},
+			},
+			wantCookies: nil,
+		},
+		{
+			name: "test two cookies and one cookie with match",
+			arg:  "foo",
+			cookies: http.Header{
+				"Set-Cookie": []string{
+					"foo=foo1",
+					"bar=baz",
+				},
+			},
+			wantCookies: map[string][]string{"bar": {"baz"}},
+		},
+		{
+			name: "test two cookies with the same name and no match",
+			arg:  "foo",
+			cookies: http.Header{
+				"Set-Cookie": []string{
+					"bar=foo1",
+					"bar=baz",
+				},
+			},
+			wantCookies: map[string][]string{"bar": {"foo1", "baz"}},
+		},
+		{
+			name: "test two cookies with the same name and both match match",
+			arg:  "foo",
+			cookies: http.Header{
+				"Set-Cookie": []string{
+					"foo=foo1",
+					"foo=baz",
+				},
+			},
+			wantCookies: nil,
+		}} {
+		t.Run(tt.name, func(t *testing.T) {
+			spec := NewDropResponseCookie()
+			f, err := spec.CreateFilter([]interface{}{tt.arg})
+			if err != nil {
+				t.Fatalf("Failed to create filter: %v", err)
+			}
+
+			if f == nil {
+				t.Fatal("Failed to create filter: filter nil")
+			}
+
+			ctx := &filtertest.Context{
+				FRequest:  &http.Request{},
+				FStateBag: map[string]interface{}{},
+				FResponse: &http.Response{Header: tt.cookies},
+			}
+
+			f.Response(ctx)
+
+			findCookie := func(name string, cookies []*http.Cookie) *http.Cookie {
+				for _, c := range cookies {
+					if name == c.Name {
+						return c
+					}
+				}
+				return nil
+			}
+
+			cookies := ctx.Response().Cookies()
+			c := findCookie(tt.arg, cookies)
+			if c != nil {
+				t.Fatalf("Failed to delete cookie %s: %q", tt.arg, c)
+			}
+
+			for k, a := range tt.wantCookies {
+				cookie := findCookie(k, cookies)
+				if cookie == nil {
+					t.Fatalf("Failed to find cookie %q", k)
+				}
+
+				v := a[0]
+				if cookie.Value != v {
+					t.Fatalf("Failed to get cookie value %q, got: %q", v, cookie.Value)
+				}
+			}
+
+			for _, cookie := range cookies {
+				if a, ok := tt.wantCookies[cookie.Name]; !ok {
+					t.Fatalf("Failed to delete cookie: %s", cookie.Name)
+				} else {
+					found := false
+					for _, v := range a {
+						if v == cookie.Value {
+							found = true
+							break
+						}
+					}
+					if !found {
+						t.Fatalf("Failed to get the expected cookie value, got: %s", cookie.Value)
+					}
+
+				}
+			}
+		})
+	}
+
 }

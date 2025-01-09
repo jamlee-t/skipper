@@ -6,7 +6,6 @@ import (
 	"math/rand"
 	"net/http"
 	"sort"
-	"strconv"
 	"testing"
 	"time"
 
@@ -210,93 +209,6 @@ func TestRandom(t *testing.T) {
 				}
 			}
 		}()
-	}
-}
-
-func TestRepeat(t *testing.T) {
-	for _, ti := range []struct {
-		args     []interface{}
-		err      bool
-		expected string
-	}{{
-		args: []interface{}{},
-		err:  true,
-	}, {
-		args: []interface{}{1, "wrong types"},
-		err:  true,
-	}, {
-		args: []interface{}{"too few arguments"},
-		err:  true,
-	}, {
-		args: []interface{}{"too many arguments", 10.0, "extra"},
-		err:  true,
-	}, {
-		args: []interface{}{"length is not a number", "10"},
-		err:  true,
-	}, {
-		args: []interface{}{"", 10},
-		err:  true,
-	}, {
-		args: []interface{}{"negative length", -1},
-		err:  true,
-	}, {
-		args:     []interface{}{"zero length", 0},
-		expected: "",
-	}, {
-		args:     []interface{}{"1", 1},
-		expected: "1",
-	}, {
-		args:     []interface{}{"float", 2.0},
-		expected: "fl",
-	}, {
-		args:     []interface{}{"0123456789", 3},
-		expected: "012",
-	}, {
-		args:     []interface{}{"0123456789", 30},
-		expected: "012345678901234567890123456789",
-	}} {
-		repeat := NewRepeat()
-		_, err := repeat.CreateFilter(ti.args)
-		if ti.err {
-			if err == nil {
-				t.Errorf("expected error for %v", ti.args)
-			}
-			continue
-		} else {
-			if err != nil {
-				t.Errorf("unexpected error %v for %v", err, ti.args)
-				continue
-			}
-		}
-
-		p := proxytest.New(filters.Registry{filters.RepeatContentName: repeat}, &eskip.Route{
-			Filters: []*eskip.Filter{{Name: filters.RepeatContentName, Args: ti.args}},
-			Shunt:   true})
-		defer p.Close()
-
-		rsp, err := http.Get(p.URL)
-		if err != nil {
-			t.Fatal(err)
-		}
-		defer rsp.Body.Close()
-
-		if rsp.StatusCode != http.StatusOK {
-			t.Fatalf("request failed: %d", rsp.StatusCode)
-		}
-
-		b, err := io.ReadAll(rsp.Body)
-		if err != nil {
-			t.Fatal(err)
-		}
-
-		got := string(b)
-		if got != ti.expected {
-			t.Errorf("result mismatch for %v", ti.args)
-		}
-
-		if rsp.Header.Get("Content-Length") != strconv.Itoa(len(ti.expected)) {
-			t.Error("content length mismatch")
-		}
 	}
 }
 
@@ -860,11 +772,11 @@ func TestRequestLatency(t *testing.T) {
 			spec:    NewUniformRequestLatency,
 			args:    []interface{}{"10ms", "5ms"},
 			p10:     6 * time.Millisecond,
-			p25:     9 * time.Millisecond,
+			p25:     8 * time.Millisecond,
 			p50:     11 * time.Millisecond,
 			p75:     13 * time.Millisecond,
 			p90:     14 * time.Millisecond,
-			epsilon: time.Millisecond,
+			epsilon: 2 * time.Millisecond,
 		},
 		{
 			msg:     "test normal latency",
@@ -875,7 +787,7 @@ func TestRequestLatency(t *testing.T) {
 			p50:     11 * time.Millisecond,
 			p75:     14 * time.Millisecond,
 			p90:     17 * time.Millisecond,
-			epsilon: time.Millisecond,
+			epsilon: 2 * time.Millisecond,
 		}} {
 
 		t.Run(ti.msg, func(t *testing.T) {
@@ -886,12 +798,12 @@ func TestRequestLatency(t *testing.T) {
 			}
 
 			N := 1000
-			res := make([]time.Duration, N)
+
+			res := make([]time.Duration, 0, N)
+			SetSleep(f, func(d time.Duration) { res = append(res, d) })
+
 			for i := 0; i < N; i++ {
-				start := time.Now()
 				f.Request(nil)
-				d := time.Since(start)
-				res[i] = d
 			}
 
 			sort.Slice(res, func(i, j int) bool {
@@ -939,11 +851,11 @@ func TestResponseLatency(t *testing.T) {
 			spec:    NewUniformResponseLatency,
 			args:    []interface{}{"10ms", "5ms"},
 			p10:     7 * time.Millisecond,
-			p25:     9 * time.Millisecond,
+			p25:     8 * time.Millisecond,
 			p50:     11 * time.Millisecond,
 			p75:     13 * time.Millisecond,
 			p90:     14 * time.Millisecond,
-			epsilon: time.Millisecond,
+			epsilon: 2 * time.Millisecond,
 		},
 		{
 			msg:     "test response normal latency",
@@ -954,7 +866,7 @@ func TestResponseLatency(t *testing.T) {
 			p50:     11 * time.Millisecond,
 			p75:     14 * time.Millisecond,
 			p90:     17 * time.Millisecond,
-			epsilon: time.Millisecond,
+			epsilon: 2 * time.Millisecond,
 		}} {
 
 		t.Run(ti.msg, func(t *testing.T) {
@@ -965,12 +877,12 @@ func TestResponseLatency(t *testing.T) {
 			}
 
 			N := 1000
-			res := make([]time.Duration, N)
+
+			res := make([]time.Duration, 0, N)
+			SetSleep(f, func(d time.Duration) { res = append(res, d) })
+
 			for i := 0; i < N; i++ {
-				start := time.Now()
 				f.Response(nil)
-				d := time.Since(start)
-				res[i] = d
 			}
 
 			sort.Slice(res, func(i, j int) bool {

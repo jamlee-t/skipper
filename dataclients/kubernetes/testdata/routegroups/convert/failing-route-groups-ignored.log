@@ -1,1 +1,2 @@
-[[]routegroup[]] error transforming
+Ignoring route: service not found: foo/non-existent
+kind=RouteGroup name=myapp-no-service ns=foo

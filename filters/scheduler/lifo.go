@@ -7,7 +7,6 @@ import (
 	"github.com/aryszka/jobqueue"
 	"github.com/opentracing/opentracing-go"
 	"github.com/opentracing/opentracing-go/ext"
-	log "github.com/sirupsen/logrus"
 	"github.com/zalando/skipper/filters"
 	"github.com/zalando/skipper/scheduler"
 )
@@ -86,7 +85,7 @@ func (s *lifoSpec) Name() string { return filters.LifoName }
 // MaxConcurrency and MaxQueueSize: total max = MaxConcurrency + MaxQueueSize
 //
 // Min values are 1 for MaxConcurrency and MaxQueueSize, and 1ms for
-// Timeout. All configration that is below will be set to these min
+// Timeout. All configuration that is below will be set to these min
 // values.
 func (s *lifoSpec) CreateFilter(args []interface{}) (filters.Filter, error) {
 	var l lifoFilter
@@ -154,7 +153,7 @@ func (*lifoGroupSpec) Name() string { return filters.LifoGroupName }
 // MaxConcurrency and MaxQueueSize: total max = MaxConcurrency + MaxQueueSize
 //
 // Min values are 1 for MaxConcurrency and MaxQueueSize, and 1ms for
-// Timeout. All configration that is below will be set to these min
+// Timeout. All configuration that is below will be set to these min
 // values.
 //
 // It is enough to set the concurrency, queue size and timeout parameters for
@@ -163,7 +162,6 @@ func (*lifoGroupSpec) Name() string { return filters.LifoGroupName }
 // one of them will be used as the source for the applied settings, if there
 // is accidentally a difference between the settings in the same group, a
 // warning will be logged.
-//
 func (*lifoGroupSpec) CreateFilter(args []interface{}) (filters.Filter, error) {
 	if len(args) < 1 || len(args) > 4 {
 		return nil, filters.ErrInvalidFilterParameters
@@ -235,11 +233,17 @@ func (l *lifoFilter) GetQueue() *scheduler.Queue {
 	return l.queue
 }
 
+// Close will cleanup underlying queues
+func (l *lifoFilter) Close() error {
+	l.queue.Close()
+	return nil
+}
+
 // Request is the filter.Filter interface implementation. Request will
 // increase the number of inflight requests and respond to the caller,
 // if the bounded queue returns an error. Status code by Error:
 //
-// - 503 if jobqueue.ErrQueueFull
+// - 503 if jobqueue.ErrStackFull
 // - 502 if jobqueue.ErrTimeout
 func (l *lifoFilter) Request(ctx filters.FilterContext) {
 	request(l.GetQueue(), scheduler.LIFOKey, ctx)
@@ -249,6 +253,12 @@ func (l *lifoFilter) Request(ctx filters.FilterContext) {
 // will decrease the number of inflight requests.
 func (l *lifoFilter) Response(ctx filters.FilterContext) {
 	response(scheduler.LIFOKey, ctx)
+}
+
+// HandleErrorResponse is to opt-in for filters to get called
+// Response(ctx) in case of errors via proxy. It has to return true to opt-in.
+func (l *lifoFilter) HandleErrorResponse() bool {
+	return true
 }
 
 func (l *lifoGroupFilter) Group() string {
@@ -274,6 +284,12 @@ func (l *lifoGroupFilter) GetQueue() *scheduler.Queue {
 	return l.queue
 }
 
+// Close will cleanup underlying queues
+func (l *lifoGroupFilter) Close() error {
+	l.queue.Close()
+	return nil
+}
+
 // Request is the filter.Filter interface implementation. Request will
 // increase the number of inflight requests and respond to the caller,
 // if the bounded queue returns an error. Status code by Error:
@@ -290,9 +306,15 @@ func (l *lifoGroupFilter) Response(ctx filters.FilterContext) {
 	response(scheduler.LIFOKey, ctx)
 }
 
+// HandleErrorResponse is to opt-in for filters to get called
+// Response(ctx) in case of errors via proxy. It has to return true to opt-in.
+func (l *lifoGroupFilter) HandleErrorResponse() bool {
+	return true
+}
+
 func request(q *scheduler.Queue, key string, ctx filters.FilterContext) {
 	if q == nil {
-		log.Warningf("Unexpected scheduler.Queue is nil for key %s", key)
+		ctx.Logger().Warnf("Unexpected scheduler.Queue is nil for key %s", key)
 		return
 	}
 
@@ -303,19 +325,19 @@ func request(q *scheduler.Queue, key string, ctx filters.FilterContext) {
 		}
 		switch err {
 		case jobqueue.ErrStackFull:
-			log.Debugf("Failed to get an entry on to the queue to process QueueFull: %v for host %s", err, ctx.Request().Host)
+			ctx.Logger().Debugf("Failed to get an entry on to the queue to process QueueFull: %v for host %s", err, ctx.Request().Host)
 			ctx.Serve(&http.Response{
 				StatusCode: http.StatusServiceUnavailable,
 				Status:     "Queue Full - https://opensource.zalando.com/skipper/operation/operation/#scheduler",
 			})
 		case jobqueue.ErrTimeout:
-			log.Debugf("Failed to get an entry on to the queue to process Timeout: %v for host %s", err, ctx.Request().Host)
+			ctx.Logger().Debugf("Failed to get an entry on to the queue to process Timeout: %v for host %s", err, ctx.Request().Host)
 			ctx.Serve(&http.Response{
 				StatusCode: http.StatusBadGateway,
 				Status:     "Queue timeout - https://opensource.zalando.com/skipper/operation/operation/#scheduler",
 			})
 		default:
-			log.Errorf("Unknown error for route based LIFO: %v for host %s", err, ctx.Request().Host)
+			ctx.Logger().Errorf("Unknown error for route based LIFO: %v for host %s", err, ctx.Request().Host)
 			ctx.Serve(&http.Response{StatusCode: http.StatusInternalServerError})
 		}
 		return

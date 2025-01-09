@@ -1,6 +1,7 @@
 package ratelimit
 
 import (
+	"context"
 	"net/http"
 	"sync"
 	"time"
@@ -20,6 +21,8 @@ const (
 // ratelimiters.
 type Registry struct {
 	sync.Mutex
+	once      sync.Once
+	closed    bool
 	defaults  Settings
 	global    Settings
 	lookup    map[Settings]*Ratelimit
@@ -48,6 +51,7 @@ func NewSwarmRegistry(swarm Swarmer, ro *net.RedisOptions, settings ...Settings)
 	}
 
 	r := &Registry{
+		once:      sync.Once{},
 		defaults:  defaults,
 		global:    defaults,
 		lookup:    make(map[Settings]*Ratelimit),
@@ -67,7 +71,13 @@ func NewSwarmRegistry(swarm Swarmer, ro *net.RedisOptions, settings ...Settings)
 
 // Close teardown Registry and dependent resources
 func (r *Registry) Close() {
-	r.redisRing.Close()
+	r.once.Do(func() {
+		r.closed = true
+		r.redisRing.Close()
+		for _, rl := range r.lookup {
+			rl.Close()
+		}
+	})
 }
 
 func (r *Registry) get(s Settings) *Ratelimit {
@@ -107,7 +117,7 @@ func (r *Registry) Check(req *http.Request) (Settings, int) {
 	case ClusterServiceRatelimit:
 		fallthrough
 	case ServiceRatelimit:
-		if rlimit.Allow("") {
+		if rlimit.Allow(context.Background(), "") {
 			return s, 0
 		}
 		return s, rlimit.RetryAfter("")
@@ -119,7 +129,7 @@ func (r *Registry) Check(req *http.Request) (Settings, int) {
 		fallthrough
 	case ClientRatelimit:
 		ip := net.RemoteHost(req)
-		if !rlimit.Allow(ip.String()) {
+		if !rlimit.Allow(context.Background(), ip.String()) {
 			return s, rlimit.RetryAfter(ip.String())
 		}
 	}

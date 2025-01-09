@@ -2,6 +2,7 @@ package script
 
 import (
 	"bytes"
+	"fmt"
 	"io"
 	"net/http"
 	"os"
@@ -9,57 +10,37 @@ import (
 	"testing"
 	"time"
 
-	"github.com/opentracing/opentracing-go"
 	log "github.com/sirupsen/logrus"
+	"github.com/stretchr/testify/assert"
 	"github.com/zalando/skipper/filters"
+	"github.com/zalando/skipper/filters/filtertest"
 )
-
-type luaContext struct {
-	request      *http.Request
-	response     *http.Response
-	pathParams   map[string]string
-	bag          map[string]interface{}
-	outgoingHost string
-}
-
-func (l *luaContext) ResponseWriter() http.ResponseWriter   { return nil }
-func (l *luaContext) Request() *http.Request                { return l.request }
-func (l *luaContext) Response() *http.Response              { return l.response }
-func (l *luaContext) OriginalRequest() *http.Request        { return nil }
-func (l *luaContext) OriginalResponse() *http.Response      { return nil }
-func (l *luaContext) Served() bool                          { return false }
-func (l *luaContext) MarkServed()                           {}
-func (l *luaContext) Serve(_ *http.Response)                {}
-func (l *luaContext) PathParam(n string) string             { return l.pathParams[n] }
-func (l *luaContext) StateBag() map[string]interface{}      { return l.bag }
-func (l *luaContext) BackendUrl() string                    { return "" }
-func (l *luaContext) OutgoingHost() string                  { return l.outgoingHost }
-func (l *luaContext) SetOutgoingHost(h string)              { l.outgoingHost = h }
-func (l *luaContext) Metrics() filters.Metrics              { return nil }
-func (l *luaContext) Tracer() opentracing.Tracer            { return nil }
-func (l *luaContext) ParentSpan() opentracing.Span          { return nil }
-func (l *luaContext) Split() (filters.FilterContext, error) { return nil, nil }
-func (l *luaContext) Loopback()                             {}
 
 type testContext struct {
 	script         string
 	params         []string
 	pathParams     map[string]string
 	url            string
-	requestHeader  map[string]string
-	responseHeader map[string]string
+	requestHeader  http.Header
+	responseHeader http.Header
+}
+
+func testScript(script string) *testContext {
+	return &testContext{script: script}
 }
 
 func TestScript(t *testing.T) {
 	for _, test := range []struct {
 		name                   string
+		opts                   LuaOptions
 		context                testContext
 		expectedStateBag       map[string]string
-		expectedRequestHeader  map[string]string
-		expectedResponseHeader map[string]string
+		expectedRequestHeader  http.Header
+		expectedResponseHeader http.Header
 		expectedOutgoingHost   string
 		expectedURL            string
 		expectedStatus         int
+		expectedError          error
 	}{
 		{
 			name: "state bag",
@@ -72,7 +53,7 @@ func TestScript(t *testing.T) {
 			name: "get request header",
 			context: testContext{
 				script:        `function request(ctx, params); ctx.state_bag["User-Agent"] = ctx.request.header["User-Agent"]; end`,
-				requestHeader: map[string]string{"user-agent": "luatest/1.0"},
+				requestHeader: http.Header{"User-Agent": []string{"luatest/1.0"}},
 			},
 			expectedStateBag: map[string]string{"User-Agent": "luatest/1.0"},
 		},
@@ -81,16 +62,75 @@ func TestScript(t *testing.T) {
 			context: testContext{
 				script: `function request(ctx, params); ctx.request.header["User-Agent"] = "skipper.lua/1.0"; end`,
 			},
-			expectedRequestHeader: map[string]string{"user-agent": "skipper.lua/1.0"},
+			expectedRequestHeader: http.Header{"User-Agent": []string{"skipper.lua/1.0"}},
+		},
+		{
+			name: "add request header",
+			context: testContext{
+				script: `function request(ctx, params)
+					ctx.request.header.add("Foo", "Bar")
+					ctx.request.header.add("Foo", "Baz")
+				end`,
+			},
+			expectedRequestHeader: http.Header{"Foo": []string{"Bar", "Baz"}},
+		},
+		{
+			name: "request header values",
+			context: testContext{
+				script: `function request(ctx, params)
+					ctx.request.header.add("Foo", "Bar")
+					ctx.request.header.add("Foo", "Baz")
+
+					ctx.request.header["Qux"] = table.concat(ctx.request.header.values("Foo"), ", ")
+					ctx.request.header["Absent-Length"] = table.getn(ctx.request.header.values("Absent"))
+				end`,
+			},
+			expectedRequestHeader: http.Header{
+				"Foo":           []string{"Bar", "Baz"},
+				"Qux":           []string{"Bar, Baz"},
+				"Absent-Length": []string{"0"},
+			},
 		},
 		{
 			name: "response header",
 			context: testContext{
 				script:         `function response(ctx, params); ctx.response.header["X-Baz"] = ctx.request.header["X-Foo"] .. ctx.response.header["X-Bar"]; end`,
-				requestHeader:  map[string]string{"X-Foo": "Foo"},
-				responseHeader: map[string]string{"X-Bar": "Bar"},
+				requestHeader:  http.Header{"X-Foo": []string{"Foo"}},
+				responseHeader: http.Header{"X-Bar": []string{"Bar"}},
 			},
-			expectedResponseHeader: map[string]string{"X-Bar": "Bar", "X-Baz": "FooBar"},
+			expectedResponseHeader: http.Header{"X-Bar": []string{"Bar"}, "X-Baz": []string{"FooBar"}},
+		},
+		{
+			name: "add response header",
+			context: testContext{
+				script: `function response(ctx, params)
+					ctx.response.header.add("X-Baz", ctx.request.header["X-Foo"])
+					ctx.response.header.add("X-Baz", ctx.response.header["X-Bar"])
+				end`,
+				requestHeader:  http.Header{"X-Foo": []string{"Foo"}},
+				responseHeader: http.Header{"X-Bar": []string{"Bar"}},
+			},
+			expectedResponseHeader: http.Header{
+				"X-Bar": []string{"Bar"},
+				"X-Baz": []string{"Foo", "Bar"},
+			},
+		},
+		{
+			name: "response header values",
+			context: testContext{
+				script: `function response(ctx, params)
+					ctx.response.header.add("Foo", "Bar")
+					ctx.response.header.add("Foo", "Baz")
+
+					ctx.response.header["Qux"] = table.concat(ctx.response.header.values("Foo"), ", ")
+					ctx.response.header["Absent-Length"] = table.getn(ctx.response.header.values("Absent"))
+				end`,
+			},
+			expectedResponseHeader: http.Header{
+				"Foo":           []string{"Bar", "Baz"},
+				"Qux":           []string{"Bar, Baz"},
+				"Absent-Length": []string{"0"},
+			},
 		},
 		{
 			name: "outgoing host",
@@ -105,7 +145,7 @@ func TestScript(t *testing.T) {
 				script: `testdata/set_request_header.lua`,
 				params: []string{"Host", "new.example.com"},
 			},
-			expectedRequestHeader: map[string]string{"Host": "new.example.com"},
+			expectedRequestHeader: http.Header{"Host": []string{"new.example.com"}},
 			expectedOutgoingHost:  "new.example.com",
 		},
 		{
@@ -190,10 +230,10 @@ func TestScript(t *testing.T) {
 			context: testContext{
 				script:        `testdata/strip_query.lua`,
 				url:           "http://www.example.com/foo/bar?baz=1&x=y&z",
-				requestHeader: map[string]string{"X-Dummy": "dummy"},
+				requestHeader: http.Header{"X-Dummy": []string{"dummy"}},
 			},
 			expectedURL:           "http://www.example.com/foo/bar",
-			expectedRequestHeader: map[string]string{"X-Dummy": "dummy"},
+			expectedRequestHeader: http.Header{"X-Dummy": []string{"dummy"}},
 		},
 		{
 			name: "strip query and preserve to headers",
@@ -203,7 +243,7 @@ func TestScript(t *testing.T) {
 				url:    "http://www.example.com/foo/bar?baz=1&x=y&z",
 			},
 			expectedURL:           "http://www.example.com/foo/bar",
-			expectedRequestHeader: map[string]string{"X-Query-Param-Baz": "1", "X-Query-Param-X": "y"},
+			expectedRequestHeader: http.Header{"X-Query-Param-Baz": []string{"1"}, "X-Query-Param-X": []string{"y"}},
 		},
 		{
 			name: "print query",
@@ -232,7 +272,7 @@ func TestScript(t *testing.T) {
 				params: []string{"foo-query-param", "X-Foo-Header"},
 				url:    "http://www.example.com/foo/bar?foo-query-param=test",
 			},
-			expectedRequestHeader: map[string]string{"X-Foo-Header": "test"},
+			expectedRequestHeader: http.Header{"X-Foo-Header": []string{"test"}},
 		},
 		{
 			name: "queryToHeader when header is present",
@@ -240,9 +280,9 @@ func TestScript(t *testing.T) {
 				script:        `testdata/query_to_header.lua`,
 				params:        []string{"foo-query-param", "X-Foo-Header"},
 				url:           "http://www.example.com/foo/bar?foo-query-param=test",
-				requestHeader: map[string]string{"X-Foo-Header": "foo"},
+				requestHeader: http.Header{"X-Foo-Header": []string{"foo"}},
 			},
-			expectedRequestHeader: map[string]string{"X-Foo-Header": "foo"},
+			expectedRequestHeader: http.Header{"X-Foo-Header": []string{"foo"}},
 		},
 		{
 			name: "queryToHeader when query is absent",
@@ -250,9 +290,9 @@ func TestScript(t *testing.T) {
 				script:        `testdata/query_to_header.lua`,
 				params:        []string{"foo-query-param", "X-Foo-Header"},
 				url:           "http://www.example.com/foo/bar",
-				requestHeader: map[string]string{"X-Dummy": "dummy"},
+				requestHeader: http.Header{"X-Dummy": []string{"dummy"}},
 			},
-			expectedRequestHeader: map[string]string{"X-Dummy": "dummy"},
+			expectedRequestHeader: http.Header{"X-Dummy": []string{"dummy"}},
 		},
 		{
 			name: "queryToHeader when query is empty",
@@ -260,9 +300,9 @@ func TestScript(t *testing.T) {
 				script:        `testdata/query_to_header.lua`,
 				params:        []string{"foo-query-param", "X-Foo-Header"},
 				url:           "http://www.example.com/foo/bar?foo-query-param=",
-				requestHeader: map[string]string{"X-Dummy": "dummy"},
+				requestHeader: http.Header{"X-Dummy": []string{"dummy"}},
 			},
-			expectedRequestHeader: map[string]string{"X-Dummy": "dummy"},
+			expectedRequestHeader: http.Header{"X-Dummy": []string{"dummy"}},
 		},
 		{
 			name: "path param to header",
@@ -270,12 +310,12 @@ func TestScript(t *testing.T) {
 				script:     `function request(ctx, params); ctx.request.header["X-Id"] = ctx.path_param["id"]; end`,
 				pathParams: map[string]string{"id": "hello"},
 			},
-			expectedRequestHeader: map[string]string{"x-id": "hello"},
+			expectedRequestHeader: http.Header{"X-Id": []string{"hello"}},
 		},
 		{
 			name: "get request cookie",
 			context: testContext{
-				requestHeader: map[string]string{"Cookie": "PHPSESSID=298zf09hf012fh2; csrftoken=u32t4o3tb3gg43; _gat=1"},
+				requestHeader: http.Header{"Cookie": []string{"PHPSESSID=298zf09hf012fh2; csrftoken=u32t4o3tb3gg43; _gat=1"}},
 				script: `function request(ctx, params)
 					ctx.state_bag.PHPSESSID = ctx.request.cookie.PHPSESSID
 					ctx.state_bag.csrftoken = ctx.request.cookie.csrftoken
@@ -291,8 +331,12 @@ func TestScript(t *testing.T) {
 		},
 		{
 			name: "iterate request cookies",
+			opts: LuaOptions{
+				// use non-existing module
+				Modules: []string{"none"},
+			},
 			context: testContext{
-				requestHeader: map[string]string{"Cookie": "PHPSESSID=298zf09hf012fh2; csrftoken=u32t4o3tb3gg43; _gat=1; csrftoken=repeat"},
+				requestHeader: http.Header{"Cookie": []string{"PHPSESSID=298zf09hf012fh2; csrftoken=u32t4o3tb3gg43; _gat=1; csrftoken=repeat"}},
 				script: `function request(ctx, params)
 					ctx.state_bag.result = ""
 					for n, v in ctx.request.cookie() do
@@ -304,53 +348,168 @@ func TestScript(t *testing.T) {
 				"result": "PHPSESSID=298zf09hf012fh2 csrftoken=u32t4o3tb3gg43 _gat=1 csrftoken=repeat ",
 			},
 		},
+		{
+			name: "disable all modules",
+			opts: LuaOptions{
+				// use non-existing module
+				Modules: []string{"none"},
+				Sources: []string{"inline"},
+			},
+			context: testContext{
+				script: `
+					function request(ctx, params)
+						ctx.request.header["X-Message"] = "still usable without modules"
+					end
+				`,
+			},
+			expectedRequestHeader: http.Header{"X-Message": []string{"still usable without modules"}},
+		},
+		{
+			name: "enable inline sources and try to reference inline script",
+			opts: LuaOptions{
+				Sources: []string{"inline"},
+			},
+			context: testContext{
+				script: `
+					function request(ctx, params)
+						ctx.request.header["X-Message"] = "test"
+					end
+				`,
+			},
+			expectedRequestHeader: http.Header{"X-Message": []string{"test"}},
+		},
+		{
+			name: "enable file sources and try to reference file",
+			opts: LuaOptions{
+				Sources: []string{"file"},
+			},
+			context: testContext{
+				script: `testdata/query_to_header.lua`,
+				params: []string{"foo-query-param", "X-Foo-Header"},
+				url:    "http://www.example.com/foo/bar?foo-query-param=test",
+			},
+			expectedRequestHeader: http.Header{"X-Foo-Header": []string{"test"}},
+		},
+		{
+			name: "enable file and inline sources and try to reference inline script",
+			opts: LuaOptions{
+				Sources: []string{"file", "inline"},
+			},
+			context: testContext{
+				script: `
+					function request(ctx, params)
+						ctx.request.header["X-Message"] = "test"
+					end
+				`,
+			},
+			expectedRequestHeader: http.Header{"X-Message": []string{"test"}},
+		},
+		{
+			name: "enable file and inline sources and try to reference file",
+			opts: LuaOptions{
+				Sources: []string{"file", "inline"},
+			},
+			context: testContext{
+				script: `testdata/query_to_header.lua`,
+				params: []string{"foo-query-param", "X-Foo-Header"},
+				url:    "http://www.example.com/foo/bar?foo-query-param=test",
+			},
+			expectedRequestHeader: http.Header{"X-Foo-Header": []string{"test"}},
+		},
+		{
+			name: "enable file sources and try to reference inline script",
+			opts: LuaOptions{
+				Sources: []string{"file"},
+			},
+			context: testContext{
+				script: `
+					function request(ctx, params)
+						ctx.request.header["X-Message"] = "test"
+					end
+				`,
+			},
+			expectedError: fmt.Errorf(`invalid lua source referenced "inline", allowed: "[file]"`),
+		},
+		{
+			name: "enable inline sources and try to reference file",
+			opts: LuaOptions{
+				Sources: []string{"inline"},
+			},
+			context: testContext{
+				script: `testdata/query_to_header.lua`,
+				params: []string{"foo-query-param", "X-Foo-Header"},
+				url:    "http://www.example.com/foo/bar?foo-query-param=test",
+			},
+			expectedError: fmt.Errorf(`invalid lua source referenced "file", allowed: "[inline]"`),
+		},
+		{
+			name: "disable all sources and try to reference inline script",
+			opts: LuaOptions{
+				Sources: []string{"none"},
+			},
+			context: testContext{
+				script: `
+					function request(ctx, params)
+						ctx.request.header["X-Message"] = "still usable without modules"
+					end
+				`,
+			},
+			expectedError: errLuaSourcesDisabled,
+		},
+		{
+			name: "disable all sources and try to reference file source",
+			opts: LuaOptions{
+				Sources: []string{"none"},
+			},
+			context: testContext{
+				script: "foo.lua",
+			},
+			expectedError: errLuaSourcesDisabled,
+		},
 	} {
-		log.Println("Running", test.name, "test")
-
-		fc, err := runFilter(&test.context)
-		if err != nil {
-			t.Errorf("failed to run filter: %v", err)
-		}
-
-		exp := len(test.expectedRequestHeader)
-		if exp > 0 && exp != len(fc.Request().Header) {
-			t.Errorf("[%s] request header mismatch: expected %v, got: %v", test.name, test.expectedRequestHeader, fc.Request().Header)
-		}
-		for k, v := range test.expectedRequestHeader {
-			if fc.Request().Header.Get(k) != v {
-				t.Errorf("[%s] %s request header: expected %s, got: %s", test.name, k, v, fc.Request().Header.Get(k))
+		t.Run(test.name, func(t *testing.T) {
+			fc, err := runFilter(test.opts, &test.context)
+			if err != nil && test.expectedError == nil {
+				t.Fatalf("Failed to run filter: %v", err)
+			} else if test.expectedError != nil {
+				if err == test.expectedError {
+					// ok, error as expected
+					return
+				} else if err != nil && err.Error() == test.expectedError.Error() {
+					// ok, error string as expected
+					return
+				}
+				t.Fatalf("Should fail to create filter: expected: %v, got: %v", test.expectedError, err)
 			}
-		}
 
-		exp = len(test.expectedResponseHeader)
-		if exp > 0 && exp != len(fc.Response().Header) {
-			t.Errorf("[%s] response header mismatch: expected %v, got: %v", test.name, test.expectedResponseHeader, fc.Response().Header)
-		}
-		for k, v := range test.expectedResponseHeader {
-			if fc.Response().Header.Get(k) != v {
-				t.Errorf("[%s] %s response header: expected %s, got: %s", test.name, k, v, fc.Response().Header.Get(k))
+			if test.expectedRequestHeader != nil {
+				assert.Equal(t, test.expectedRequestHeader, fc.Request().Header)
 			}
-		}
 
-		if len(fc.StateBag()) != len(test.expectedStateBag) {
-			t.Errorf("[%s] state bag mismatch: expected %v, got: %v", test.name, test.expectedStateBag, fc.StateBag())
-		}
-		for k, v := range test.expectedStateBag {
-			bv, ok := fc.StateBag()[k]
-			if !ok || v != bv {
-				t.Errorf("[%s] %s state bag: expected %s, got: %s", test.name, k, v, bv)
+			if test.expectedResponseHeader != nil {
+				assert.Equal(t, test.expectedResponseHeader, fc.Response().Header)
 			}
-		}
 
-		if test.expectedOutgoingHost != "" && fc.OutgoingHost() != test.expectedOutgoingHost {
-			t.Errorf("[%s] outgoing host: expected %s, got: %s", test.name, test.expectedOutgoingHost, fc.OutgoingHost())
-		}
-		if test.expectedURL != "" && fc.Request().URL.String() != test.expectedURL {
-			t.Errorf("[%s] request path: expected %s, got: %v", test.name, test.expectedURL, fc.Request().URL)
-		}
-		if test.expectedStatus != 0 && test.expectedStatus != fc.Response().StatusCode {
-			t.Errorf("[%s] response status: expected %d, got: %d", test.name, test.expectedStatus, fc.Response().StatusCode)
-		}
+			if len(fc.StateBag()) != len(test.expectedStateBag) {
+				t.Errorf("[%s] state bag mismatch: expected %v, got: %v", test.name, test.expectedStateBag, fc.StateBag())
+			}
+			for k, v := range test.expectedStateBag {
+				bv, ok := fc.StateBag()[k]
+				if !ok || v != bv {
+					t.Errorf("[%s] %s state bag: expected %s, got: %s", test.name, k, v, bv)
+				}
+			}
+
+			if test.expectedOutgoingHost != "" && fc.OutgoingHost() != test.expectedOutgoingHost {
+				t.Errorf("[%s] outgoing host: expected %s, got: %s", test.name, test.expectedOutgoingHost, fc.OutgoingHost())
+			}
+			if test.expectedURL != "" && fc.Request().URL.String() != test.expectedURL {
+				t.Errorf("[%s] request path: expected %s, got: %v", test.name, test.expectedURL, fc.Request().URL)
+			}
+			if test.expectedStatus != 0 && test.expectedStatus != fc.Response().StatusCode {
+				t.Errorf("[%s] response status: expected %d, got: %d", test.name, test.expectedStatus, fc.Response().StatusCode)
+			}
+		})
 	}
 }
 
@@ -359,7 +518,7 @@ func TestSleep(t *testing.T) {
 		script: `function request(ctx, params) sleep(100.1) end`,
 	}
 	t0 := time.Now()
-	_, err := runFilter(ctx)
+	_, err := runFilter(LuaOptions{}, ctx)
 	if err != nil {
 		t.Fatalf("failed to run filter: %v", err)
 	}
@@ -529,8 +688,8 @@ func ExampleLogHeaders() {
 		script: LogHeaders,
 		params: []string{"request", "response"},
 		// single header as iteration order is not defined
-		requestHeader:  map[string]string{"X-Foo": "foo"},
-		responseHeader: map[string]string{"X-Bar": "bar"},
+		requestHeader:  http.Header{"X-Foo": []string{"foo"}},
+		responseHeader: http.Header{"X-Bar": []string{"bar", "baz"}},
 	})
 	// Output:
 	// GET http://www.example.com/foo/bar HTTP/1.1\r
@@ -540,7 +699,7 @@ func ExampleLogHeaders() {
 	//
 	// Response for GET http://www.example.com/foo/bar HTTP/1.1\r
 	// 200\r
-	// X-Bar: bar\r
+	// X-Bar: bar baz\r
 	// \r
 }
 
@@ -551,13 +710,42 @@ func ExampleLogRequestAuthHeader() {
 		script: LogRequestAuthHeader,
 		params: []string{"request"},
 		// single header as iteration order is not defined
-		requestHeader: map[string]string{"Authorization": "request secret"},
+		requestHeader: http.Header{"Authorization": []string{"request secret"}},
 	})
 	// Output:
 	// GET http://www.example.com/foo/bar HTTP/1.1\r
 	// Host: www.example.com\r
 	// Authorization: TRUNCATED\r
 	// \r
+}
+
+const MultipleHeaderValues = `
+function request(ctx, params)
+	ctx.request.header.add("X-Foo", "Bar")
+	ctx.request.header.add("X-Foo", "Baz")
+
+	-- all X-Foo values
+	for _, v in pairs(ctx.request.header.values("X-Foo")) do
+		print(v)
+	end
+
+	-- all values
+	for k, _ in ctx.request.header() do
+		for _, v in pairs(ctx.request.header.values(k)) do
+			print(k, "=", v)
+		end
+	end
+end`
+
+func ExampleMultipleHeaderValues() {
+	runExample(&testContext{
+		script: MultipleHeaderValues,
+	})
+	// Output:
+	// Bar
+	// Baz
+	// X-Foo=Bar
+	// X-Foo=Baz
 }
 
 const PrintRequestUrlRawQuery = `
@@ -711,22 +899,29 @@ func ExampleGetMissingStateBag() {
 	// nil
 }
 
-const SetUnsupportedStateBag = `
+const SetStateBagTable = `
 function request(ctx, params)
-	ctx.state_bag.unsupported = {}
-	print("ok")
-end`
+	ctx.state_bag.table = {foo="bar"}
+end
 
-func ExampleSetUnsupportedStateBag() {
+function response(ctx, params)
+	print(ctx.state_bag.table.foo)
+end
+`
+
+func ExampleSetStateBagTable() {
 	runExample(&testContext{
-		script: SetUnsupportedStateBag,
+		script: SetStateBagTable,
 	})
 	// Output:
-	// ok
+	// bar
 }
 
-func newFilter(script string, params ...string) (filters.Filter, error) {
-	ls := NewLuaScript()
+func newFilter(opts LuaOptions, script string, params ...string) (filters.Filter, error) {
+	ls, err := NewLuaScriptWithOptions(opts)
+	if err != nil {
+		return nil, err
+	}
 	args := []interface{}{script}
 	for _, p := range params {
 		args = append(args, p)
@@ -734,8 +929,8 @@ func newFilter(script string, params ...string) (filters.Filter, error) {
 	return ls.CreateFilter(args)
 }
 
-func runFilter(test *testContext) (*luaContext, error) {
-	scr, err := newFilter(test.script, test.params...)
+func runFilter(opts LuaOptions, test *testContext) (filters.FilterContext, error) {
+	scr, err := newFilter(opts, test.script, test.params...)
 	if err != nil {
 		return nil, err
 	}
@@ -744,19 +939,19 @@ func runFilter(test *testContext) (*luaContext, error) {
 		url = test.url
 	}
 	req, _ := http.NewRequest("GET", url, nil)
-	for k, v := range test.requestHeader {
-		req.Header.Add(k, v)
+	if test.requestHeader != nil {
+		req.Header = test.requestHeader.Clone()
 	}
-	fc := &luaContext{
-		pathParams:   test.pathParams,
-		bag:          make(map[string]interface{}),
-		request:      req,
-		outgoingHost: "www.example.com",
+	fc := &filtertest.Context{
+		FParams:       test.pathParams,
+		FStateBag:     make(map[string]interface{}),
+		FRequest:      req,
+		FOutgoingHost: "www.example.com",
 	}
 	scr.Request(fc)
 
 	body := "Hello world"
-	fc.response = &http.Response{
+	fc.FResponse = &http.Response{
 		Status:        "200 OK",
 		StatusCode:    200,
 		Proto:         "HTTP/1.1",
@@ -767,8 +962,8 @@ func runFilter(test *testContext) (*luaContext, error) {
 		Request:       req,
 		Header:        make(http.Header),
 	}
-	for k, v := range test.responseHeader {
-		fc.Response().Header.Add(k, v)
+	if test.responseHeader != nil {
+		fc.Response().Header = test.responseHeader.Clone()
 	}
 
 	scr.Response(fc)
@@ -777,6 +972,10 @@ func runFilter(test *testContext) (*luaContext, error) {
 }
 
 func runExample(ctx *testContext) {
+	runExampleWithOptions(LuaOptions{}, ctx)
+}
+
+func runExampleWithOptions(opts LuaOptions, ctx *testContext) {
 	o := log.StandardLogger().Out
 	f := log.StandardLogger().Formatter
 	defer func() {
@@ -787,7 +986,7 @@ func runExample(ctx *testContext) {
 	log.SetOutput(os.Stdout)
 	log.SetFormatter(&exampleLogFormatter{})
 
-	_, err := runFilter(ctx)
+	_, err := runFilter(opts, ctx)
 	if err != nil {
 		log.Errorf("%v", err)
 	}
@@ -803,9 +1002,15 @@ func (f *exampleLogFormatter) Format(entry *log.Entry) ([]byte, error) {
 	} else {
 		b = &bytes.Buffer{}
 	}
-	// escape \r to use testable examples
-	b.WriteString(strings.ReplaceAll(entry.Message, "\r", `\r`))
-	b.WriteByte('\n')
+
+	for _, line := range strings.Split(entry.Message, "\n") {
+		// escape \r to use testable examples
+		line = strings.ReplaceAll(line, "\r", `\r`)
+		line = strings.TrimRight(line, " ")
+
+		b.WriteString(line)
+		b.WriteString("\n")
+	}
 	return b.Bytes(), nil
 }
 
@@ -824,7 +1029,7 @@ func ExampleSetRequestCookieIsNotSupported() {
 }
 
 func BenchmarkNewState(b *testing.B) {
-	f, _ := newFilter(`function request(ctx, params) end`)
+	f, _ := newFilter(LuaOptions{}, `function request(ctx, params) end`)
 	s := f.(*script)
 
 	b.ResetTimer()
@@ -834,11 +1039,11 @@ func BenchmarkNewState(b *testing.B) {
 }
 
 func benchmarkRequest(b *testing.B, script string, params ...string) {
-	f, _ := newFilter(script, params...)
+	f, _ := newFilter(LuaOptions{}, script, params...)
 
 	r, _ := http.NewRequest("GET", "http://example.com/test", nil)
 	r.Header.Add("X-Foo", "Bar")
-	fc := &luaContext{request: r}
+	fc := &filtertest.Context{FRequest: r}
 
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {

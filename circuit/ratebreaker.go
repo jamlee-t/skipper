@@ -1,8 +1,9 @@
 package circuit
 
 import (
-	log "github.com/sirupsen/logrus"
 	"sync"
+
+	log "github.com/sirupsen/logrus"
 
 	"github.com/sony/gobreaker"
 )
@@ -14,7 +15,7 @@ import (
 
 type rateBreaker struct {
 	settings BreakerSettings
-	mx       *sync.Mutex
+	mu       sync.Mutex
 	sampler  *binarySampler
 	gb       *gobreaker.TwoStepCircuitBreaker
 }
@@ -22,7 +23,6 @@ type rateBreaker struct {
 func newRate(s BreakerSettings) *rateBreaker {
 	b := &rateBreaker{
 		settings: s,
-		mx:       &sync.Mutex{},
 	}
 
 	b.gb = gobreaker.NewTwoStepCircuitBreaker(gobreaker.Settings{
@@ -39,8 +39,8 @@ func newRate(s BreakerSettings) *rateBreaker {
 }
 
 func (b *rateBreaker) readyToTrip() bool {
-	b.mx.Lock()
-	defer b.mx.Unlock()
+	b.mu.Lock()
+	defer b.mu.Unlock()
 
 	if b.sampler == nil {
 		return false
@@ -51,8 +51,8 @@ func (b *rateBreaker) readyToTrip() bool {
 
 // count the failures in closed and half-open state
 func (b *rateBreaker) countRate(success bool) {
-	b.mx.Lock()
-	defer b.mx.Unlock()
+	b.mu.Lock()
+	defer b.mu.Unlock()
 
 	if b.sampler == nil {
 		b.sampler = newBinarySampler(b.settings.Window)

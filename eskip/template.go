@@ -35,8 +35,7 @@ type TemplateContext interface {
 // New parses a template string and returns a reusable *Template object.
 // The template string can contain named placeholders of the format:
 //
-// 	Hello, ${who}!
-//
+//	Hello, ${who}!
 func NewTemplate(template string) *Template {
 	matches := placeholderRegexp.FindAllStringSubmatch(template, -1)
 	placeholders := make([]string, len(matches))
@@ -81,6 +80,8 @@ func (t *Template) ApplyContext(ctx TemplateContext) (string, bool) {
 			return ctx.Request().Host
 		case "request.path":
 			return ctx.Request().URL.Path
+		case "request.rawQuery":
+			return ctx.Request().URL.RawQuery
 		case "request.source":
 			return snet.RemoteHost(ctx.Request()).String()
 		case "request.sourceFromLast":
@@ -109,7 +110,7 @@ func (t *Template) apply(get TemplateGetter) (string, bool) {
 		if value == "" {
 			missing = true
 		}
-		result = strings.Replace(result, "${"+placeholder+"}", value, -1)
+		result = strings.ReplaceAll(result, "${"+placeholder+"}", value)
 	}
 	return result, !missing
 }

@@ -2,12 +2,17 @@ package auth
 
 import (
 	"fmt"
+	"io"
+	"net/http"
+	"regexp"
+	"strconv"
 	"strings"
 	"time"
 
 	"github.com/opentracing/opentracing-go"
-	log "github.com/sirupsen/logrus"
 	"github.com/zalando/skipper/filters"
+	"github.com/zalando/skipper/filters/annotate"
+	"github.com/zalando/skipper/metrics"
 )
 
 const (
@@ -28,23 +33,79 @@ type TokeninfoOptions struct {
 	Timeout      time.Duration
 	MaxIdleConns int
 	Tracer       opentracing.Tracer
+	Metrics      metrics.Metrics
+
+	// CacheSize configures the maximum number of cached tokens.
+	// The cache periodically evicts random items when number of cached tokens exceeds CacheSize.
+	// Zero value disables tokeninfo cache.
+	CacheSize int
+
+	// CacheTTL limits the lifetime of a cached tokeninfo.
+	// Tokeninfo is cached for the duration of "expires_in" field value seconds or
+	// for the duration of CacheTTL if it is not zero and less than "expires_in" value.
+	CacheTTL time.Duration
 }
 
 type (
 	tokeninfoSpec struct {
 		typ     roleCheckType
 		options TokeninfoOptions
+
+		tokeninfoValidateYamlConfigParser *yamlConfigParser[tokeninfoValidateFilterConfig]
 	}
 
 	tokeninfoFilter struct {
-		typ        roleCheckType
-		authClient *authClient
-		scopes     []string
-		kv         kv
+		typ    roleCheckType
+		client tokeninfoClient
+		scopes []string
+		kv     kv
+	}
+
+	tokeninfoValidateFilter struct {
+		client tokeninfoClient
+		config *tokeninfoValidateFilterConfig
+	}
+
+	// tokeninfoValidateFilterConfig implements [yamlConfig],
+	// make sure it is not modified after initialization.
+	tokeninfoValidateFilterConfig struct {
+		OptOutAnnotations    []string `json:"optOutAnnotations,omitempty"`
+		UnauthorizedResponse string   `json:"unauthorizedResponse,omitempty"`
+		OptOutHosts          []string `json:"optOutHosts,omitempty"`
+
+		optOutHostsCompiled []*regexp.Regexp
 	}
 )
 
-var tokeninfoAuthClient map[string]*authClient = make(map[string]*authClient)
+var tokeninfoAuthClient map[string]tokeninfoClient = make(map[string]tokeninfoClient)
+
+// getTokeninfoClient creates new or returns a cached instance of tokeninfoClient
+func (o *TokeninfoOptions) getTokeninfoClient() (tokeninfoClient, error) {
+	if c, ok := tokeninfoAuthClient[o.URL]; ok {
+		return c, nil
+	}
+
+	c, err := o.newTokeninfoClient()
+	if err == nil {
+		tokeninfoAuthClient[o.URL] = c
+	}
+	return c, err
+}
+
+// newTokeninfoClient creates new instance of tokeninfoClient
+func (o *TokeninfoOptions) newTokeninfoClient() (tokeninfoClient, error) {
+	var c tokeninfoClient
+
+	c, err := newAuthClient(o.URL, tokenInfoSpanName, o.Timeout, o.MaxIdleConns, o.Tracer)
+	if err != nil {
+		return nil, err
+	}
+
+	if o.CacheSize > 0 {
+		c = newTokeninfoCache(c, o.Metrics, o.CacheSize, o.CacheTTL)
+	}
+	return c, nil
+}
 
 func NewOAuthTokeninfoAllScopeWithOptions(to TokeninfoOptions) filters.Spec {
 	return &tokeninfoSpec{
@@ -113,6 +174,16 @@ func NewOAuthTokeninfoAnyKVWithOptions(to TokeninfoOptions) filters.Spec {
 	}
 }
 
+func NewOAuthTokeninfoValidate(to TokeninfoOptions) filters.Spec {
+	p := newYamlConfigParser[tokeninfoValidateFilterConfig](64)
+	return &tokeninfoSpec{
+		typ:     checkOAuthTokeninfoValidate,
+		options: to,
+
+		tokeninfoValidateYamlConfigParser: &p,
+	}
+}
+
 // NewOAuthTokeninfoAnyKV creates a new auth filter specification
 // to validate authorization for requests. Current implementation uses
 // Bearer tokens to authorize requests and checks that the token
@@ -134,7 +205,6 @@ func NewOAuthTokeninfoAnyKV(OAuthTokeninfoURL string, OAuthTokeninfoTimeout time
 // Use one of the base initializer functions as the first argument:
 // NewOAuthTokeninfoAllScope, NewOAuthTokeninfoAnyScope,
 // NewOAuthTokeninfoAllKV or NewOAuthTokeninfoAnyKV.
-//
 func TokeninfoWithOptions(create func(string, time.Duration) filters.Spec, o TokeninfoOptions) filters.Spec {
 	s := create(o.URL, o.Timeout)
 	ts, ok := s.(*tokeninfoSpec)
@@ -156,6 +226,8 @@ func (s *tokeninfoSpec) Name() string {
 		return filters.OAuthTokeninfoAnyKVName
 	case checkOAuthTokeninfoAllKV:
 		return filters.OAuthTokeninfoAllKVName
+	case checkOAuthTokeninfoValidate:
+		return filters.OAuthTokeninfoValidateName
 	}
 	return AuthUnknown
 }
@@ -167,8 +239,7 @@ func (s *tokeninfoSpec) Name() string {
 // type. The shown example for checkOAuthTokeninfoAllScopes will grant
 // access only to tokens, that have scopes read-x and write-y:
 //
-//     s.CreateFilter("read-x", "write-y")
-//
+//	s.CreateFilter("read-x", "write-y")
 func (s *tokeninfoSpec) CreateFilter(args []interface{}) (filters.Filter, error) {
 	sargs, err := getStrings(args)
 	if err != nil {
@@ -178,17 +249,20 @@ func (s *tokeninfoSpec) CreateFilter(args []interface{}) (filters.Filter, error)
 		return nil, filters.ErrInvalidFilterParameters
 	}
 
-	var ac *authClient
-	var ok bool
-	if ac, ok = tokeninfoAuthClient[s.options.URL]; !ok {
-		ac, err = newAuthClient(s.options.URL, tokenInfoSpanName, s.options.Timeout, s.options.MaxIdleConns, s.options.Tracer)
-		if err != nil {
-			return nil, filters.ErrInvalidFilterParameters
-		}
-		tokeninfoAuthClient[s.options.URL] = ac
+	ac, err := s.options.getTokeninfoClient()
+	if err != nil {
+		return nil, filters.ErrInvalidFilterParameters
 	}
 
-	f := &tokeninfoFilter{typ: s.typ, authClient: ac, kv: make(map[string][]string)}
+	if s.typ == checkOAuthTokeninfoValidate {
+		config, err := s.tokeninfoValidateYamlConfigParser.parseSingleArg(args)
+		if err != nil {
+			return nil, err
+		}
+		return &tokeninfoValidateFilter{client: ac, config: config}, nil
+	}
+
+	f := &tokeninfoFilter{typ: s.typ, client: ac, kv: make(map[string][]string)}
 	switch f.typ {
 	// all scopes
 	case checkOAuthTokeninfoAllScopes:
@@ -241,16 +315,13 @@ func (f *tokeninfoFilter) validateAnyScopes(h map[string]interface{}) bool {
 	if !ok {
 		return false
 	}
-	var a []string
-	for i := range v {
-		s, ok := v[i].(string)
-		if !ok {
-			return false
-		}
-		a = append(a, s)
-	}
 
-	return intersect(f.scopes, a)
+	for _, scope := range f.scopes {
+		if contains(v, scope) {
+			return true
+		}
+	}
+	return false
 }
 
 func (f *tokeninfoFilter) validateAllScopes(h map[string]interface{}) bool {
@@ -266,16 +337,13 @@ func (f *tokeninfoFilter) validateAllScopes(h map[string]interface{}) bool {
 	if !ok {
 		return false
 	}
-	var a []string
-	for i := range v {
-		s, ok := v[i].(string)
-		if !ok {
+
+	for _, scope := range f.scopes {
+		if !contains(v, scope) {
 			return false
 		}
-		a = append(a, s)
 	}
-
-	return all(f.scopes, a)
+	return true
 }
 
 func (f *tokeninfoFilter) validateAnyKV(h map[string]interface{}) bool {
@@ -306,6 +374,15 @@ func (f *tokeninfoFilter) validateAllKV(h map[string]interface{}) bool {
 	return true
 }
 
+func contains(vals []interface{}, s string) bool {
+	for _, v := range vals {
+		if v == s {
+			return true
+		}
+	}
+	return false
+}
+
 // Request handles authentication based on the defined auth type.
 func (f *tokeninfoFilter) Request(ctx filters.FilterContext) {
 	r := ctx.Request()
@@ -315,21 +392,21 @@ func (f *tokeninfoFilter) Request(ctx filters.FilterContext) {
 	if !ok {
 		token, ok := getToken(r)
 		if !ok || token == "" {
-			unauthorized(ctx, "", missingBearerToken, f.authClient.url.Hostname(), "")
+			unauthorized(ctx, "", missingBearerToken, "", "")
 			return
 		}
 
 		var err error
-		authMap, err = f.authClient.getTokeninfo(token, ctx)
+		authMap, err = f.client.getTokeninfo(token, ctx)
 		if err != nil {
 			reason := authServiceAccess
 			if err == errInvalidToken {
 				reason = invalidToken
 			} else {
-				log.Errorf("Error while calling tokeninfo: %v.", err)
+				ctx.Logger().Errorf("Error while calling tokeninfo: %v", err)
 			}
 
-			unauthorized(ctx, "", reason, f.authClient.url.Hostname(), "")
+			unauthorized(ctx, "", reason, "", "")
 			return
 		}
 	} else {
@@ -349,7 +426,7 @@ func (f *tokeninfoFilter) Request(ctx filters.FilterContext) {
 	case checkOAuthTokeninfoAllKV:
 		allowed = f.validateAllKV(authMap)
 	default:
-		log.Errorf("Wrong tokeninfoFilter type: %s.", f)
+		ctx.Logger().Errorf("Wrong tokeninfoFilter type: %s.", f)
 	}
 
 	if !allowed {
@@ -363,7 +440,65 @@ func (f *tokeninfoFilter) Request(ctx filters.FilterContext) {
 
 func (f *tokeninfoFilter) Response(filters.FilterContext) {}
 
-// Close cleans-up the authClient
-func (f *tokeninfoFilter) Close() {
-	f.authClient.Close()
+func (c *tokeninfoValidateFilterConfig) initialize() error {
+	for _, host := range c.OptOutHosts {
+		if r, err := regexp.Compile(host); err != nil {
+			return fmt.Errorf("failed to compile opt-out host pattern: %q", host)
+		} else {
+			c.optOutHostsCompiled = append(c.optOutHostsCompiled, r)
+		}
+	}
+	return nil
 }
+
+func (f *tokeninfoValidateFilter) Request(ctx filters.FilterContext) {
+	if _, ok := ctx.StateBag()[tokeninfoCacheKey]; ok {
+		return // tokeninfo was already validated by a preceding filter
+	}
+
+	if len(f.config.OptOutAnnotations) > 0 {
+		annotations := annotate.GetAnnotations(ctx)
+		for _, annotation := range f.config.OptOutAnnotations {
+			if _, ok := annotations[annotation]; ok {
+				return // opt-out from validation
+			}
+		}
+	}
+
+	if len(f.config.optOutHostsCompiled) > 0 {
+		host := ctx.Request().Host
+		for _, r := range f.config.optOutHostsCompiled {
+			if r.MatchString(host) {
+				return // opt-out from validation
+			}
+		}
+	}
+
+	token, ok := getToken(ctx.Request())
+	if !ok {
+		f.serveUnauthorized(ctx)
+		return
+	}
+
+	tokeninfo, err := f.client.getTokeninfo(token, ctx)
+	if err != nil {
+		f.serveUnauthorized(ctx)
+		return
+	}
+
+	uid, _ := tokeninfo[uidKey].(string)
+	authorized(ctx, uid)
+	ctx.StateBag()[tokeninfoCacheKey] = tokeninfo
+}
+
+func (f *tokeninfoValidateFilter) serveUnauthorized(ctx filters.FilterContext) {
+	ctx.Serve(&http.Response{
+		StatusCode: http.StatusUnauthorized,
+		Header: http.Header{
+			"Content-Length": []string{strconv.Itoa(len(f.config.UnauthorizedResponse))},
+		},
+		Body: io.NopCloser(strings.NewReader(f.config.UnauthorizedResponse)),
+	})
+}
+
+func (f *tokeninfoValidateFilter) Response(filters.FilterContext) {}

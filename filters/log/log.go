@@ -13,8 +13,6 @@ import (
 	"regexp"
 	"strings"
 
-	log "github.com/sirupsen/logrus"
-
 	"github.com/zalando/skipper/filters"
 	"github.com/zalando/skipper/jwt"
 )
@@ -111,7 +109,7 @@ func (tb *teeBody) Write(b []byte) (int, error) {
 // maxAuditBody attribute to limit the size of the log. It will use
 // os.Stderr as writer for the output of the log entries.
 //
-//     spec := NewAuditLog(1024)
+//	spec := NewAuditLog(1024)
 func NewAuditLog(maxAuditBody int) filters.Spec {
 	return &auditLog{
 		writer:     os.Stderr,
@@ -172,7 +170,7 @@ func (al *auditLog) Response(ctx filters.FilterContext) {
 	enc := json.NewEncoder(al.writer)
 	err := enc.Encode(&doc)
 	if err != nil {
-		log.Errorf("Failed to json encode auditDoc: %v", err)
+		ctx.Logger().Errorf("Failed to json encode auditDoc: %v", err)
 	}
 }
 

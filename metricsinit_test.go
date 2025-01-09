@@ -36,7 +36,7 @@ func mustAvailablePort(t *testing.T) int {
 func TestInitOrderAndDefault(t *testing.T) {
 	const (
 		ringMetricsUpdatePeriod = time.Millisecond
-		testTimeout             = 120 * time.Millisecond
+		testTimeout             = 5 * time.Second
 	)
 
 	port := mustAvailablePort(t)
@@ -46,13 +46,19 @@ func TestInitOrderAndDefault(t *testing.T) {
 	done := make(chan struct{})
 	go func() {
 		options := Options{
-			Address:              fmt.Sprintf(":%d", port),
-			SupportListener:      fmt.Sprintf(":%d", supportPort),
-			EnableRuntimeMetrics: true,
-			EnableSwarm:          true,
-			SwarmRedisURLs:       []string{fmt.Sprintf("localhost:%d", redisPort)},
-			EnableRatelimiters:   true,
-			testOptions:          testOptions{redisConnMetricsInterval: ringMetricsUpdatePeriod},
+			Address:                       fmt.Sprintf(":%d", port),
+			SupportListener:               fmt.Sprintf(":%d", supportPort),
+			EnableRuntimeMetrics:          true,
+			EnableSwarm:                   true,
+			SwarmRedisURLs:                []string{fmt.Sprintf("localhost:%d", redisPort)},
+			EnableRatelimiters:            true,
+			SwarmRedisConnMetricsInterval: ringMetricsUpdatePeriod,
+			PassiveHealthCheck: map[string]string{
+				"period":               "1m",
+				"min-requests":         "10",
+				"max-drop-probability": "0.9",
+				"min-drop-probability": "0.05",
+			},
 		}
 
 		tornDown := make(chan struct{})

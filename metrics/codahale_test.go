@@ -36,6 +36,7 @@ func TestUseVoidByDefaultOptions(t *testing.T) {
 func TestDefaultOptionsWithListener(t *testing.T) {
 	o := Options{}
 	c := NewCodaHale(o)
+	defer c.Close()
 
 	if c == Void {
 		t.Error("Options containing a listener should create a registry")
@@ -53,6 +54,7 @@ func TestDefaultOptionsWithListener(t *testing.T) {
 func TestCodaHaleDebugGcStats(t *testing.T) {
 	o := Options{EnableDebugGcMetrics: true}
 	c := NewCodaHale(o)
+	defer c.Close()
 
 	if c.reg.Get("debug.GCStats.LastGC") == nil {
 		t.Error("Options enabled debug gc stats but failed to find the key 'debug.GCStats.LastGC'")
@@ -62,6 +64,7 @@ func TestCodaHaleDebugGcStats(t *testing.T) {
 func TestCodaHaleRuntimeStats(t *testing.T) {
 	o := Options{EnableRuntimeMetrics: true}
 	c := NewCodaHale(o)
+	defer c.Close()
 
 	if c.reg.Get("runtime.MemStats.Alloc") == nil {
 		t.Error("Options enabled runtime stats but failed to find the key 'runtime.MemStats.Alloc'")
@@ -71,6 +74,7 @@ func TestCodaHaleRuntimeStats(t *testing.T) {
 func TestCodaHaleMeasurement(t *testing.T) {
 	o := Options{}
 	c := NewCodaHale(o)
+	defer c.Close()
 
 	g1 := c.getGauge("TestGauge")
 	c.UpdateGauge("TestGauge", 1)
@@ -147,6 +151,7 @@ type proxyMetricTest struct {
 var proxyMetricsTests = []proxyMetricTest{
 	// T1 - Measure routing
 	{KeyRouteLookup, func(m Metrics) { m.MeasureRouteLookup(time.Now()) }},
+	{fmt.Sprintf(KeyFilterCreate, "afilter"), func(m Metrics) { m.MeasureFilterCreate("afilter", time.Now()) }},
 	// T2 - Measure filter request
 	{fmt.Sprintf(KeyFilterRequest, "foo"), func(m Metrics) { m.MeasureFilterRequest("foo", time.Now()) }},
 	// T3 - Measure all filters request
@@ -172,6 +177,8 @@ func TestCodaHaleProxyMetrics(t *testing.T) {
 	for _, pmt := range proxyMetricsTests {
 		t.Run(pmt.metricsKey, func(t *testing.T) {
 			m := NewCodaHale(Options{})
+			defer m.Close()
+
 			pmt.measureFunc(m)
 
 			time.Sleep(20 * time.Millisecond)
@@ -496,6 +503,8 @@ func TestCodaHaleServeMetrics(t *testing.T) {
 			}
 
 			m := NewCodaHale(ti.options)
+			defer m.Close()
+
 			for _, mi := range ti.measures {
 				m.MeasureServe(mi.route, mi.host, mi.method, mi.status, time.Now().Add(-mi.duration))
 			}

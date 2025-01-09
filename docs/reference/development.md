@@ -1,6 +1,6 @@
 ## How to develop a Filter
 
-A filter is part of a route and can change arbitary http data in the
+A filter is part of a route and can change arbitrary http data in the
 `http.Request` and `http.Response` path of a proxy.
 
 The filter example shows a non trivial diff of a filter
@@ -22,7 +22,7 @@ entrypoint. In case you do not need options from flags, use
 filter.
 
 
-```
+```diff
 diff --git a/cmd/skipper/main.go b/cmd/skipper/main.go
 index 28f18f9..4530b85 100644
 --- a/cmd/skipper/main.go
@@ -97,7 +97,7 @@ index 10d5769..da46fe0 100644
 
 Documentation for users should be done in `docs/`.
 
-```
+````diff
 diff --git a/docs/filters.md b/docs/filters.md
 index d3bb872..a877062 100644
 --- a/docs/filters.md
@@ -127,7 +127,7 @@ index d3bb872..a877062 100644
  ## oauthTokeninfoAnyScope
 
  If skipper is started with `-oauth2-tokeninfo-url` flag, you can use
-```
+````
 
 ### Add godoc
 
@@ -135,7 +135,7 @@ Godoc is meant for developers using skipper as library, use `doc.go`
 of the package to document generic functionality, usage and library
 usage.
 
-```
+```diff
 diff --git a/filters/auth/doc.go b/filters/auth/doc.go
 index 696d3fd..1d6e3a8 100644
 --- a/filters/auth/doc.go
@@ -170,10 +170,8 @@ process. A spec has to satisfy the `Spec` interface `Name() string` and
 
 The actual filter implementation has to satisfy the `Filter`
 interface `Request(filters.FilterContext)` and `Response(filters.FilterContext)`.
-If you need to clean up for example a goroutine you can do it in
-`Close()`, which will be called on filter shutdown.
 
-```
+```diff
 diff --git a/filters/auth/webhook.go b/filters/auth/webhook.go
 new file mode 100644
 index 0000000..f0632a6
@@ -254,16 +252,6 @@ index 0000000..f0632a6
 +}
 +
 +func (*webhookFilter) Response(filters.FilterContext) {}
-+
-+// Close cleans-up the quit channel used for this filter
-+func (f *webhookFilter) Close() {
-+	f.authClient.mu.Lock()
-+	if f.authClient.quit != nil {
-+		close(f.authClient.quit)
-+		f.authClient.quit = nil
-+	}
-+	f.authClient.mu.Unlock()
-+}
 ```
 
 ### Writing tests
@@ -282,7 +270,7 @@ package. Backends can be created with `httptest.NewServer` as in the
 example below.
 
 
-```
+```diff
 diff --git a/filters/auth/webhook_test.go b/filters/auth/webhook_test.go
 new file mode 100644
 index 0000000..d43c4ea
@@ -425,7 +413,7 @@ library. Due to a bug in the Go compiler as reported [here](https://github.com/g
 debugger cannot be used. This issue will be fixed in Go 1.12 but until then the only workaround is to remove
 references to the `plugin` library. The following patch can be used for debugging.
 
-```
+```diff
 diff --git a/plugins.go b/plugins.go
 index 837b6cf..aa69f09 100644
 --- a/plugins.go

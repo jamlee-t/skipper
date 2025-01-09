@@ -371,7 +371,8 @@ func parseRoutes(data map[string]string) []*eskip.RouteInfo {
 // parsing failed.
 func infoToRoutesLogged(info []*eskip.RouteInfo) []*eskip.Route {
 	var routes []*eskip.Route
-	for _, ri := range info {
+	for i := range info {
+		ri := info[i]
 		if ri.ParseError == nil {
 			routes = append(routes, &ri.Route)
 		} else {
@@ -441,7 +442,7 @@ func (c *Client) LoadUpdate() ([]*eskip.Route, []string, error) {
 		}
 
 		id := path.Base(response.Node.Key)
-		if response.Action == "delete" {
+		if response.Action == "delete" || response.Action == "expire" {
 			deletes[id] = true
 			delete(updates, id)
 		} else {
@@ -492,6 +493,7 @@ func (c *Client) Delete(id string) error {
 
 func (c *Client) UpsertAll(routes []*eskip.Route) error {
 	for _, r := range routes {
+		//lint:ignore SA1019 due to backward compatibility
 		r.Id = eskip.GenerateIfNeeded(r.Id)
 		err := c.Upsert(r)
 		if err != nil {

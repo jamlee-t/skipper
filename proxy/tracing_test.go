@@ -8,12 +8,16 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"net/url"
+	"strings"
 	"testing"
 	"time"
 
 	ot "github.com/opentracing/opentracing-go"
 	"github.com/opentracing/opentracing-go/mocktracer"
 	"github.com/zalando/skipper/tracing/tracingtest"
+
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 )
 
 const traceHeader = "X-Trace-Header"
@@ -80,9 +84,10 @@ func TestTracingIngressSpan(t *testing.T) {
 	})
 	defer s.Close()
 
-	doc := fmt.Sprintf(`hello: Path("/hello") -> setPath("/bye") -> setQuery("void") -> "%s"`, s.URL)
+	routeID := "ingressRoute"
+	doc := fmt.Sprintf(`%s: Path("/hello") -> setPath("/bye") -> setQuery("void") -> "%s"`, routeID, s.URL)
 
-	tracer := mocktracer.New()
+	tracer := tracingtest.NewTracer()
 	params := Params{
 		OpenTracing: &OpenTracingParams{
 			Tracer: tracer,
@@ -112,9 +117,6 @@ func TestTracingIngressSpan(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	// client may get response before proxy finishes span
-	time.Sleep(10 * time.Millisecond)
-
 	span, ok := findSpan(tracer, "ingress")
 	if !ok {
 		t.Fatal("ingress span not found")
@@ -122,6 +124,7 @@ func TestTracingIngressSpan(t *testing.T) {
 
 	verifyTag(t, span, SpanKindTag, SpanKindServer)
 	verifyTag(t, span, ComponentTag, "skipper")
+	verifyTag(t, span, SkipperRouteIDTag, routeID)
 	// to save memory we dropped the URL tag from ingress span
 	//verifyTag(t, span, HTTPUrlTag, "/hello?world") // For server requests there is no scheme://host:port, see https://golang.org/pkg/net/http/#Request
 	verifyTag(t, span, HTTPMethodTag, "GET")
@@ -131,6 +134,133 @@ func TestTracingIngressSpan(t *testing.T) {
 	verifyTag(t, span, FlowIDTag, "test-flow-id")
 	verifyTag(t, span, HTTPStatusCodeTag, uint16(200))
 	verifyHasTag(t, span, HTTPRemoteIPTag)
+}
+
+func TestTracingIngressSpanShunt(t *testing.T) {
+	routeID := "ingressShuntRoute"
+	doc := fmt.Sprintf(`%s: Path("/hello") -> setPath("/bye") -> setQuery("void") -> status(205) -> <shunt>`, routeID)
+
+	tracer := tracingtest.NewTracer()
+	params := Params{
+		OpenTracing: &OpenTracingParams{
+			Tracer: tracer,
+		},
+		Flags: FlagsNone,
+	}
+
+	t.Setenv("HOSTNAME", "ingress-shunt.tracing.test")
+
+	tp, err := newTestProxyWithParams(doc, params)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer tp.close()
+
+	ps := httptest.NewServer(tp.proxy)
+	defer ps.Close()
+
+	req, err := http.NewRequest("GET", ps.URL+"/hello?world", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	req.Header.Set("X-Flow-Id", "test-flow-id")
+
+	rsp, err := ps.Client().Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer rsp.Body.Close()
+	io.Copy(io.Discard, rsp.Body)
+
+	span, ok := findSpan(tracer, "ingress")
+	if !ok {
+		t.Fatal("ingress span not found")
+	}
+
+	verifyTag(t, span, SpanKindTag, SpanKindServer)
+	verifyTag(t, span, ComponentTag, "skipper")
+	verifyTag(t, span, SkipperRouteIDTag, routeID)
+	// to save memory we dropped the URL tag from ingress span
+	//verifyTag(t, span, HTTPUrlTag, "/hello?world") // For server requests there is no scheme://host:port, see https://golang.org/pkg/net/http/#Request
+	verifyTag(t, span, HTTPMethodTag, "GET")
+	verifyTag(t, span, HostnameTag, "ingress-shunt.tracing.test")
+	verifyTag(t, span, HTTPPathTag, "/hello")
+	verifyTag(t, span, HTTPHostTag, ps.Listener.Addr().String())
+	verifyTag(t, span, FlowIDTag, "test-flow-id")
+	verifyTag(t, span, HTTPStatusCodeTag, uint16(205))
+	verifyHasTag(t, span, HTTPRemoteIPTag)
+}
+
+func TestTracingIngressSpanLoopback(t *testing.T) {
+	shuntRouteID := "ingressShuntRoute"
+	loop1RouteID := "loop1Route"
+	loop2RouteID := "loop2Route"
+	routeIDs := []string{loop2RouteID, loop1RouteID, shuntRouteID}
+	paths := map[string]string{
+		loop2RouteID: "/loop2",
+		loop1RouteID: "/loop1",
+		shuntRouteID: "/shunt",
+	}
+
+	doc := fmt.Sprintf(`
+%s: Path("/shunt") -> setPath("/bye") -> setQuery("void") -> status(204) -> <shunt>;
+%s: Path("/loop1") -> setPath("/shunt") -> <loopback>;
+%s: Path("/loop2") -> setPath("/loop1") -> <loopback>;
+`, shuntRouteID, loop1RouteID, loop2RouteID)
+
+	tracer := tracingtest.NewTracer()
+	params := Params{
+		OpenTracing: &OpenTracingParams{
+			Tracer: tracer,
+		},
+		Flags: FlagsNone,
+	}
+
+	t.Setenv("HOSTNAME", "ingress-loop.tracing.test")
+
+	tp, err := newTestProxyWithParams(doc, params)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer tp.close()
+
+	ps := httptest.NewServer(tp.proxy)
+	defer ps.Close()
+
+	req, err := http.NewRequest("GET", ps.URL+"/loop2", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	req.Header.Set("X-Flow-Id", "test-flow-id")
+
+	rsp, err := ps.Client().Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer rsp.Body.Close()
+	io.Copy(io.Discard, rsp.Body)
+	t.Logf("got response %d", rsp.StatusCode)
+
+	sp, ok := findSpanByRouteID(tracer, loop2RouteID)
+	if !ok {
+		t.Fatalf("span for route %q not found", loop2RouteID)
+	}
+	verifyTag(t, sp, HTTPStatusCodeTag, uint16(204))
+
+	for _, rid := range routeIDs {
+		span, ok := findSpanByRouteID(tracer, rid)
+		if !ok {
+			t.Fatalf("span for route %q not found", rid)
+		}
+		verifyTag(t, span, SpanKindTag, SpanKindServer)
+		verifyTag(t, span, ComponentTag, "skipper")
+		verifyTag(t, span, SkipperRouteIDTag, rid)
+		verifyTag(t, span, HTTPMethodTag, "GET")
+		verifyTag(t, span, HostnameTag, "ingress-loop.tracing.test")
+		verifyTag(t, span, HTTPPathTag, paths[rid])
+		verifyTag(t, span, HTTPHostTag, ps.Listener.Addr().String())
+		verifyTag(t, span, FlowIDTag, "test-flow-id")
+	}
 }
 
 func TestTracingSpanName(t *testing.T) {
@@ -236,7 +366,7 @@ func TestTracingProxySpan(t *testing.T) {
 	defer s.Close()
 
 	doc := fmt.Sprintf(`hello: Path("/hello") -> setPath("/bye") -> setQuery("void") -> "%s"`, s.URL)
-	tracer := mocktracer.New()
+	tracer := tracingtest.NewTracer()
 
 	t.Setenv("HOSTNAME", "proxy.tracing.test")
 
@@ -259,9 +389,6 @@ func TestTracingProxySpan(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-
-	// client may get response before proxy finishes span
-	time.Sleep(10 * time.Millisecond)
 
 	span, ok := findSpan(tracer, "proxy")
 	if !ok {
@@ -363,45 +490,79 @@ func TestProxyTracingDefaultOptions(t *testing.T) {
 	}
 }
 
-func TestEnabledLogFilterLifecycleEvents(t *testing.T) {
-	tracer := mocktracer.New()
-	tracing := newProxyTracing(&OpenTracingParams{
-		Tracer:          tracer,
-		LogFilterEvents: true,
-	})
-	span := tracer.StartSpan("test")
-	defer span.Finish()
+func TestFilterTracing(t *testing.T) {
+	for _, tc := range []struct {
+		name       string
+		operation  string
+		filters    []string
+		params     *OpenTracingParams
+		expectLogs string
+	}{
+		{
+			name:       "enable log filter events",
+			operation:  "request_filters",
+			filters:    []string{"f1", "f2"},
+			params:     &OpenTracingParams{LogFilterEvents: true},
+			expectLogs: "f1: start, f1: end, f2: start, f2: end",
+		},
+		{
+			name:       "disable log filter events",
+			operation:  "request_filters",
+			filters:    []string{"f1", "f2"},
+			params:     &OpenTracingParams{LogFilterEvents: false},
+			expectLogs: "",
+		},
+		{
+			name:      "disable filter span (ignores log events)",
+			operation: "request_filters",
+			filters:   []string{"f1", "f2"},
+			params:    &OpenTracingParams{DisableFilterSpans: true, LogFilterEvents: true},
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			tracer := tracingtest.NewTracer()
+			tc.params.Tracer = tracer
+			tracing := newProxyTracing(tc.params)
 
-	tracing.logFilterStart(span, "test-filter")
-	tracing.logFilterEnd(span, "test-filter")
+			ctx := &context{request: &http.Request{}}
 
-	mockSpan := span.(*mocktracer.MockSpan)
+			ft := tracing.startFilterTracing(tc.operation, ctx)
+			for _, f := range tc.filters {
+				ft.logStart(f)
+				ft.logEnd(f)
+			}
+			ft.finish()
 
-	if len(mockSpan.Logs()) != 2 {
-		t.Errorf("filter lifecycle events were not logged although it was enabled")
+			spans := tracer.FinishedSpans()
+
+			if tc.params.DisableFilterSpans {
+				assert.Nil(t, ctx.parentSpan)
+				assert.Len(t, spans, 0)
+				return
+			}
+
+			require.Len(t, spans, 1)
+
+			span := spans[0]
+			assert.Equal(t, span, ctx.parentSpan)
+			assert.Equal(t, tc.operation, span.OperationName)
+			assert.Equal(t, tc.expectLogs, spanLogs(span))
+		})
 	}
 }
 
-func TestDisabledLogFilterLifecycleEvents(t *testing.T) {
-	tracer := mocktracer.New()
-	tracing := newProxyTracing(&OpenTracingParams{
-		Tracer:          tracer,
-		LogFilterEvents: false,
-	})
-	span := tracer.StartSpan("test")
-	defer span.Finish()
-
-	tracing.logFilterStart(span, "test-filter")
-	tracing.logFilterEnd(span, "test-filter")
-
-	mockSpan := span.(*mocktracer.MockSpan)
-
-	if len(mockSpan.Logs()) != 0 {
-		t.Errorf("filter lifecycle events were logged although it was disabled")
+func spanLogs(span *mocktracer.MockSpan) string {
+	var logs []string
+	for _, e := range span.Logs() {
+		for _, f := range e.Fields {
+			logs = append(logs, fmt.Sprintf("%s: %s", f.Key, f.ValueString))
+		}
 	}
+	return strings.Join(logs, ", ")
 }
+
 func TestEnabledLogStreamEvents(t *testing.T) {
-	tracer := mocktracer.New()
+	tracer := tracingtest.NewTracer()
 	tracing := newProxyTracing(&OpenTracingParams{
 		Tracer:          tracer,
 		LogStreamEvents: true,
@@ -420,7 +581,7 @@ func TestEnabledLogStreamEvents(t *testing.T) {
 }
 
 func TestDisabledLogStreamEvents(t *testing.T) {
-	tracer := mocktracer.New()
+	tracer := tracingtest.NewTracer()
 	tracing := newProxyTracing(&OpenTracingParams{
 		Tracer:          tracer,
 		LogStreamEvents: false,
@@ -439,7 +600,7 @@ func TestDisabledLogStreamEvents(t *testing.T) {
 }
 
 func TestSetEnabledTags(t *testing.T) {
-	tracer := mocktracer.New()
+	tracer := tracingtest.NewTracer()
 	tracing := newProxyTracing(&OpenTracingParams{
 		Tracer:      tracer,
 		ExcludeTags: []string{},
@@ -463,7 +624,7 @@ func TestSetEnabledTags(t *testing.T) {
 }
 
 func TestSetDisabledTags(t *testing.T) {
-	tracer := mocktracer.New()
+	tracer := tracingtest.NewTracer()
 	tracing := newProxyTracing(&OpenTracingParams{
 		Tracer: tracer,
 		ExcludeTags: []string{
@@ -495,7 +656,7 @@ func TestSetDisabledTags(t *testing.T) {
 }
 
 func TestLogEventWithEmptySpan(t *testing.T) {
-	tracer := mocktracer.New()
+	tracer := tracingtest.NewTracer()
 	tracing := newProxyTracing(&OpenTracingParams{
 		Tracer: tracer,
 	})
@@ -506,7 +667,7 @@ func TestLogEventWithEmptySpan(t *testing.T) {
 }
 
 func TestSetTagWithEmptySpan(t *testing.T) {
-	tracer := mocktracer.New()
+	tracer := tracingtest.NewTracer()
 	tracing := newProxyTracing(&OpenTracingParams{
 		Tracer: tracer,
 	})
@@ -515,9 +676,18 @@ func TestSetTagWithEmptySpan(t *testing.T) {
 	tracing.setTag(nil, "test", "val")
 }
 
-func findSpan(tracer *mocktracer.MockTracer, name string) (*mocktracer.MockSpan, bool) {
+func findSpan(tracer *tracingtest.MockTracer, name string) (*mocktracer.MockSpan, bool) {
 	for _, s := range tracer.FinishedSpans() {
 		if s.OperationName == name {
+			return s, true
+		}
+	}
+	return nil, false
+}
+
+func findSpanByRouteID(tracer *tracingtest.MockTracer, routeID string) (*mocktracer.MockSpan, bool) {
+	for _, s := range tracer.FinishedSpans() {
+		if s.Tag(SkipperRouteIDTag) == routeID {
 			return s, true
 		}
 	}

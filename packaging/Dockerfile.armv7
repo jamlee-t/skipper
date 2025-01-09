@@ -1,0 +1,12 @@
+FROM --platform=linux/arm/v7 alpine@sha256:56fa17d2a7e7f168a043a2712e63aed1f8543aeafdcee47c58dcffe38ed51099
+LABEL maintainer="Team Gateway&Proxy @ Zalando SE <team-gwproxy@zalando.de>"
+RUN apk --no-cache add ca-certificates && update-ca-certificates
+ADD build/linux/arm/v7/skipper \
+    build/linux/arm/v7/eskip \
+    build/linux/arm/v7/webhook \
+    build/linux/arm/v7/routesrv /usr/bin/
+ENV PATH $PATH:/usr/bin
+
+EXPOSE 9090 9911
+
+CMD ["/usr/bin/skipper"]

@@ -3,23 +3,35 @@ on:
   push:
     branches:
       - master
+permissions: {}
+env:
+  TESTCONTAINERS_RYUK_DISABLED: true
 jobs:
   tests:
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
     steps:
-      - uses: actions/checkout@v2
-      - uses: actions/setup-go@v2
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+      - uses: actions/setup-go@3041bf56c941b39c61721a86cd11f3bb1338122a
         with:
           # https://www.npmjs.com/package/semver#caret-ranges-123-025-004
-          go-version: '^1.17'
+          go-version: "^1.21"
+          check-latest: true
       - run: go version
-      - run: sudo apt-get install redis-server
       - run: make deps
       - run: make check-fmt
-      - run: make build
       - run: make vet
       - run: make staticcheck
       - run: make check-race
-      - run: make cicheck
-      - run: make gosec
-      - run: make publish-coverage
+      - run: make osv-scanner
+      - run: make govulncheck
+      - run: make capslock
+      - run: make coverprofile
+      - name: Convert coverage to lcov
+        uses: jandelgado/gcov2lcov-action@4e1989767862652e6ca8d3e2e61aabe6d43be28b
+      - name: Coveralls
+        uses: coverallsapp/github-action@cfd0633edbd2411b532b808ba7a8b5e04f76d2c8
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          path-to-lcov: coverage.lcov

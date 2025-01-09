@@ -4,7 +4,7 @@ set of filters.
 
 For the list of command line options, run:
 
-    skipper -help
+	skipper -help
 
 For details about the usage and extensibility of skipper, please see the
 documentation of the root skipper package.
@@ -17,6 +17,7 @@ package main
 import (
 	"fmt"
 	"runtime"
+	"runtime/debug"
 
 	log "github.com/sirupsen/logrus"
 	"github.com/zalando/skipper"
@@ -28,6 +29,22 @@ var (
 	commit  string
 )
 
+func init() {
+	if info, ok := debug.ReadBuildInfo(); ok {
+		if version == "" {
+			version = info.Main.Version
+		}
+		if commit == "" {
+			for _, setting := range info.Settings {
+				if setting.Key == "vcs.revision" {
+					commit = setting.Value[:min(8, len(setting.Value))]
+					break
+				}
+			}
+		}
+	}
+}
+
 func main() {
 	cfg := config.NewConfig()
 	if err := cfg.Parse(); err != nil {
@@ -35,14 +52,16 @@ func main() {
 	}
 
 	if cfg.PrintVersion {
-		fmt.Printf(
-			"Skipper version %s (commit: %s, runtime: %s)\n",
-			version, commit, runtime.Version(),
-		)
-
+		fmt.Printf("Skipper version %s (", version)
+		if commit != "" {
+			fmt.Printf("commit: %s, ", commit)
+		}
+		fmt.Printf("runtime: %s)\n", runtime.Version())
 		return
 	}
 
 	log.SetLevel(cfg.ApplicationLogLevel)
-	log.Fatal(skipper.Run(cfg.ToOptions()))
+	if err := skipper.Run(cfg.ToOptions()); err != nil {
+		log.Fatal(err)
+	}
 }

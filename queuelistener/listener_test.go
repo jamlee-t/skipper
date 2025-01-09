@@ -80,8 +80,13 @@ func (l *testListener) Accept() (net.Conn, error) {
 		select {
 		case l.conns <- c:
 		default:
-			// drop one if cannot store the latest
-			<-l.conns
+			// Drop one if cannot store the latest.
+			// The test might have received a connection in the meantime so do not block.
+			// Sending is safe as Accept is called from a single goroutine.
+			select {
+			case <-l.conns:
+			default:
+			}
 			l.conns <- c
 		}
 	}
@@ -348,13 +353,15 @@ func TestInterface(t *testing.T) {
 			t.Fatal(err)
 		}
 
-		if !conn.(*connection).net.(*testConnection).isClosed() {
+		if !conn.(*connection).external.Conn.(*testConnection).isClosed() {
 			t.Error("failed to close underlying connection")
 		}
 	})
 
 	t.Run("wrapped listener returns temporary error, logs and retries", func(t *testing.T) {
 		log := loggingtest.New()
+		defer log.Close()
+
 		l, err := listenWith(&testListener{failNextTemporary: true}, Options{
 			Log: log,
 		})
@@ -404,6 +411,7 @@ func TestInterface(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
+		defer l.Close()
 
 		if l.Addr() != addr {
 			t.Error("failed to return the right address")
@@ -685,7 +693,7 @@ func TestOptions(t *testing.T) {
 		defer got.Close()
 		l := got.(*listener)
 
-		if l.maxConcurrency != o.MaxConcurrency || l.maxQueueSize != o.MaxQueueSize {
+		if l.maxConcurrency != int64(o.MaxConcurrency) || l.maxQueueSize != int64(o.MaxQueueSize) {
 			t.Errorf("Failed to overwrite calculated settings: %d != %d || %d != %d", l.maxConcurrency, o.MaxConcurrency, l.maxQueueSize, o.MaxQueueSize)
 		}
 	})
@@ -703,11 +711,11 @@ func TestOptions(t *testing.T) {
 		defer got.Close()
 		l := got.(*listener)
 
-		if o.MaxConcurrency != 0 && l.maxConcurrency == o.MaxConcurrency {
+		if o.MaxConcurrency != 0 && l.maxConcurrency == int64(o.MaxConcurrency) {
 			t.Errorf("Failed to use calculate maxConcurrency settings: %d == %d", l.maxConcurrency, o.MaxConcurrency)
 		}
-		if l.maxConcurrency != o.MemoryLimitBytes/o.ConnectionBytes {
-			t.Errorf("Calculated is not: %d != %d", l.maxConcurrency, o.MemoryLimitBytes/o.ConnectionBytes)
+		if l.maxConcurrency != o.MemoryLimitBytes/int64(o.ConnectionBytes) {
+			t.Errorf("Calculated is not: %d != %d", l.maxConcurrency, o.MemoryLimitBytes/int64(o.ConnectionBytes))
 		}
 	})
 	t.Run("when max queue size is not set, it is calculated from max concurrency", func(t *testing.T) {
@@ -722,13 +730,13 @@ func TestOptions(t *testing.T) {
 		defer got.Close()
 		l := got.(*listener)
 
-		if o.MaxQueueSize != 0 && l.maxQueueSize == o.MaxQueueSize {
+		if o.MaxQueueSize != 0 && l.maxQueueSize == int64(o.MaxQueueSize) {
 			t.Errorf("Failed to use calculated maxQueueSize setting: %d == %d", l.maxConcurrency, o.MaxConcurrency)
 		}
 		if l.maxQueueSize == 0 || l.maxQueueSize > maxCalculatedQueueSize {
 			t.Errorf("Calculated maxQueueSize not in bounds: %d", l.maxQueueSize)
 		}
-		if l.maxQueueSize != 10*o.MaxConcurrency {
+		if l.maxQueueSize != 10*int64(o.MaxConcurrency) {
 			t.Errorf("Calculated maxQueueSize is wrong: %d != %d", l.maxQueueSize, 10*o.MaxConcurrency)
 		}
 	})
@@ -880,7 +888,7 @@ func TestTeardown(t *testing.T) {
 			}
 		}
 
-		if c0.(*connection).net.(*testConnection).isClosed() {
+		if c0.(*connection).external.Conn.(*testConnection).isClosed() {
 			t.Error("the accepted connection was closed by the queue")
 		}
 
@@ -984,6 +992,8 @@ func TestTeardown(t *testing.T) {
 func TestMonitoring(t *testing.T) {
 	t.Run("logs the temporary errors", func(t *testing.T) {
 		log := loggingtest.New()
+		defer log.Close()
+
 		l, err := listenWith(&testListener{failNextTemporary: true}, Options{
 			Log: log,
 		})
@@ -1004,7 +1014,7 @@ func TestMonitoring(t *testing.T) {
 		}
 	})
 
-	t.Run("updates the gauges for the concurrency and the queue size", func(t *testing.T) {
+	t.Run("updates the gauges for the concurrency and the queue size, measures accept latency", func(t *testing.T) {
 		m := &metricstest.MockMetrics{}
 		l, err := listenWith(&testListener{}, Options{
 			Metrics:        m,
@@ -1034,6 +1044,12 @@ func TestMonitoring(t *testing.T) {
 		}); err != nil {
 			t.Fatal(err)
 		}
+
+		m.WithMeasures(func(measures map[string][]time.Duration) {
+			if len(measures[acceptLatencyKey]) != 3 {
+				t.Error("latency measures mismatch")
+			}
+		})
 	})
 
 	t.Run("multiple calls to close are tolerated", func(t *testing.T) {
@@ -1056,6 +1072,7 @@ func TestMonitoring(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
+		defer l.Close()
 
 		done := make(chan struct{})
 		defer func() { close(done) }()
@@ -1088,7 +1105,7 @@ func TestMonitoring(t *testing.T) {
 func TestListen(t *testing.T) {
 	for _, tt := range []struct {
 		name             string
-		memoryLimit      int
+		memoryLimit      int64
 		bytesPerRequest  int
 		network, address string
 		wantErr          bool
@@ -1178,7 +1195,7 @@ func TestListen(t *testing.T) {
 func TestQueue1(t *testing.T) {
 	for _, tt := range []struct {
 		name            string
-		memoryLimit     int
+		memoryLimit     int64
 		bytesPerRequest int
 		allow           int
 	}{

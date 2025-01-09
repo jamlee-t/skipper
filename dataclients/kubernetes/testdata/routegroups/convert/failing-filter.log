@@ -1,3 +1,1 @@
-[[]routegroup[]]
-[[]eskip[]]
-filter
+\[routegroup\] parse failed after token foo, position 3: syntax error

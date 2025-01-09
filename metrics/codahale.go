@@ -14,6 +14,7 @@ import (
 const (
 	KeyRouteLookup                = "routelookup"
 	KeyRouteFailure               = "routefailure"
+	KeyFilterCreate               = "filter.%s.create"
 	KeyFilterRequest              = "filter.%s.request"
 	KeyFiltersRequest             = "allfilters.request.%s"
 	KeyAllFiltersRequestCombined  = "allfilters.combined.request"
@@ -45,6 +46,7 @@ type CodaHale struct {
 	createGauge   func() metrics.GaugeFloat64
 	options       Options
 	handler       http.Handler
+	quit          chan struct{}
 }
 
 // NewCodaHale returns a new CodaHale backend of metrics.
@@ -52,6 +54,8 @@ func NewCodaHale(o Options) *CodaHale {
 	o = applyCompatibilityDefaults(o)
 
 	c := &CodaHale{}
+
+	c.quit = make(chan struct{})
 	c.reg = metrics.NewRegistry()
 
 	var createSample func() metrics.Sample
@@ -68,12 +72,12 @@ func NewCodaHale(o Options) *CodaHale {
 
 	if o.EnableDebugGcMetrics {
 		metrics.RegisterDebugGCStats(c.reg)
-		go metrics.CaptureDebugGCStats(c.reg, statsRefreshDuration)
+		go c.collectStats(metrics.CaptureDebugGCStatsOnce)
 	}
 
 	if o.EnableRuntimeMetrics {
 		metrics.RegisterRuntimeMemStats(c.reg)
-		go metrics.CaptureRuntimeMemStats(c.reg, statsRefreshDuration)
+		go c.collectStats(metrics.CaptureRuntimeMemStatsOnce)
 	}
 
 	return c
@@ -121,12 +125,15 @@ func (c *CodaHale) IncFloatCounterBy(key string, value float64) {
 }
 
 func (c *CodaHale) measureSince(key string, start time.Time) {
-	d := time.Since(start)
-	go c.updateTimer(key, d)
+	c.updateTimer(key, time.Since(start))
 }
 
 func (c *CodaHale) MeasureRouteLookup(start time.Time) {
 	c.measureSince(KeyRouteLookup, start)
+}
+
+func (c *CodaHale) MeasureFilterCreate(filterName string, start time.Time) {
+	c.measureSince(fmt.Sprintf(KeyFilterCreate, filterName), start)
 }
 
 func (c *CodaHale) MeasureFilterRequest(filterName string, start time.Time) {
@@ -212,7 +219,7 @@ func (c *CodaHale) getCounter(key string) metrics.Counter {
 }
 
 func (c *CodaHale) incCounter(key string, value int64) {
-	go c.getCounter(key).Inc(value)
+	c.getCounter(key).Inc(value)
 }
 
 func (c *CodaHale) IncRoutingFailures() {
@@ -232,6 +239,23 @@ func (c *CodaHale) MeasureBackend5xx(t time.Time) {
 func (c *CodaHale) IncErrorsStreaming(routeId string) {
 	if c.options.EnableRouteStreamingErrorsCounters {
 		c.incCounter(fmt.Sprintf(KeyErrorsStreaming, routeId), 1)
+	}
+}
+
+func (c *CodaHale) Close() {
+	close(c.quit)
+}
+
+func (c *CodaHale) collectStats(capture func(r metrics.Registry)) {
+	ticker := time.NewTicker(statsRefreshDuration)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ticker.C:
+			capture(c.reg)
+		case <-c.quit:
+			return
+		}
 	}
 }
 
