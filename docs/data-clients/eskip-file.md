@@ -4,9 +4,9 @@ Eskip file dataclient can be used to serve static defined routes, read
 from an eskip file. The [file format eskip](https://godoc.org/github.com/zalando/skipper/eskip)
 shows your route definitions in a clear way:
 
-```
+```sh
 % cat example.eskip
-hello: Path("/hello") -> "https://www.example.org"'
+hello: Path("/hello") -> "https://www.example.org"
 ```
 
 The [Skipper project](https://github.com/zalando/skipper) has two
@@ -29,7 +29,7 @@ A more complicated example with different routes, matches,
 you can name your route and use preconditions and create, change, delete
 HTTP headers as you like:
 
-```
+```sh
 % cat complicated_example.eskip
 hostHeaderMatch:
          Host("^skipper.teapot.org$")
@@ -85,9 +85,9 @@ and in [predicates](https://godoc.org/github.com/zalando/skipper/predicates).
 
 
 Eskip file format is also used if you print your current routes in skipper,
-for example (metrics listener required):
+for example:
 
-```
+```sh
 % curl localhost:9911/routes
 *
   -> setResponseHeader("Content-Type", "application/json; charset=utf-8")

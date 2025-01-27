@@ -6,18 +6,18 @@
 // The tracers, except for "noop", are built as Go Plugins. Note the warning from Go's
 // plugin.go:
 //
-//    // The plugin support is currently incomplete, only supports Linux,
-//    // and has known bugs. Please report any issues.
+//	// The plugin support is currently incomplete, only supports Linux,
+//	// and has known bugs. Please report any issues.
 //
 // All plugins must have a function named "InitTracer" with the following signature
 //
-//    func([]string) (opentracing.Tracer, error)
+//	func([]string) (opentracing.Tracer, error)
 //
 // The parameters passed are all arguments for the plugin, i.e. everything after the first
 // word from skipper's -opentracing parameter. E.g. when the -opentracing parameter is
 // "mytracer foo=bar token=xxx somename=bla:3" the "mytracer" plugin will receive
 //
-//    []string{"foo=bar", "token=xxx", "somename=bla:3"}
+//	[]string{"foo=bar", "token=xxx", "somename=bla:3"}
 //
 // as arguments.
 //
@@ -25,24 +25,24 @@
 //
 // An example plugin looks like
 //
-//     package main
+//	package main
 //
-//     import (
-//          basic "github.com/opentracing/basictracer-go"
-//          opentracing "github.com/opentracing/opentracing-go"
-//     )
+//	import (
+//	     basic "github.com/opentracing/basictracer-go"
+//	     opentracing "github.com/opentracing/opentracing-go"
+//	)
 //
-//     func InitTracer(opts []string) (opentracing.Tracer, error) {
-//          return basic.NewTracerWithOptions(basic.Options{
-//              Recorder:       basic.NewInMemoryRecorder(),
-//              ShouldSample:   func(traceID uint64) bool { return traceID%64 == 0 },
-//              MaxLogsPerSpan: 25,
-//          }), nil
-//     }
+//	func InitTracer(opts []string) (opentracing.Tracer, error) {
+//	     return basic.NewTracerWithOptions(basic.Options{
+//	         Recorder:       basic.NewInMemoryRecorder(),
+//	         ShouldSample:   func(traceID uint64) bool { return traceID%64 == 0 },
+//	         MaxLogsPerSpan: 25,
+//	     }), nil
+//	}
 //
 // This should be built with
 //
-//    go build -buildmode=plugin -o basic.so ./basic/basic.go
+//	go build -buildmode=plugin -o basic.so ./basic/basic.go
 //
 // and copied to the given as -plugindir (by default, "./plugins").
 //
@@ -61,6 +61,11 @@ import (
 	"github.com/zalando/skipper/tracing/tracers/instana"
 	"github.com/zalando/skipper/tracing/tracers/jaeger"
 	"github.com/zalando/skipper/tracing/tracers/lightstep"
+
+	originstana "github.com/instana/go-sensor"
+	origlightstep "github.com/lightstep/lightstep-tracer-go"
+	origbasic "github.com/opentracing/basictracer-go"
+	origjaeger "github.com/uber/jaeger-client-go"
 )
 
 // InitTracer initializes an opentracing tracer. The first option item is the
@@ -145,4 +150,30 @@ func LogKV(k, v string, ctx context.Context) {
 	if span := ot.SpanFromContext(ctx); span != nil {
 		span.LogKV(k, v)
 	}
+}
+
+// GetTraceID retrieves TraceID from HTTP request, for example to search for this trace
+// in the UI of your tracing solution and to get more context about it
+func GetTraceID(span ot.Span) string {
+	if span == nil {
+		return ""
+	}
+
+	spanContext := span.Context()
+	if spanContext == nil {
+		return ""
+	}
+
+	switch spanContextType := spanContext.(type) {
+	case origbasic.SpanContext:
+		return fmt.Sprintf("%x", spanContextType.TraceID)
+	case originstana.SpanContext:
+		return fmt.Sprintf("%x", spanContextType.TraceID)
+	case origjaeger.SpanContext:
+		return spanContextType.TraceID().String()
+	case origlightstep.SpanContext:
+		return fmt.Sprintf("%x", spanContextType.TraceID)
+	}
+
+	return ""
 }

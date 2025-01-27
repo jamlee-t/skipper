@@ -13,6 +13,9 @@ import (
 	"github.com/zalando/skipper/filters"
 	"github.com/zalando/skipper/metrics"
 	"github.com/zalando/skipper/routing"
+	"github.com/zalando/skipper/tracing"
+
+	log "github.com/sirupsen/logrus"
 )
 
 const unknownHost = "_unknownhost_"
@@ -20,6 +23,7 @@ const unknownHost = "_unknownhost_"
 type flushedResponseWriter interface {
 	http.ResponseWriter
 	http.Flusher
+	Unwrap() http.ResponseWriter
 }
 
 type context struct {
@@ -35,7 +39,6 @@ type context struct {
 	originalRequest      *http.Request
 	originalResponse     *http.Response
 	outgoingHost         string
-	debugFilterPanics    []interface{}
 	outgoingDebugRequest *http.Request
 	executionCounter     int
 	startServe           time.Time
@@ -47,6 +50,7 @@ type context struct {
 	proxy                *Proxy
 	routeLookup          *routing.RouteLookup
 	cancelBackendContext stdlibcontext.CancelFunc
+	logger               filters.FilterContextLogger
 }
 
 type filterMetrics struct {
@@ -150,6 +154,10 @@ func newContext(
 	return c
 }
 
+func (c *context) ResponseController() *http.ResponseController {
+	return http.NewResponseController(c.responseWriter)
+}
+
 func (c *context) applyRoute(route *routing.Route, params map[string]string, preserveHost bool) {
 	c.route = route
 	if preserveHost {
@@ -206,6 +214,18 @@ func (c *context) SetOutgoingHost(h string)            { c.outgoingHost = h }
 func (c *context) Metrics() filters.Metrics            { return c.metrics }
 func (c *context) Tracer() opentracing.Tracer          { return c.tracer }
 func (c *context) ParentSpan() opentracing.Span        { return c.parentSpan }
+
+func (c *context) Logger() filters.FilterContextLogger {
+	if c.logger == nil {
+		traceId := tracing.GetTraceID(c.initialSpan)
+		if traceId != "" {
+			c.logger = log.WithFields(log.Fields{"trace_id": traceId})
+		} else {
+			c.logger = log.StandardLogger()
+		}
+	}
+	return c.logger
+}
 
 func (c *context) Serve(r *http.Response) {
 	r.Request = c.Request()
@@ -264,25 +284,28 @@ func (c *context) Split() (filters.FilterContext, error) {
 	u.Host = originalRequest.Host
 	cr, body, err := cloneRequestForSplit(u, originalRequest)
 	if err != nil {
-		c.proxy.log.Errorf("context: failed to clone request: %v", err)
+		c.Logger().Errorf("context: failed to clone request: %v", err)
 		return nil, err
 	}
 	serverSpan := opentracing.SpanFromContext(originalRequest.Context())
 	cr = cr.WithContext(opentracing.ContextWithSpan(cr.Context(), serverSpan))
+	cr = cr.WithContext(routing.NewContext(cr.Context()))
 	originalRequest.Body = body
 	cc.request = cr
 	return cc, nil
 }
 
 func (c *context) Loopback() {
-	err := c.proxy.do(c)
+	loopSpan := c.tracer.StartSpan(c.proxy.tracing.initialOperationName, opentracing.ChildOf(c.parentSpan.Context()))
+	defer loopSpan.Finish()
+	err := c.proxy.do(c, loopSpan)
 	if c.response != nil && c.response.Body != nil {
 		if _, err := io.Copy(io.Discard, c.response.Body); err != nil {
-			c.proxy.log.Errorf("context: error while discarding remainder response body: %v.", err)
+			c.Logger().Errorf("context: error while discarding remainder response body: %v.", err)
 		}
 		err := c.response.Body.Close()
 		if err != nil {
-			c.proxy.log.Errorf("context: error during closing the response body: %v", err)
+			c.Logger().Errorf("context: error during closing the response body: %v", err)
 		}
 	}
 	if c.proxySpan != nil {
@@ -296,7 +319,7 @@ func (c *context) Loopback() {
 	}
 
 	if err != nil {
-		c.proxy.log.Errorf("context: failed to execute loopback request: %v", err)
+		c.Logger().Errorf("context: failed to execute loopback request: %v", err)
 	}
 }
 
@@ -326,5 +349,6 @@ func (w noopFlushedResponseWriter) Header() http.Header {
 func (w noopFlushedResponseWriter) Write([]byte) (int, error) {
 	return 0, nil
 }
-func (w noopFlushedResponseWriter) WriteHeader(_ int) {}
-func (w noopFlushedResponseWriter) Flush()            {}
+func (w noopFlushedResponseWriter) WriteHeader(_ int)           {}
+func (w noopFlushedResponseWriter) Flush()                      {}
+func (w noopFlushedResponseWriter) Unwrap() http.ResponseWriter { return nil }

@@ -9,6 +9,7 @@ import (
 	"os"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/zalando/skipper/eskip"
 	"github.com/zalando/skipper/etcd/etcdtest"
@@ -26,14 +27,14 @@ func TestMain(m *testing.M) {
 		log.Fatal(err)
 	}
 
-	defer func() {
-		err := etcdtest.Stop()
-		if err != nil {
-			log.Fatal(err)
-		}
-	}()
+	exitCode := m.Run()
 
-	os.Exit(m.Run())
+	err = etcdtest.Stop()
+	if err != nil {
+		log.Fatal(err)
+	}
+
+	os.Exit(exitCode)
 }
 
 func checkInitial(d []*eskip.Route) bool {
@@ -201,7 +202,7 @@ func TestValidatesDocument(t *testing.T) {
 	}
 
 	_, err = c.LoadAll()
-	if err != invalidResponseDocument {
+	if err != errInvalidResponseDocument {
 		t.Error("failed to fail")
 	}
 }
@@ -310,6 +311,53 @@ func TestReceiveInsert(t *testing.T) {
 	}
 }
 
+func TestReceiveExpire(t *testing.T) {
+	if testing.Short() {
+		t.Skip()
+	}
+	if err := etcdtest.DeleteAll(); err != nil {
+		t.Fatal(err)
+		return
+	}
+
+	c, err := New(Options{etcdtest.Urls, "/skippertest", 0, false, "", "", ""})
+	if err != nil {
+		t.Fatal(err)
+		return
+	}
+
+	_, err = c.LoadAll()
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Will expire after a TTL of 1 second
+	etcdtest.PutDataToTTL("/skippertest", "pdp", `Path("/pdp") -> "https://expire.example.org"`, 1)
+
+	// Wait until the route is expired with a timeout of 5 seconds
+	timeout := time.After(5 * time.Second)
+	for {
+		select {
+		case <-timeout:
+			t.Error("Timeout: route should expire after 1 second but did not expire within 5 seconds")
+			return
+		default:
+			rs, es, err := c.LoadUpdate()
+			if err != nil {
+				t.Fatal(err)
+				return
+			}
+
+			if checkDeleted(es, "pdp") {
+				if len(rs) != 0 {
+					t.Fatal("unexpected upsert")
+				}
+				return
+			}
+		}
+	}
+}
+
 func TestReceiveDelete(t *testing.T) {
 	if testing.Short() {
 		t.Skip()
@@ -351,7 +399,7 @@ func TestUpsertNoId(t *testing.T) {
 	}
 
 	err = c.Upsert(&eskip.Route{})
-	if err != missingRouteId {
+	if err != errMissingRouteId {
 		t.Error("failed to fail")
 	}
 }
@@ -432,7 +480,7 @@ func TestDeleteNoId(t *testing.T) {
 	}
 
 	err = c.Delete("")
-	if err != missingRouteId {
+	if err != errMissingRouteId {
 		t.Error("failed to fail")
 	}
 }
@@ -592,20 +640,20 @@ func TestRequestWithBasicAuth(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	parts := strings.Split(authHeader, " ")
-	if len(parts) != 2 {
+	k, v, found := strings.Cut(authHeader, " ")
+	if !found || k == "" || v == "" {
 		t.Error("invalid auth header sent")
 		t.Log(authHeader)
 		return
 	}
 
-	if parts[0] != "Basic" {
+	if k != "Basic" {
 		t.Error("invalid auth header sent")
 		t.Log(authHeader)
 		return
 	}
 
-	decodedArr, err := base64.StdEncoding.DecodeString(parts[1])
+	decodedArr, err := base64.StdEncoding.DecodeString(v)
 	if err != nil {
 		t.Error(err)
 		t.Log("header sent:", authHeader)

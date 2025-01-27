@@ -149,7 +149,7 @@ Uses standardized Forwarded header ([RFC 7239](https://tools.ietf.org/html/rfc72
 
 More info about the header: [MDN](https://developer.mozilla.org/en-US/docs/Web/HTTP/Headers/Forwarded)
 
-If multiple proxies chain values in the header, as a comma separated list, the predicates below will only match 
+If multiple proxies chain values in the header, as a comma separated list, the predicates below will only match
 the last value in the chain for each part of the header.
 
 Example: Forwarded: host=example.com;proto=https, host=example.org
@@ -192,7 +192,7 @@ ForwardedProtocol("http")
 ForwardedProtocol("https")
 ```
 
-## Weight (priority)
+## Weight
 
 By default, the weight (priority) of a route is determined by the number of defined predicates.
 
@@ -250,7 +250,7 @@ health_down: Path("/health") && Shutdown() -> status(503) -> inlineContent("shut
 ## Method
 
 The HTTP method that the request must match. HTTP methods are one of
-GET, HEAD, PATCH, POST, PUT, DELETE, OPTIONS, CONNECT.
+GET, HEAD, PATCH, POST, PUT, DELETE, OPTIONS, CONNECT, TRACE.
 
 Parameters:
 
@@ -309,7 +309,7 @@ Parameters:
 Examples:
 
 ```
-HeaderRegexp("X-Forwarded-For", "^192\.168\.0\.[0-2]?[0-9]?[0-9] ")
+HeaderRegexp("X-Forwarded-For", "^192\.168\.0\.[0-2]?[0-9]?[0-9]")
 HeaderRegexp("Accept", "application/(json|xml)")
 ```
 
@@ -376,6 +376,78 @@ Examples:
 ```
 JWTPayloadAllKVRegexp("iss", "^https://")
 JWTPayloadAnyKVRegexp("iss", "^https://")
+```
+
+### HeaderSHA256
+
+Matches if SHA-256 hash of the header value (known as [pre-shared key](https://en.wikipedia.org/wiki/Pre-shared_key) or secret)
+equals to any of the configured hash values.
+Several hash values could be used to match multiple secrets e.g. during secret rotation.
+
+Hash values only hide secrets from parties that have access to the source of Skipper routes.
+Authentication strength depends on the strength of the secret value so e.g.
+`HeaderSHA256("X-Secret", "2bb80d537b1da3e38bd30361aa855686bde0eacd7162fef6a25fe97bf527a25b")`
+is not stronger than just `Header("X-Secret", "secret")`.
+
+The secret value must be kept secret, must be used by a single client and must be rotated periodically.
+See below how to generate random secret value using [OpenSSL](https://www.openssl.org/docs/man1.1.1/man1/rand.html).
+
+Parameters:
+
+* header name (string)
+* one or more hex-encoded SHA-256 hashes of the matching header values (string)
+
+Secure secret value example:
+```sh
+#
+# 1. Generate cryptographically secure pseudo random secret header value:
+# - length of at least 32 bytes (the size of the SHA-256 output)
+# - encode as -base64 or -hex to get ASCII text value
+#
+SECRET=$(openssl rand -base64 32)
+echo $SECRET
+3YchPsliGjBXvyl/ncLWEI8/loKGrj/VNM4garxWEmA=
+
+#
+# 2. Get SHA-256 hash of the secret header value to use as HeaderSHA256 argument:
+# - use echo -n to not output the trailing newline
+#
+echo -n $SECRET | sha256sum
+a6131ba920df753c8109500cc11818f7192336d06532f6fa13009c2e4f6e1841  -
+```
+```
+// 3. Configure route to match hash of the secret value
+HeaderSHA256(
+    "X-Secret",
+    "a6131ba920df753c8109500cc11818f7192336d06532f6fa13009c2e4f6e1841"
+) -> inlineContent("ok\n") -> <shunt>
+```
+```sh
+# 4. Test secret value
+curl -H "X-Secret: $SECRET" http://localhost:9090
+```
+
+Secret rotation example:
+```
+// To rotate secret:
+// * add new secret - both old and new secrets match during rotation
+// * update client to use new secret
+// * remove old secret
+HeaderSHA256(
+    "X-Secret",
+    "cba06b5736faf67e54b07b561eae94395e774c517a7d910a54369e1263ccfbd4", // SHA256("old")
+    "11507a0e2f5e69d5dfa40a62a1bd7b6ee57e6bcd85c67c9b8431b36fff21c437"  // SHA256("new")
+) -> inlineContent("ok\n") -> <shunt>
+```
+
+[Basic access authentication](https://en.wikipedia.org/wiki/Basic_access_authentication) example:
+```
+anon: * -> setResponseHeader("WWW-Authenticate", `Basic realm="foo", charset="UTF-8"`) -> status(401) -> <shunt>;
+auth: HeaderSHA256(
+    "Authorization",
+    "caae07e42ed8d231a58edcde95782b0feb67186172c18c89894ce4c2174df137", // SHA256("Basic " + BASE64("test:123£"))
+    "157da8472590f0ce0a7c651bd79aecb5cc582944fcf76cbabada915d333deee8"  // SHA256("Basic " + BASE64("Aladdin:open sesame"))
+) -> inlineContent("ok\n") -> <shunt>;
 ```
 
 ## Interval
@@ -458,7 +530,7 @@ Examples:
 Cron("* * * * *")
 // match only when the hour is between 5-7 (inclusive)
 Cron("* 5-7, * * *")
-// match only when the hour is between 5-7, equal to 8, or betweeen 12-15
+// match only when the hour is between 5-7, equal to 8, or between 12-15
 Cron("* 5-7,8,12-15 * * *")
 // match only when it is weekdays
 Cron("* * * * 1-5")
@@ -592,7 +664,7 @@ ignoring the chance argument.
 Parameters:
 
 * Traffic (decimal) valid values [0.0, 1.0]
-* Traffic (decimal, string, string) session stickyness
+* Traffic (decimal, string, string) session stickiness
 
 Examples:
 
@@ -610,7 +682,7 @@ v1:
     "https://api-test-blue";
 ```
 
-stickyness:
+stickiness:
 
 ```
 // hit by 5% percent chance
@@ -642,4 +714,50 @@ catalog:
     * ->
     responseCookie("catalog-test", "default") ->
     "https://catalog";
+```
+
+## TrafficSegment
+
+TrafficSegment predicate requires two number arguments $min$ and $max$
+from an interval $[0, 1]$ (from zero included to one included) and $min <= max$.
+
+Let $r$ be one-per-request uniform random number value from $[0, 1)$.
+TrafficSegment matches if $r$ belongs to an interval from $[min, max)$.
+Upper interval boundary $max$ is excluded to simplify definition of
+adjacent intervals - the upper boundary of the first interval
+then equals lower boundary of the next and so on, e.g. $[0, 0.25)$ and $[0.25, 1)$.
+
+This predicate has weight of -1 and therefore does not affect route weight.
+
+Parameters:
+
+* min (decimal) from an interval [0, 1]
+* max (decimal) from an interval [0, 1], min <= max
+
+Example of routes splitting traffic in 50%+30%+20% proportion:
+
+```
+r50: Path("/test") && TrafficSegment(0.0, 0.5) -> <shunt>;
+r30: Path("/test") && TrafficSegment(0.5, 0.8) -> <shunt>;
+r20: Path("/test") && TrafficSegment(0.8, 1.0) -> <shunt>;
+```
+
+## ContentLengthBetween
+
+The ContentLengthBetween predicate matches a route when a request content length header value is between min and max provided values.
+In case the client does not specify the content length value then the predicate will not match.
+
+Parameters:
+
+* min (int): the lower bound (inclusive) for the content length check. The value must be greater than or equal to 0.
+* max (int): the upper bound (exclusive) for the content length check. The value must be greater than `min`.
+
+Examples:
+
+```
+// matches the range from 0 to 999
+ContentLengthBetween(0, 1000)
+
+// matches the range from 1000 to 9999
+ContentLengthBetween(1000, 10000)
 ```

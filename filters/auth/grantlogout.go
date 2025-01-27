@@ -2,15 +2,14 @@ package auth
 
 import (
 	"encoding/json"
-	"errors"
 	"fmt"
 	"io"
 	"net/http"
 	"net/url"
 	"strings"
 
-	log "github.com/sirupsen/logrus"
 	"github.com/zalando/skipper/filters"
+	"golang.org/x/oauth2"
 )
 
 const (
@@ -25,11 +24,11 @@ const (
 )
 
 type grantLogoutSpec struct {
-	config OAuthConfig
+	config *OAuthConfig
 }
 
 type grantLogoutFilter struct {
-	config OAuthConfig
+	config *OAuthConfig
 }
 
 type revokeErrorResponse struct {
@@ -43,20 +42,6 @@ func (s *grantLogoutSpec) CreateFilter([]interface{}) (filters.Filter, error) {
 	return &grantLogoutFilter{
 		config: s.config,
 	}, nil
-}
-
-func (f *grantLogoutFilter) getBasicAuthCredentials() (string, string, error) {
-	clientID := f.config.GetClientID()
-	if clientID == "" {
-		return "", "", errors.New("failed to create token revoke auth header: no client ID")
-	}
-
-	clientSecret := f.config.GetClientSecret()
-	if clientSecret == "" {
-		return "", "", errors.New("failed to create token revoke auth header: no client secret")
-	}
-
-	return clientID, clientSecret, nil
 }
 
 func responseToError(responseData []byte, statusCode int, tokenType string) error {
@@ -81,7 +66,7 @@ func responseToError(responseData []byte, statusCode int, tokenType string) erro
 	)
 }
 
-func (f *grantLogoutFilter) revokeTokenType(tokenType string, token string) error {
+func (f *grantLogoutFilter) revokeTokenType(c *oauth2.Config, tokenType string, token string) error {
 	revokeURL, err := url.Parse(f.config.RevokeTokenURL)
 	if err != nil {
 		return err
@@ -106,12 +91,7 @@ func (f *grantLogoutFilter) revokeTokenType(tokenType string, token string) erro
 		return err
 	}
 
-	clientId, clientSecret, err := f.getBasicAuthCredentials()
-	if err != nil {
-		return err
-	}
-
-	revokeRequest.SetBasicAuth(clientId, clientSecret)
+	revokeRequest.SetBasicAuth(c.ClientID, c.ClientSecret)
 	revokeRequest.Header.Set("Content-Type", "application/x-www-form-urlencoded")
 
 	revokeResponse, err := f.config.AuthClient.Do(revokeRequest)
@@ -139,9 +119,13 @@ func (f *grantLogoutFilter) revokeTokenType(tokenType string, token string) erro
 }
 
 func (f *grantLogoutFilter) Request(ctx filters.FilterContext) {
+	if f.config.RevokeTokenURL == "" {
+		return
+	}
+
 	req := ctx.Request()
 
-	c, err := extractCookie(req, f.config)
+	token, err := f.config.GrantCookieEncoder.Read(req)
 	if err != nil {
 		unauthorized(
 			ctx,
@@ -152,7 +136,7 @@ func (f *grantLogoutFilter) Request(ctx filters.FilterContext) {
 		return
 	}
 
-	if c.AccessToken == "" && c.RefreshToken == "" {
+	if token.AccessToken == "" && token.RefreshToken == "" {
 		unauthorized(
 			ctx,
 			"",
@@ -162,18 +146,24 @@ func (f *grantLogoutFilter) Request(ctx filters.FilterContext) {
 		return
 	}
 
+	authConfig, err := f.config.GetConfig(req)
+	if err != nil {
+		serverError(ctx)
+		return
+	}
+
 	var accessTokenRevokeError, refreshTokenRevokeError error
-	if c.AccessToken != "" {
-		accessTokenRevokeError = f.revokeTokenType(accessTokenType, c.AccessToken)
+	if token.AccessToken != "" {
+		accessTokenRevokeError = f.revokeTokenType(authConfig, accessTokenType, token.AccessToken)
 		if accessTokenRevokeError != nil {
-			log.Error(accessTokenRevokeError)
+			ctx.Logger().Errorf("%v", accessTokenRevokeError)
 		}
 	}
 
-	if c.RefreshToken != "" {
-		refreshTokenRevokeError = f.revokeTokenType(refreshTokenType, c.RefreshToken)
+	if token.RefreshToken != "" {
+		refreshTokenRevokeError = f.revokeTokenType(authConfig, refreshTokenType, token.RefreshToken)
 		if refreshTokenRevokeError != nil {
-			log.Error(refreshTokenRevokeError)
+			ctx.Logger().Errorf("%v", refreshTokenRevokeError)
 		}
 	}
 
@@ -183,6 +173,12 @@ func (f *grantLogoutFilter) Request(ctx filters.FilterContext) {
 }
 
 func (f *grantLogoutFilter) Response(ctx filters.FilterContext) {
-	deleteCookie := createDeleteCookie(f.config, ctx.Request().Host)
-	ctx.Response().Header.Add("Set-Cookie", deleteCookie.String())
+	cookies, err := f.config.GrantCookieEncoder.Update(ctx.Request(), nil)
+	if err != nil {
+		ctx.Logger().Errorf("Failed to delete cookies: %v.", err)
+		return
+	}
+	for _, c := range cookies {
+		ctx.Response().Header.Add("Set-Cookie", c.String())
+	}
 }

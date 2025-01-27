@@ -1,7 +1,6 @@
 package metrics
 
 import (
-	"fmt"
 	"net/http"
 	"net/http/pprof"
 	"runtime"
@@ -63,6 +62,7 @@ type Metrics interface {
 	IncFloatCounterBy(key string, value float64)
 	// Additional methods
 	MeasureRouteLookup(start time.Time)
+	MeasureFilterCreate(filterName string, start time.Time)
 	MeasureFilterRequest(filterName string, start time.Time)
 	MeasureAllFiltersRequest(routeId string, start time.Time)
 	MeasureBackend(routeId string, start time.Time)
@@ -77,6 +77,7 @@ type Metrics interface {
 	IncErrorsStreaming(routeId string)
 	RegisterHandler(path string, handler *http.ServeMux)
 	UpdateGauge(key string, value float64)
+	Close()
 }
 
 // Options for initializing metrics collection.
@@ -121,12 +122,12 @@ type Options struct {
 
 	// If set, the detailed total response time metrics will contain the
 	// HTTP method as a domain of the metric. It affects both route and
-	// host splitted metrics.
+	// host split metrics.
 	EnableServeMethodMetric bool
 
 	// If set, the detailed total response time metrics will contain the
 	// HTTP Response status code as a domain of the metric. It affects
-	// both route and host splitted metrics.
+	// both route and host split metrics.
 	EnableServeStatusCodeMetric bool
 
 	// If set, detailed response time metrics will be collected
@@ -194,6 +195,10 @@ type Options struct {
 	// library.
 	// A new registry is created if this option is nil.
 	PrometheusRegistry *prometheus.Registry
+
+	// EnablePrometheusStartLabel adds start label to each prometheus counter with the value of counter creation
+	// timestamp as unix nanoseconds.
+	EnablePrometheusStartLabel bool
 }
 
 var (
@@ -273,12 +278,8 @@ func NewHandler(o Options, m Metrics) http.Handler {
 
 	Default = m
 
-	// Fix trailing slashes and register routes.
-	mPath := defaultMetricsPath
-	mPath = strings.TrimRight(mPath, "/")
-	m.RegisterHandler(mPath, mux)
-	mPath = fmt.Sprintf("%s/", mPath)
-	m.RegisterHandler(mPath, mux)
+	m.RegisterHandler(defaultMetricsPath, mux)
+	m.RegisterHandler(defaultMetricsPath+"/", mux)
 
 	return mux
 }

@@ -5,12 +5,12 @@ import (
 	"bufio"
 	"bytes"
 	"errors"
+	"fmt"
 	"io"
 	"net/http"
 	"net/url"
 	"os"
 	"strings"
-	"time"
 
 	log "github.com/sirupsen/logrus"
 
@@ -24,18 +24,55 @@ import (
 	gjson "layeh.com/gopher-json"
 )
 
-// InitialPoolSize is the number of lua states created initially per route
-var InitialPoolSize int = 3
+var (
+	// InitialPoolSize is the number of lua states created initially per route
+	InitialPoolSize int = 3
 
-// MaxPoolSize is the number of lua states stored per route - there may be more parallel
-// requests, but only this number is cached.
-var MaxPoolSize int = 10
+	// MaxPoolSize is the number of lua states stored per route - there may be more parallel
+	// requests, but only this number is cached.
+	MaxPoolSize int = 10
 
-type luaScript struct{}
+	errLuaSourcesDisabled = errors.New("lua Sources are disabled")
+)
 
-// NewLuaScript creates a new filter spec for skipper
+type LuaOptions struct {
+	// Modules configures enabled standard and additional (preloaded) Lua modules.
+	// For standard Lua modules (see https://www.lua.org/manual/5.1/manual.html)
+	// use "<module>.<symbol>" (e.g. "base.print") to selectively enable module symbols.
+	// Additional modules are preloaded with all symbols.
+	// Empty value enables all modules.
+	Modules []string
+	// Sources that are allowed as input sources. Valid sources
+	// are "none", "file" and "inline". Empty slice will enable
+	// both as default. To disable the use of lua filters use
+	// "none".
+	Sources []string
+}
+
+type luaScript struct {
+	modules []string
+	sources []string
+}
+
+// NewLuaScript creates a new filter spec
 func NewLuaScript() filters.Spec {
-	return &luaScript{}
+	spec, _ := NewLuaScriptWithOptions(LuaOptions{})
+	return spec
+}
+
+// NewLuaScriptWithOptions creates a new filter spec with options
+func NewLuaScriptWithOptions(opts LuaOptions) (filters.Spec, error) {
+	sources := opts.Sources
+	if len(sources) == 0 {
+		// backwards compatible default, allow all
+		sources = append(sources, "file", "inline")
+	} else if contains("none", opts.Sources) {
+		sources = nil
+	}
+	return &luaScript{
+		modules: opts.Modules,
+		sources: sources,
+	}, nil
 }
 
 // Name returns the name of the filter ("lua")
@@ -43,8 +80,11 @@ func (ls *luaScript) Name() string {
 	return filters.LuaName
 }
 
-// CreateFilter creates the filter
+// CreateFilter creates the lua script filter.
 func (ls *luaScript) CreateFilter(config []interface{}) (filters.Filter, error) {
+	if len(ls.sources) == 0 {
+		return nil, errLuaSourcesDisabled
+	}
 	if len(config) == 0 {
 		return nil, filters.ErrInvalidFilterParameters
 	}
@@ -62,10 +102,22 @@ func (ls *luaScript) CreateFilter(config []interface{}) (filters.Filter, error) 
 	}
 
 	s := &script{source: src, routeParams: params}
-	if err := s.initScript(); err != nil {
+	if err := s.initScript(ls.modules, ls.sources); err != nil {
 		return nil, err
 	}
 	return s, nil
+}
+
+type script struct {
+	source      string
+	routeParams []string
+
+	pool        chan *lua.LState
+	proto       *lua.FunctionProto
+	load        []luaModule
+	preload     []luaModule
+	hasRequest  bool
+	hasResponse bool
 }
 
 func (s *script) getState() (*lua.LState, error) {
@@ -93,13 +145,15 @@ func (s *script) putState(L *lua.LState) {
 }
 
 func (s *script) newState() (*lua.LState, error) {
-	L := lua.NewState()
-	L.PreloadModule("base64", base64.Loader)
-	L.PreloadModule("http", gluahttp.NewHttpModule(&http.Client{}).Loader)
-	L.PreloadModule("url", gluaurl.Loader)
-	L.PreloadModule("json", gjson.Loader)
-	L.SetGlobal("print", L.NewFunction(printToLog))
-	L.SetGlobal("sleep", L.NewFunction(sleep))
+	L := lua.NewState(lua.Options{SkipOpenLibs: true})
+
+	for _, m := range s.load {
+		m.load(L)
+	}
+
+	for _, m := range s.preload {
+		m.preload(L)
+	}
 
 	L.Push(L.NewFunctionFromProto(s.proto))
 
@@ -111,39 +165,33 @@ func (s *script) newState() (*lua.LState, error) {
 	return L, nil
 }
 
-func printToLog(L *lua.LState) int {
-	top := L.GetTop()
-	args := make([]interface{}, 0, top)
-	for i := 1; i <= top; i++ {
-		args = append(args, L.ToStringMeta(L.Get(i)).String())
-	}
-	log.Print(args...)
-	return 0
-}
-
-func sleep(L *lua.LState) int {
-	time.Sleep(time.Duration(L.CheckInt64(1)) * time.Millisecond)
-	return 0
-}
-
-func (s *script) initScript() error {
+func (s *script) initScript(modules, validSources []string) error {
 	// Compile
 	var reader io.Reader
 	var name string
 
 	if strings.HasSuffix(s.source, ".lua") {
+		if !contains("file", validSources) {
+			return fmt.Errorf(`invalid lua source referenced "file", allowed: "%v"`, validSources)
+		}
+
 		file, err := os.Open(s.source)
 		if err != nil {
 			return err
 		}
+
 		defer func() {
 			if err = file.Close(); err != nil {
 				log.Errorf("Failed to close lua file %s: %v", s.source, err)
 			}
 		}()
+
 		reader = bufio.NewReader(file)
 		name = s.source
 	} else {
+		if !contains("inline", validSources) {
+			return fmt.Errorf(`invalid lua source referenced "inline", allowed: "%v"`, validSources)
+		}
 		reader = strings.NewReader(s.source)
 		name = "<script>"
 	}
@@ -157,7 +205,50 @@ func (s *script) initScript() error {
 	}
 	s.proto = proto
 
+	// Configure enabled modules and symbols
+	moduleConfig := moduleConfig(modules)
+
+	if len(moduleConfig) == 0 {
+		s.load = append(s.load, standardModules...)
+	} else {
+		L := lua.NewState(lua.Options{SkipOpenLibs: true})
+		defer L.Close()
+
+		for _, m := range standardModules {
+			name := m.name
+			if m.name == lua.BaseLibName {
+				name = "base" // alias for empty lua.BaseLibName
+			}
+			if symbols, ok := moduleConfig[name]; ok {
+				if len(symbols) > 0 {
+					m = m.withSymbols(L, symbols)
+				}
+				s.load = append(s.load, m)
+			}
+		}
+	}
+
+	// Configure additional modules
+	additionalModules := []luaModule{
+		{"base64", base64.Loader, nil},
+		{"http", gluahttp.NewHttpModule(&http.Client{}).Loader, nil},
+		{"url", gluaurl.Loader, nil},
+		{"json", gjson.Loader, nil},
+	}
+
+	if len(moduleConfig) == 0 {
+		s.preload = append(s.preload, additionalModules...)
+	} else {
+		for _, m := range additionalModules {
+			// TODO: enable selected symbols for preloaded modules
+			if _, ok := moduleConfig[m.name]; ok {
+				s.preload = append(s.preload, m)
+			}
+		}
+	}
+
 	// Detect request and response functions
+	// Note: use s.newState() instead of lua.NewState() to load only enabled modules
 	L, err := s.newState()
 	if err != nil {
 		return err
@@ -186,14 +277,6 @@ func (s *script) initScript() error {
 	return nil
 }
 
-type script struct {
-	source                  string
-	routeParams             []string
-	pool                    chan *lua.LState
-	proto                   *lua.FunctionProto
-	hasRequest, hasResponse bool
-}
-
 func (s *script) Request(f filters.FilterContext) {
 	if s.hasRequest {
 		s.runFunc("request", f)
@@ -216,11 +299,8 @@ func (s *script) runFunc(name string, f filters.FilterContext) {
 
 	pt := L.CreateTable(len(s.routeParams), len(s.routeParams))
 	for i, p := range s.routeParams {
-		parts := strings.SplitN(p, "=", 2)
-		if len(parts) == 1 {
-			parts = append(parts, "")
-		}
-		pt.RawSetString(parts[0], lua.LString(parts[1]))
+		k, v, _ := strings.Cut(p, "=")
+		pt.RawSetString(k, lua.LString(v))
 		pt.RawSetInt(i+1, lua.LString(p))
 	}
 
@@ -260,13 +340,13 @@ func serveRequest(f filters.FilterContext) func(*lua.LState) int {
 			return 1
 		}
 		res := &http.Response{}
-		r.ForEach(serveTableWalk(s, res))
+		r.ForEach(serveTableWalk(res))
 		f.Serve(res)
 		return 0
 	}
 }
 
-func serveTableWalk(s *lua.LState, res *http.Response) func(lua.LValue, lua.LValue) {
+func serveTableWalk(res *http.Response) func(lua.LValue, lua.LValue) {
 	return func(k, v lua.LValue) {
 		sk, ok := k.(lua.LString)
 		if !ok {
@@ -385,7 +465,10 @@ func getRequestValue(f filters.FilterContext) func(*lua.LState) int {
 		switch key {
 		case "header":
 			if header == nil {
-				header = s.CreateTable(0, 0)
+				header = s.CreateTable(0, 2)
+				header.RawSetString("add", s.NewFunction(addRequestHeader(f)))
+				header.RawSetString("values", s.NewFunction(requestHeaderValues(f)))
+
 				mt := s.CreateTable(0, 3)
 				mt.RawSetString("__index", s.NewFunction(getRequestHeader(f)))
 				mt.RawSetString("__newindex", s.NewFunction(setRequestHeader(f)))
@@ -476,7 +559,10 @@ func getResponseValue(f filters.FilterContext) func(*lua.LState) int {
 		switch key {
 		case "header":
 			if header == nil {
-				header = s.CreateTable(0, 0)
+				header = s.CreateTable(0, 2)
+				header.RawSetString("add", s.NewFunction(addResponseHeader(f)))
+				header.RawSetString("values", s.NewFunction(responseHeaderValues(f)))
+
 				mt := s.CreateTable(0, 3)
 				mt.RawSetString("__index", s.NewFunction(getResponseHeader(f)))
 				mt.RawSetString("__newindex", s.NewFunction(setResponseHeader(f)))
@@ -529,6 +615,8 @@ func getStateBag(f filters.FilterContext) func(*lua.LState) int {
 			s.Push(lua.LNumber(res))
 		case float64:
 			s.Push(lua.LNumber(res))
+		case *lua.LTable:
+			s.Push(res) // load *lua.LTable as is
 		default:
 			return 0
 		}
@@ -546,6 +634,8 @@ func setStateBag(f filters.FilterContext) func(*lua.LState) int {
 			res = string(val.(lua.LString))
 		case lua.LTNumber:
 			res = float64(val.(lua.LNumber))
+		case lua.LTTable:
+			res = val // store *lua.LTable as is
 		default:
 			// TODO(sszuecs): https://github.com/zalando/skipper/issues/1487
 			// s.RaiseError("unsupported state bag value type %v, need a string or a number", val.Type())
@@ -590,6 +680,30 @@ func setRequestHeader(f filters.FilterContext) func(*lua.LState) int {
 			f.Request().Header.Set(hdr, val)
 		}
 		return 0
+	}
+}
+
+func addRequestHeader(f filters.FilterContext) func(*lua.LState) int {
+	return func(s *lua.LState) int {
+		value := s.ToString(-1)
+		name := s.ToString(-2)
+		if name != "" && value != "" {
+			f.Request().Header.Add(name, value)
+		}
+		return 0
+	}
+}
+
+func requestHeaderValues(f filters.FilterContext) func(*lua.LState) int {
+	return func(s *lua.LState) int {
+		name := s.ToString(-1)
+		values := f.Request().Header.Values(name)
+		res := s.CreateTable(len(values), 0)
+		for _, v := range values {
+			res.Append(lua.LString(v))
+		}
+		s.Push(res)
+		return 1
 	}
 }
 
@@ -668,6 +782,30 @@ func setResponseHeader(f filters.FilterContext) func(*lua.LState) int {
 			f.Response().Header.Set(hdr, val)
 		}
 		return 0
+	}
+}
+
+func addResponseHeader(f filters.FilterContext) func(*lua.LState) int {
+	return func(s *lua.LState) int {
+		value := s.ToString(-1)
+		name := s.ToString(-2)
+		if name != "" && value != "" {
+			f.Response().Header.Add(name, value)
+		}
+		return 0
+	}
+}
+
+func responseHeaderValues(f filters.FilterContext) func(*lua.LState) int {
+	return func(s *lua.LState) int {
+		name := s.ToString(-1)
+		values := f.Response().Header.Values(name)
+		res := s.CreateTable(len(values), 0)
+		for _, v := range values {
+			res.Append(lua.LString(v))
+		}
+		s.Push(res)
+		return 1
 	}
 }
 
@@ -774,4 +912,13 @@ func unsupported(message string) func(*lua.LState) int {
 		s.RaiseError(message)
 		return 0
 	}
+}
+
+func contains(s string, a []string) bool {
+	for _, w := range a {
+		if s == w {
+			return true
+		}
+	}
+	return false
 }

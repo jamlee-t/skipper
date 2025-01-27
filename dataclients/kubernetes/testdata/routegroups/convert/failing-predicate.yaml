@@ -1,6 +1,7 @@
 apiVersion: zalando.org/v1
 kind: RouteGroup
 metadata:
+  namespace: foo
   name: myapp
 spec:
   hosts:
@@ -13,12 +14,17 @@ spec:
   defaultBackends:
   - backendName: myapp
   routes:
-  - predicates:
-    - Header#
+  - pathSubtree: /app
+    predicates:
+      - Header#
+  - pathSubtree: /app2
+    predicates:
+      - Header("test")
 ---
 apiVersion: v1
 kind: Service
 metadata:
+  namespace: foo
   name: myapp
 spec:
   ports:
@@ -32,6 +38,7 @@ spec:
 apiVersion: v1
 kind: Endpoints
 metadata:
+  namespace: foo
   name: myapp
 subsets:
 - addresses:

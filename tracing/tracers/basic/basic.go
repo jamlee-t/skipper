@@ -4,13 +4,25 @@ import (
 	"fmt"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	basic "github.com/opentracing/basictracer-go"
 	opentracing "github.com/opentracing/opentracing-go"
 )
 
-func InitTracer(opts []string) (opentracing.Tracer, error) {
+type CloseableTracer interface {
+	opentracing.Tracer
+	Close()
+}
+
+type basicTracer struct {
+	opentracing.Tracer
+	quit chan struct{}
+	once sync.Once
+}
+
+func InitTracer(opts []string) (CloseableTracer, error) {
 	fmt.Printf("DO NOT USE IN PRODUCTION\n")
 	var (
 		dropAllLogs    bool
@@ -21,34 +33,34 @@ func InitTracer(opts []string) (opentracing.Tracer, error) {
 	)
 
 	for _, o := range opts {
-		parts := strings.SplitN(o, "=", 2)
-		switch parts[0] {
+		k, v, _ := strings.Cut(o, "=")
+		switch k {
 		case "drop-all-logs":
 			dropAllLogs = true
 
 		case "sample-modulo":
-			if len(parts) == 1 {
-				return nil, missingArg(parts[0])
+			if v == "" {
+				return nil, missingArg(k)
 			}
-			sampleModulo, err = strconv.ParseUint(parts[1], 10, 64)
+			sampleModulo, err = strconv.ParseUint(v, 10, 64)
 			if err != nil {
-				return nil, invalidArg(parts[0], err)
+				return nil, invalidArg(k, err)
 			}
 
 		case "max-logs-per-span":
-			if len(parts) == 1 {
-				return nil, missingArg(parts[0])
+			if v == "" {
+				return nil, missingArg(k)
 			}
-			maxLogsPerSpan, err = strconv.Atoi(parts[1])
+			maxLogsPerSpan, err = strconv.Atoi(v)
 			if err != nil {
-				return nil, invalidArg(parts[0], err)
+				return nil, invalidArg(k, err)
 			}
 
 		case "recorder":
-			if len(parts) == 1 {
-				return nil, missingArg(parts[0])
+			if v == "" {
+				return nil, missingArg(k)
 			}
-			switch parts[1] {
+			switch v {
 			case "in-memory":
 				recorder = basic.NewInMemoryRecorder()
 			default:
@@ -56,7 +68,23 @@ func InitTracer(opts []string) (opentracing.Tracer, error) {
 			}
 		}
 	}
+
+	quit := make(chan struct{})
+	bt := &basicTracer{
+		basic.NewWithOptions(basic.Options{
+			DropAllLogs:    dropAllLogs,
+			ShouldSample:   func(traceID uint64) bool { return traceID%sampleModulo == 0 },
+			MaxLogsPerSpan: maxLogsPerSpan,
+			Recorder:       recorder,
+		}),
+		quit,
+		sync.Once{},
+	}
+
 	go func() {
+		ticker := time.NewTicker(1 * time.Second)
+		defer ticker.Stop()
+
 		for {
 			rec := recorder.(*basic.InMemorySpanRecorder)
 			spans := rec.GetSampledSpans()
@@ -65,16 +93,17 @@ func InitTracer(opts []string) (opentracing.Tracer, error) {
 			for _, span := range spans {
 				fmt.Printf("SAMPLED=%#v\n", span)
 			}
-			time.Sleep(1 * time.Second)
+
+			select {
+			case <-ticker.C:
+			case <-quit:
+				return
+			}
+
 		}
 	}()
 
-	return basic.NewWithOptions(basic.Options{
-		DropAllLogs:    dropAllLogs,
-		ShouldSample:   func(traceID uint64) bool { return traceID%sampleModulo == 0 },
-		MaxLogsPerSpan: maxLogsPerSpan,
-		Recorder:       recorder,
-	}), nil
+	return bt, nil
 }
 
 func missingArg(opt string) error {
@@ -83,4 +112,10 @@ func missingArg(opt string) error {
 
 func invalidArg(opt string, err error) error {
 	return fmt.Errorf("invalid argument for %s option: %s", opt, err)
+}
+
+func (bt *basicTracer) Close() {
+	bt.once.Do(func() {
+		close(bt.quit)
+	})
 }

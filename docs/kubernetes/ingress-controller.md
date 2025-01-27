@@ -149,19 +149,49 @@ You would point your DNS entries to the
 load balancer in front of skipper, for example automated using
 [external-dns](https://github.com/kubernetes-incubator/external-dns).
 
-## Why skipper uses endpoints and not services?
+## Why Skipper uses EndpointSlices or Endpoints and not Services?
 
 Skipper does not use the ClusterIP of [Kubernetes
 Services](http://kubernetes.io/docs/user-guide/services) to route
-traffic to the pods. Instead it uses the Endpoints API to bypass
-kube-proxy created iptables to remove overhead like conntrack entries
-for iptables DNAT. Skipper can also reuse connections to Pods, such
-that you have no overhead in establishing connections all the time. To
-prevent errors on node failures, Skipper also does automatic
-retries to another endpoint in case it gets a connection refused or
-TLS handshake error to the endpoint.  Other reasons are future support
-of features like session affinity, different load balancer
-algorithms or distributed loadbalancing also known as service mesh.
+traffic to the pods. Instead it uses the Endpointslices or Endpoints
+API to bypass kube-proxy created iptables to remove overhead like
+conntrack entries for iptables DNAT. Skipper can also reuse
+connections to Pods, such that you have no overhead in establishing
+connections all the time. To prevent errors on node failures, Skipper
+also does automatic retries to another endpoint in case it gets a
+connection refused or TLS handshake error to the endpoint.  Other
+reasons are future support of features like session affinity,
+different load balancer algorithms or distributed loadbalancing also
+known as service mesh.
+
+### Using EndpointSlices instead of Endpoints
+
+[EndpointSlices](https://kubernetes.io/docs/concepts/services-networking/endpoint-slices)
+provide the ability to
+[scale beyond 1000](https://kubernetes.io/docs/concepts/services-networking/service/#over-capacity-endpoints)
+load balancer members in one pool.
+
+To enable EndpointSlices you need to run skipper or routesrv with
+`-enable-kubernetes-endpointslices=true`.
+
+### Using Services instead of Endpoints
+
+While using Endpoints is the preferred way of using Skipper as an
+ingress controller as described in the section above, there might be
+edge cases that require the use of [Kubernetes
+Services](http://kubernetes.io/docs/user-guide/services) instead.
+
+An example of scenario where you might need to use Services is when you rely
+on Istio networking features to connect multiple clusters, as the IPs of
+Kubernetes Endpoints will not resolve in all cases.
+
+If you find yourself in this category, you can override the default behaviour
+by setting the `KubernetesForceService` flag to `true` in the `Skipper.Options` struct.
+This will cause Skipper to create routes with `BackendType=eskip.NetworkBackend` instead
+of `BackendType=eskip.LBBackend` and use the following address format:
+`http://<service name>.<namespace>.svc.cluster.local:<port>`. See the [Kubernetes Service DNS
+documentation](https://kubernetes.io/docs/concepts/services-networking/dns-pod-service/#services)
+for more information.
 
 ## AWS deployment
 
@@ -195,6 +225,26 @@ load balancer virtual IP.
 
 ![ingress-traffic-flow](../img/ingress-traffic-flow-baremetal.svg)
 
+## RouteSRV
+
+In kubernetes skipper-ingress fetches ingress/routegroup configurations every **3s**, with high number of skipper pods *~100* we faced issues with kube-apiserver. At which we introduced RouteSRV, which will serve as a layer between kube-apiserver and skipper ingress, so it will give us more flexiability in scaling skipper-ingress without affecting k8s-apiserver
+
+### Kubernetes dataclient as routes source
+
+```mermaid
+  graph TD;
+      kapis(kubeapiserver) --fetches ingresses--> s(skipper);
+```
+
+
+### Kubernetes with RouteSRV as routes source
+
+```mermaid
+  graph TD;
+  kapis(kubeapiserver) --fetches ingresses--> s(routesrv) --fetches routes--> d1(skipper1) & d2(skipper2);
+```
+
+
 ## Requirements
 
 In general for one endpoint you need, a DNS A/AAAA record pointing to
@@ -226,7 +276,7 @@ Prerequisites:
 manifests: `git clone https://github.com/zalando/skipper.git`
 1. You should enter the cloned directory: `cd skipper`
 1. You have to choose how to install skipper-ingress. You can install
-it as [dameonset](#dameonset) or as [deployment](#deployment).
+it as [daemonset](#daemonset) or as [deployment](#deployment).
 
 Beware, in order to get traffic from the internet, we would need to
 have a load balancer in front to direct all traffic to skipper. Skipper
@@ -240,7 +290,7 @@ definition.
 
 ### Deployment style
 
-Follow the deployment style you like: [dameonset](#dameonset) or [deployment](#deployment).
+Follow the deployment style you like: [daemonset](#daemonset) or [deployment](#deployment).
 
 #### Daemonset
 
@@ -282,7 +332,8 @@ kubectl create -f docs/kubernetes/deploy/deployment
 
 Now, let's see what we have just deployed.
 This will create serviceaccount, PodSecurityPolicy and RBAC rules such that
-skipper-ingress is allowed to listen on the hostnetwork.
+skipper-ingress is allowed to listen on the hostnetwork and poll
+ingress resources.
 
 ```yaml
 # cat docs/kubernetes/deploy/deployment/rbac.yaml
@@ -343,9 +394,9 @@ cluster service on TCP port 80. Besides skipper-ingress, deployment
 and service can not be reached from outside the cluster. Now we expose
 the application with Ingress to the external network:
 
-```bash
+```yaml
 # cat demo-ing.yaml
-apiVersion: extensions/v1beta1
+apiVersion: networking.k8s.io/v1
 kind: Ingress
 metadata:
   name: skipper-demo
@@ -355,8 +406,11 @@ spec:
     http:
       paths:
       - backend:
-          serviceName: skipper-demo
-          servicePort: 80
+          service:
+            name: skipper-demo
+            port:
+              number: 80
+        pathType: ImplementationSpecific
 ```
 
 To deploy this ingress, you have to run:
@@ -404,7 +458,7 @@ serve the traffic.
 Example ingress:
 
 ```yaml
-apiVersion: extensions/v1beta1
+apiVersion: networking.k8s.io/v1
 kind: Ingress
 metadata:
   annotations:
@@ -416,8 +470,11 @@ spec:
     http:
       paths:
       - backend:
-          serviceName: app-svc
-          servicePort: 80
+          service:
+            name: app-svc
+            port:
+              number: 80
+        pathType: ImplementationSpecific
 ```
 
 ## Scoping Skipper Deployments to a Single Namespace
@@ -442,7 +499,7 @@ The source code is available at [GitHub](https://github.com/baez90/skipper-helm)
 The chart includes resource definitions for the following use cases:
 
 - RBAC
-- CoreOS [Prometheus-Operator](https://github.com/coreos/prometheus-operator)
+- [Prometheus-Operator](https://github.com/prometheus-operator/prometheus-operator)
 
 As this chart is not maintained by the Skipper developers and is still under development only the basic deployment workflow is covered here.
 Check the GitHub repository for all details.
@@ -541,8 +598,8 @@ Corefile example:
 If the setup is correct, skipper will protect the following ingress
 example with the `ClientIP` predicate:
 
-```
-apiVersion: extensions/v1beta1
+```yaml
+apiVersion: networking.k8s.io/v1
 kind: Ingress
 metadata:
   name: demo
@@ -553,15 +610,18 @@ spec:
     http:
       paths:
       - backend:
-          serviceName: example
-          servicePort: 80
+          service:
+            name: example
+            port:
+              number: 80
+        pathType: ImplementationSpecific
 ```
 
 Your clients inside the cluster should call this example with
 `demo.skipper.cluster.local` in their host header. Example
 from inside a container:
 
-```
+```sh
 curl demo.skipper.cluster.local
 ```
 
@@ -585,7 +645,7 @@ line option `-enable-swarm` and `-enable-ratelimits`.
 The rest depends on the implementation, that can be:
 
 - [Redis](https://redis.io)
-- [SWIM](https://www.cs.cornell.edu/projects/Quicksilver/public_pdfs/SWIM.pdf)
+- alpha version: [SWIM](https://www.cs.cornell.edu/projects/Quicksilver/public_pdfs/SWIM.pdf)
 
 ### Redis based
 
@@ -678,7 +738,7 @@ production, yet.
 Additionally you have to add the following command line flags to
 skipper's container spec `args:`:
 
-```
+```sh
 -swarm-port=9990
 -swarm-label-selector-key=application
 -swarm-label-selector-value=skipper-ingress
@@ -695,4 +755,89 @@ the communication work with TCP and UDP to the specified `swarm-port`:
   hostPort: 9990
   name: swarm-port
   protocol: TCP
+```
+
+## Upgrades
+
+Please always read the announcements of the vX.Y.**0**
+[release page](https://github.com/zalando/skipper/releases/tag/v0.19.0),
+because these will document in case we break something in a backwards non
+compatible way. Most of the time it will be safe to deploy minor
+version updates, but better to know in advance if something could
+break.
+
+### <v0.14.0 to >=v0.14.0
+
+Kubernetes dataclient removes support for ingress v1beta1.
+What does it mean for you?
+
+1. If you run with enabled `-kubernetes-ingress-v1`, you won't need to
+  do anything and you can safely delete the flag while updating to
+  `>=0.14.0`.
+2. If you use skipper as library and pass `KubernetesIngressV1: true`
+  via `kubernetes.Options` into `kubernetes.New()`, then you won't need to
+  do anything and you can safely delete passing the option while updating to
+  `>=0.14.0`.
+3. If you use Ingress v1beta1 and run Kubernetes cluster version that
+  does not support ingress v1, then you can't update skipper to
+  `>=0.14.0`, before you upgrade your Kubernetes cluster.
+4. If you use Ingress v1beta1 and run Kubernetes cluster version that
+  support ingress v1, then you need to allow skipper to access the new
+  APIs with a changed RBAC. See the guide below.
+
+
+If you are in case 4., you have to apply a change in your RBAC, please
+check the diff or the full rendered file.
+
+Diff view (same for deployment and daemonset):
+```diff
+diff --git docs/kubernetes/deploy/deployment/rbac.yaml docs/kubernetes/deploy/deployment/rbac.yaml
+index 361f3789..c0e448a4 100644
+--- docs/kubernetes/deploy/deployment/rbac.yaml
++++ docs/kubernetes/deploy/deployment/rbac.yaml
+@@ -37,11 +37,18 @@ metadata:
+   name: skipper-ingress
+   namespace: kube-system
+ ---
+-apiVersion: rbac.authorization.k8s.io/v1beta1
++apiVersion: rbac.authorization.k8s.io/v1
+ kind: ClusterRole
+ metadata:
+   name: skipper-ingress
+ rules:
++- apiGroups:
++  - networking.k8s.io
++  resources:
++  - ingresses
++  verbs:
++  - get
++  - list
+ - apiGroups:
+     - extensions
+   resources:
+@@ -66,7 +73,7 @@ rules:
+   - get
+   - list
+ ---
+-apiVersion: rbac.authorization.k8s.io/v1beta1
++apiVersion: rbac.authorization.k8s.io/v1
+ kind: ClusterRoleBinding
+ metadata:
+   name: skipper-ingress
+@@ -79,7 +86,7 @@ subjects:
+   name: skipper-ingress
+   namespace: kube-system
+ ---
+-apiVersion: rbac.authorization.k8s.io/v1beta1
++apiVersion: rbac.authorization.k8s.io/v1
+ kind: RoleBinding
+ metadata:
+   name: skipper-ingress-hostnetwork-psp
+```
+
+Full rendered RBAC files (same for deployment and daemonset):
+
+```yaml
+# cat docs/kubernetes/deploy/deployment/rbac.yaml
+{!kubernetes/deploy/deployment/rbac.yaml!}
 ```

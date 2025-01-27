@@ -1,25 +1,24 @@
 package eskip
 
-//go:generate goyacc -o parser.go -p eskip parser.y
+//go:generate goyacc -l -v "" -o parser.go -p eskip parser.y
 
 import (
 	"errors"
 	"fmt"
+	"math/rand"
 	"net/url"
 	"regexp"
 	"strings"
+	"sync"
 
 	log "github.com/sirupsen/logrus"
-	"github.com/zalando/skipper/filters/flowid"
 )
 
 const duplicateHeaderPredicateErrorFmt = "duplicate header predicate: %s"
 
 var (
-	invalidPredicateArgError        = errors.New("invalid predicate arg")
-	invalidPredicateArgCountError   = errors.New("invalid predicate count arg")
-	duplicatePathTreePredicateError = errors.New("duplicate path tree predicate")
-	duplicateMethodPredicateError   = errors.New("duplicate method predicate")
+	errDuplicatePathTreePredicate = errors.New("duplicate path tree predicate")
+	errDuplicateMethodPredicate   = errors.New("duplicate method predicate")
 )
 
 // NewEditor creates an Editor PreProcessor, that matches routes and
@@ -28,10 +27,10 @@ var (
 // --edit-route='/Source[(](.*)[)]/ClientIP($1)/', which will change
 // routes as you can see:
 //
-//        # input
-//        r0: Source("127.0.0.1/8", "10.0.0.0/8") -> inlineContent("OK") -> <shunt>
-//        # actual route
-//        edit_r0: ClientIP("127.0.0.1/8", "10.0.0.0/8") -> inlineContent("OK") -> <shunt>
+//	# input
+//	r0: Source("127.0.0.1/8", "10.0.0.0/8") -> inlineContent("OK") -> <shunt>;
+//	# actual route
+//	edit_r0: ClientIP("127.0.0.1/8", "10.0.0.0/8") -> inlineContent("OK") -> <shunt>;
 func NewEditor(reg *regexp.Regexp, repl string) *Editor {
 	return &Editor{
 		reg:  reg,
@@ -50,11 +49,11 @@ type Editor struct {
 // --clone-route='/Source[(](.*)[)]/ClientIP($1)/', which will change
 // routes as you can see:
 //
-//        # input
-//        r0: Source("127.0.0.1/8", "10.0.0.0/8") -> inlineContent("OK") -> <shunt>
-//        # actual route
-//        clone_r0: ClientIP("127.0.0.1/8", "10.0.0.0/8") -> inlineContent("OK") -> <shunt>
-//        r0: Source("127.0.0.1/8", "10.0.0.0/8") -> inlineContent("OK") -> <shunt>
+//	# input
+//	r0: Source("127.0.0.1/8", "10.0.0.0/8") -> inlineContent("OK") -> <shunt>;
+//	# actual route
+//	clone_r0: ClientIP("127.0.0.1/8", "10.0.0.0/8") -> inlineContent("OK") -> <shunt>;
+//	r0: Source("127.0.0.1/8", "10.0.0.0/8") -> inlineContent("OK") -> <shunt>;
 func NewClone(reg *regexp.Regexp, repl string) *Clone {
 	return &Clone{
 		reg:  reg,
@@ -72,11 +71,11 @@ func (e *Editor) Do(routes []*Route) []*Route {
 		return routes
 	}
 
-	for i, r := range routes {
+	canonicalRoutes := CanonicalList(routes)
+
+	for i, r := range canonicalRoutes {
 		rr := new(Route)
 		*rr = *r
-		rr = Canonical(rr)
-
 		if doOneRoute(e.reg, e.repl, rr) {
 			routes[i] = rr
 		}
@@ -90,12 +89,13 @@ func (c *Clone) Do(routes []*Route) []*Route {
 		return routes
 	}
 
+	canonicalRoutes := CanonicalList(routes)
+
 	result := make([]*Route, len(routes), 2*len(routes))
 	copy(result, routes)
-	for _, r := range routes {
+	for _, r := range canonicalRoutes {
 		rr := new(Route)
 		*rr = *r
-		rr = Canonical(rr)
 
 		rr.Id = "clone_" + rr.Id
 		predicates := make([]*Predicate, len(r.Predicates))
@@ -200,15 +200,6 @@ func (df *DefaultFilters) Do(routes []*Route) []*Route {
 	return nextRoutes
 }
 
-// Represents a matcher condition for incoming requests.
-type matcher struct {
-	// The name of the matcher, e.g. Path or Header
-	name string
-
-	// The args of the matcher, e.g. the path to be matched.
-	args []interface{}
-}
-
 // BackendType indicates whether a route is a network backend, a shunt or a loopback.
 type BackendType int
 
@@ -226,7 +217,7 @@ var errMixedProtocols = errors.New("loadbalancer endpoints cannot have mixed pro
 // document.
 type parsedRoute struct {
 	id          string
-	matchers    []*matcher
+	predicates  []*Predicate
 	filters     []*Filter
 	shunt       bool
 	loopback    bool
@@ -453,17 +444,25 @@ func (t BackendType) String() string {
 }
 
 // Expects exactly n arguments of type string, or fails.
-func getStringArgs(n int, args []interface{}) ([]string, error) {
-	if len(args) != n {
-		return nil, invalidPredicateArgCountError
+func getStringArgs(p *Predicate, n int) ([]string, error) {
+	failure := func() ([]string, error) {
+		if n == 1 {
+			return nil, fmt.Errorf("%s predicate expects 1 string argument", p.Name)
+		} else {
+			return nil, fmt.Errorf("%s predicate expects %d string arguments", p.Name, n)
+		}
+	}
+
+	if len(p.Args) != n {
+		return failure()
 	}
 
 	sargs := make([]string, n)
-	for i, a := range args {
+	for i, a := range p.Args {
 		if sa, ok := a.(string); ok {
 			sargs[i] = sa
 		} else {
-			return nil, invalidPredicateArgError
+			return failure()
 		}
 	}
 
@@ -481,40 +480,36 @@ func applyPredicates(route *Route, proute *parsedRoute) error {
 		methodSet bool
 	)
 
-	for _, m := range proute.matchers {
-		if err != nil {
-			return err
-		}
-
-		switch m.name {
+	for _, p := range proute.predicates {
+		switch p.Name {
 		case "Path":
 			if pathSet {
-				return duplicatePathTreePredicateError
+				return errDuplicatePathTreePredicate
 			}
 
-			if args, err = getStringArgs(1, m.args); err == nil {
+			if args, err = getStringArgs(p, 1); err == nil {
 				route.Path = args[0]
 				pathSet = true
 			}
 		case "Host":
-			if args, err = getStringArgs(1, m.args); err == nil {
+			if args, err = getStringArgs(p, 1); err == nil {
 				route.HostRegexps = append(route.HostRegexps, args[0])
 			}
 		case "PathRegexp":
-			if args, err = getStringArgs(1, m.args); err == nil {
+			if args, err = getStringArgs(p, 1); err == nil {
 				route.PathRegexps = append(route.PathRegexps, args[0])
 			}
 		case "Method":
 			if methodSet {
-				return duplicateMethodPredicateError
+				return errDuplicateMethodPredicate
 			}
 
-			if args, err = getStringArgs(1, m.args); err == nil {
+			if args, err = getStringArgs(p, 1); err == nil {
 				route.Method = args[0]
 				methodSet = true
 			}
 		case "HeaderRegexp":
-			if args, err = getStringArgs(2, m.args); err == nil {
+			if args, err = getStringArgs(p, 2); err == nil {
 				if route.HeaderRegexps == nil {
 					route.HeaderRegexps = make(map[string][]string)
 				}
@@ -522,7 +517,7 @@ func applyPredicates(route *Route, proute *parsedRoute) error {
 				route.HeaderRegexps[args[0]] = append(route.HeaderRegexps[args[0]], args[1])
 			}
 		case "Header":
-			if args, err = getStringArgs(2, m.args); err == nil {
+			if args, err = getStringArgs(p, 2); err == nil {
 				if route.Headers == nil {
 					route.Headers = make(map[string]string)
 				}
@@ -536,13 +531,15 @@ func applyPredicates(route *Route, proute *parsedRoute) error {
 		case "*", "Any":
 			// void
 		default:
-			route.Predicates = append(
-				route.Predicates,
-				&Predicate{m.name, m.args})
+			route.Predicates = append(route.Predicates, p)
+		}
+
+		if err != nil {
+			return fmt.Errorf("invalid route %q: %w", proute.id, err)
 		}
 	}
 
-	return err
+	return nil
 }
 
 // Converts a parsing route objects to the exported route definition with
@@ -590,35 +587,50 @@ func newRouteDefinition(r *parsedRoute) (*Route, error) {
 	return rd, err
 }
 
-// executes the parser.
-func parse(code string) ([]*parsedRoute, error) {
-	l := newLexer(code)
-	eskipParse(l)
-	return l.routes, l.err
+type eskipLexParser struct {
+	lexer  eskipLex
+	parser eskipParserImpl
 }
 
-func partialRouteToRoute(format, p string) string {
-	p = strings.TrimSpace(p)
-	if p == "" {
-		return ""
+var parserPool sync.Pool
+
+func parseDocument(code string) ([]*parsedRoute, error) {
+	routes, _, _, err := parse(start_document, code)
+	return routes, err
+}
+
+func parsePredicates(code string) ([]*Predicate, error) {
+	_, predicates, _, err := parse(start_predicates, code)
+	return predicates, err
+}
+
+func parseFilters(code string) ([]*Filter, error) {
+	_, _, filters, err := parse(start_filters, code)
+	return filters, err
+}
+
+func parse(start int, code string) ([]*parsedRoute, []*Predicate, []*Filter, error) {
+	lp, ok := parserPool.Get().(*eskipLexParser)
+	if !ok {
+		lp = &eskipLexParser{}
+	} else {
+		*lp = eskipLexParser{}
 	}
+	defer parserPool.Put(lp)
 
-	return fmt.Sprintf(format, p)
-}
+	lexer := &lp.lexer
+	lexer.init(start, code)
 
-// hacks a filter expression into a route expression for parsing.
-func filtersToRoute(f string) string {
-	return partialRouteToRoute("* -> %s -> <shunt>", f)
-}
+	lp.parser.Parse(lexer)
 
-// hacks a predicate expression into a route expression for parsing.
-func predicatesToRoute(p string) string {
-	return partialRouteToRoute("%s -> <shunt>", p)
+	// Do not return lexer to avoid reading lexer fields after returning eskipLexParser to the pool.
+	// Let the caller decide which of return values to use based on the start token.
+	return lexer.routes, lexer.predicates, lexer.filters, lexer.err
 }
 
 // Parses a route expression or a routing document to a set of route definitions.
 func Parse(code string) ([]*Route, error) {
-	parsedRoutes, err := parse(code)
+	parsedRoutes, err := parseDocument(code)
 	if err != nil {
 		return nil, err
 	}
@@ -636,8 +648,55 @@ func Parse(code string) ([]*Route, error) {
 	return routeDefinitions, nil
 }
 
-func partialParse(f string, partialToRoute func(string) string) (*parsedRoute, error) {
-	rs, err := parse(partialToRoute(f))
+// MustParse parses a route expression or a routing document to a set of route definitions and
+// panics in case of error
+func MustParse(code string) []*Route {
+	r, err := Parse(code)
+	if err != nil {
+		panic(err)
+	}
+	return r
+}
+
+// MustParsePredicates parses a set of predicates (combined by '&&') into
+// a list of parsed predicate definitions and panics in case of error
+func MustParsePredicates(s string) []*Predicate {
+	p, err := ParsePredicates(s)
+	if err != nil {
+		panic(err)
+	}
+	return p
+}
+
+// MustParseFilters parses a set of filters (combined by '->') into
+// a list of parsed filter definitions and panics in case of error
+func MustParseFilters(s string) []*Filter {
+	p, err := ParseFilters(s)
+	if err != nil {
+		panic(err)
+	}
+	return p
+}
+
+// Parses a filter chain into a list of parsed filter definitions.
+func ParseFilters(f string) ([]*Filter, error) {
+	f = strings.TrimSpace(f)
+	if f == "" {
+		return nil, nil
+	}
+
+	return parseFilters(f)
+}
+
+// ParsePredicates parses a set of predicates (combined by '&&') into
+// a list of parsed predicate definitions.
+func ParsePredicates(p string) ([]*Predicate, error) {
+	p = strings.TrimSpace(p)
+	if p == "" {
+		return nil, nil
+	}
+
+	rs, err := parsePredicates(p)
 	if err != nil {
 		return nil, err
 	}
@@ -646,63 +705,41 @@ func partialParse(f string, partialToRoute func(string) string) (*parsedRoute, e
 		return nil, nil
 	}
 
-	return rs[0], nil
-}
-
-// Parses a filter chain into a list of parsed filter definitions.
-func ParseFilters(f string) ([]*Filter, error) {
-	r, err := partialParse(f, filtersToRoute)
-	if r == nil || err != nil {
-		return nil, err
-	}
-
-	return r.filters, nil
-}
-
-// ParsePredicates parses a set of predicates (combined by '&&') into
-// a list of parsed predicate definitions.
-func ParsePredicates(p string) ([]*Predicate, error) {
-	r, err := partialParse(p, predicatesToRoute)
-	if r == nil || err != nil {
-		return nil, err
-	}
-
-	var ps []*Predicate
-	for i := range r.matchers {
-		if r.matchers[i].name != "*" {
-			ps = append(ps, &Predicate{
-				Name: r.matchers[i].name,
-				Args: r.matchers[i].args,
-			})
+	ps := make([]*Predicate, 0, len(rs))
+	for _, p := range rs {
+		if p.Name != "*" {
+			ps = append(ps, p)
 		}
+	}
+	if len(ps) == 0 {
+		ps = nil
 	}
 
 	return ps, nil
 }
 
-const randomIdLength = 16
-
-var routeIdRx = regexp.MustCompile(`\W`)
+const (
+	randomIdLength = 16
+	// does not contain underscore to produce compatible output with previously used flow id generator
+	alphabet = "0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ"
+)
 
 // generate weak random id for a route if
 // it doesn't have one.
+//
+// Deprecated: do not use, generate valid route id that matches [a-zA-Z_] yourself.
 func GenerateIfNeeded(existingId string) string {
 	if existingId != "" {
 		return existingId
 	}
 
-	// using this to avoid adding a new dependency.
-	g, err := flowid.NewStandardGenerator(randomIdLength)
-	if err != nil {
-		return existingId
-	}
-	id, err := g.Generate()
-	if err != nil {
-		return existingId
+	var sb strings.Builder
+	sb.WriteString("route")
+
+	for i := 0; i < randomIdLength; i++ {
+		ai := rand.Intn(len(alphabet))
+		sb.WriteByte(alphabet[ai])
 	}
 
-	// replace characters that are not allowed
-	// for eskip route ids.
-	id = routeIdRx.ReplaceAllString(id, "x")
-	return "route" + id
+	return sb.String()
 }

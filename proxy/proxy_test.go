@@ -16,9 +16,13 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
+	log "github.com/sirupsen/logrus"
+
+	"github.com/google/go-cmp/cmp"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
@@ -53,7 +57,7 @@ type (
 )
 
 type syncResponseWriter struct {
-	mx         sync.Mutex
+	mu         sync.Mutex
 	statusCode int
 	header     http.Header
 	body       *bytes.Buffer
@@ -61,6 +65,7 @@ type syncResponseWriter struct {
 
 type testProxy struct {
 	log     *loggingtest.Logger
+	dc      *testdataclient.Client
 	routing *routing.Routing
 	proxy   *Proxy
 }
@@ -68,6 +73,75 @@ type testProxy struct {
 type listener struct {
 	inner    net.Listener
 	lastConn chan net.Conn
+}
+
+type testLog struct {
+	mu sync.Mutex
+
+	buf      bytes.Buffer
+	oldOut   io.Writer
+	oldLevel log.Level
+}
+
+func NewTestLog() *testLog {
+	oldOut := log.StandardLogger().Out
+	oldLevel := log.GetLevel()
+	log.SetLevel(log.DebugLevel)
+
+	tl := &testLog{oldOut: oldOut, oldLevel: oldLevel}
+	log.SetOutput(tl)
+	return tl
+}
+
+func (l *testLog) Write(p []byte) (int, error) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+
+	return l.buf.Write(p)
+}
+
+func (l *testLog) String() string {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+
+	return l.buf.String()
+}
+
+func (l *testLog) Reset() {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+
+	l.buf.Reset()
+}
+
+func (l *testLog) Close() {
+	log.SetOutput(l.oldOut)
+	log.SetLevel(l.oldLevel)
+}
+
+func (l *testLog) WaitForN(exp string, n int, to time.Duration) error {
+	timeout := time.After(to)
+	ticker := time.NewTicker(10 * time.Millisecond)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-timeout:
+			return fmt.Errorf("timeout waiting for log entry: %s", exp)
+		case <-ticker.C:
+			if l.Count(exp) >= n {
+				return nil
+			}
+		}
+	}
+}
+
+func (l *testLog) WaitFor(exp string, to time.Duration) error {
+	return l.WaitForN(exp, 1, to)
+}
+
+func (l *testLog) Count(exp string) int {
+	return strings.Count(l.String(), exp)
 }
 
 func (cors *preserveOriginalSpec) Name() string { return "preserveOriginal" }
@@ -111,22 +185,22 @@ func (srw *syncResponseWriter) WriteHeader(statusCode int) {
 }
 
 func (srw *syncResponseWriter) Write(b []byte) (int, error) {
-	srw.mx.Lock()
-	defer srw.mx.Unlock()
+	srw.mu.Lock()
+	defer srw.mu.Unlock()
 	return srw.body.Write(b)
 }
 
 func (srw *syncResponseWriter) Read(b []byte) (int, error) {
-	srw.mx.Lock()
-	defer srw.mx.Unlock()
+	srw.mu.Lock()
+	defer srw.mu.Unlock()
 	return srw.body.Read(b)
 }
 
 func (srw *syncResponseWriter) Flush() {}
 
 func (srw *syncResponseWriter) Len() int {
-	srw.mx.Lock()
-	defer srw.mx.Unlock()
+	srw.mu.Lock()
+	defer srw.mu.Unlock()
 	return srw.body.Len()
 }
 
@@ -141,11 +215,14 @@ func newTestProxyWithFiltersAndParams(fr filters.Registry, doc string, params Pa
 	}
 
 	tl := loggingtest.New()
+	if params.EndpointRegistry == nil {
+		params.EndpointRegistry = routing.NewEndpointRegistry(routing.RegistryOptions{})
+	}
 	opts := routing.Options{
 		FilterRegistry: fr,
 		PollTimeout:    sourcePollTimeout,
 		DataClients:    []routing.DataClient{dc},
-		PostProcessors: []routing.PostProcessor{loadbalancer.NewAlgorithmProvider()},
+		PostProcessors: []routing.PostProcessor{loadbalancer.NewAlgorithmProvider(), params.EndpointRegistry},
 		Log:            tl,
 		Predicates:     []routing.PredicateSpec{teePredicate.New()},
 	}
@@ -162,7 +239,7 @@ func newTestProxyWithFiltersAndParams(fr filters.Registry, doc string, params Pa
 		return nil, err
 	}
 
-	return &testProxy{tl, rt, p}, nil
+	return &testProxy{tl, dc, rt, p}, nil
 }
 
 func newTestProxyWithFilters(fr filters.Registry, doc string, flags Flags, pr ...PriorityRoute) (*testProxy, error) {
@@ -183,6 +260,7 @@ func newTestProxy(doc string, flags Flags, pr ...PriorityRoute) (*testProxy, err
 
 func (tp *testProxy) close() {
 	tp.log.Close()
+	tp.dc.Close()
 	tp.routing.Close()
 	tp.proxy.Close()
 }
@@ -937,8 +1015,14 @@ type nilFilterSpec struct{}
 func (*nilFilterSpec) Name() string                                              { return "nilFilter" }
 func (*nilFilterSpec) CreateFilter(config []interface{}) (filters.Filter, error) { return nil, nil }
 
-func TestNilFilterIsNotCalledAndDoesNotBreakFilterChain(t *testing.T) {
-	s := startTestServer([]byte("Hello World!"), 0, func(r *http.Request) {})
+func TestFilterPanic(t *testing.T) {
+	testLog := NewTestLog()
+	defer testLog.Close()
+
+	var backendRequests int32
+	s := startTestServer([]byte("Hello World!"), 0, func(r *http.Request) {
+		atomic.AddInt32(&backendRequests, 1)
+	})
 	defer s.Close()
 
 	fr := make(filters.Registry)
@@ -954,40 +1038,57 @@ func TestNilFilterIsNotCalledAndDoesNotBreakFilterChain(t *testing.T) {
 		appendRequestHeader("X-Expected", "after") ->
 		appendResponseHeader("X-Expected", "after") ->
 		"%s"`, s.URL)
-	tp, err := newTestProxyWithFilters(fr, doc, FlagsNone)
-	if err != nil {
-		t.Error(err)
-		return
-	}
 
+	tp, err := newTestProxyWithFilters(fr, doc, FlagsNone)
+	require.NoError(t, err)
 	defer tp.close()
 
-	r, _ := http.NewRequest("GET", "https://www.example.org/foo", nil)
+	r := httptest.NewRequest("GET", "/foo", nil)
 	w := httptest.NewRecorder()
 	tp.proxy.ServeHTTP(w, r)
 
-	if requestExpectedHeader, has := r.Header["X-Expected"]; has {
-		assert.Contains(t, requestExpectedHeader, "before",
-			"request header was not added before nil filter")
-		assert.Contains(t, requestExpectedHeader, "after",
-			"request header was not added after nil filter (nil filter broke the filter chain)")
-	} else {
-		t.Error("Request is missing the expected header (added during filter chain winding)")
-		return
+	assert.Equal(t, http.StatusInternalServerError, w.Code)
+	assert.Equal(t, int32(0), backendRequests, "expected no backend request")
+	assert.Equal(t, []string{"before"}, r.Header["X-Expected"], "panic expected to skip the rest of the request filters")
+	assert.NotContains(t, w.Header(), "X-Expected", "panic expected to skip all of the response filters")
+
+	const msg = "panic caused by: runtime error: invalid memory address or nil pointer dereference"
+	if err = testLog.WaitFor(msg, 100*time.Millisecond); err != nil {
+		t.Errorf("expected '%s' in logs", msg)
+	}
+}
+
+func TestFilterPanicPrintStackRate(t *testing.T) {
+	testLog := NewTestLog()
+	defer testLog.Close()
+
+	fr := make(filters.Registry)
+	fr.Register(new(nilFilterSpec))
+
+	tp, err := newTestProxyWithFilters(fr, `* -> nilFilter() -> <shunt>`, FlagsNone)
+	require.NoError(t, err)
+	defer tp.close()
+
+	const (
+		panicsCaused  = 10
+		stacksPrinted = 3 // see Proxy.onPanicSometimes
+	)
+
+	for i := 0; i < panicsCaused; i++ {
+		r := httptest.NewRequest("GET", "/", nil)
+		w := httptest.NewRecorder()
+
+		tp.proxy.ServeHTTP(w, r)
 	}
 
-	if responseExpectedHeader, has := w.Header()["X-Expected"]; has {
-		assert.Contains(t, responseExpectedHeader, "before",
-			"response header was not added before nil filter")
-		assert.Contains(t, responseExpectedHeader, "after",
-			"response header was not added after nil filter (nil filter broke the filter chain)")
-	} else {
-		t.Error("Response is missing the expected header (added during filter chain unwinding)")
-		return
+	const errorMsg = "error while proxying"
+	if err = testLog.WaitForN(errorMsg, 10, 100*time.Millisecond); err != nil {
+		t.Errorf(`expected "%s" to be logged exactly %d times`, errorMsg, panicsCaused)
 	}
 
-	if w.Code != http.StatusOK {
-		t.Errorf("Wrong status code. Expected 200 but got %d", w.Code)
+	const stackMsg = "github.com/zalando/skipper/proxy.TestFilterPanicPrintStackRate"
+	if err = testLog.WaitForN(stackMsg, 3, 100*time.Millisecond); err != nil {
+		t.Errorf(`expected "%s" to be logged exactly %d times`, stackMsg, stacksPrinted)
 	}
 }
 
@@ -1073,7 +1174,7 @@ func TestProcessesRequestWithPriorityRouteOverStandard(t *testing.T) {
 	s1 := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("X-Test-Header", "normal-value")
 	}))
-	defer s0.Close()
+	defer s1.Close()
 
 	req, err := http.NewRequest(
 		"GET",
@@ -1124,22 +1225,18 @@ func TestFlusherImplementation(t *testing.T) {
 		t.Error(err)
 		return
 	}
-
 	defer tp.close()
 
-	a := fmt.Sprintf(":%d", 1<<16-rand.Intn(1<<15))
-	ps := &http.Server{Addr: a, Handler: tp.proxy}
-	go ps.ListenAndServe()
+	ps := httptest.NewServer(tp.proxy)
+	defer ps.Close()
 
-	// let the server start listening
-	time.Sleep(15 * time.Millisecond)
-
-	rsp, err := http.Get("http://127.0.0.1" + a)
+	rsp, err := http.Get(ps.URL)
 	if err != nil {
 		t.Error(err)
 		return
 	}
 	defer rsp.Body.Close()
+
 	b, err := io.ReadAll(rsp.Body)
 	if err != nil {
 		t.Error(err)
@@ -1339,6 +1436,7 @@ func TestHostHeader(t *testing.T) {
 			closeAll()
 			continue
 		}
+		defer rsp.Body.Close()
 
 		if ti.flags.Debug() {
 			closeAll()
@@ -1362,8 +1460,7 @@ func TestBackendServiceUnavailable(t *testing.T) {
 		t.Error(err)
 		return
 	}
-
-	defer p.proxy.Close()
+	defer p.close()
 
 	ps := httptest.NewServer(p.proxy)
 	defer ps.Close()
@@ -1462,22 +1559,27 @@ func TestRoundtripperRetry(t *testing.T) {
 }
 
 func TestResponseHeaderTimeout(t *testing.T) {
+	const timeout = 10 * time.Millisecond
+
 	s := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		time.Sleep(5 * time.Microsecond)
+		time.Sleep(2 * timeout)
 	}))
 	defer s.Close()
 
-	p, err := newTestProxyWithParams(fmt.Sprintf(`* -> "%s"`, s.URL), Params{ResponseHeaderTimeout: 1 * time.Microsecond})
+	params := Params{
+		ResponseHeaderTimeout: timeout,
+	}
+	p, err := newTestProxyWithParams(fmt.Sprintf(`* -> "%s"`, s.URL), params)
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer p.proxy.Close()
+	defer p.close()
 
 	ps := httptest.NewServer(p.proxy)
 	defer ps.Close()
 
-	// Prevent retry
-	rsp, err := http.Post(ps.URL, "text/plain", strings.NewReader("payload"))
+	// Prevent retry by using POST
+	rsp, err := ps.Client().Post(ps.URL, "text/plain", strings.NewReader("payload"))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1545,17 +1647,16 @@ func TestBranding(t *testing.T) {
 	backendDown.Close()
 
 	routes := routesTpl
-	routes = strings.Replace(routes, "${backend-down}", backendDown.URL, -1)
-	routes = strings.Replace(routes, "${backend-default}", backendDefault.URL, -1)
-	routes = strings.Replace(routes, "${backend-set}", backendSet.URL, -1)
+	routes = strings.ReplaceAll(routes, "${backend-down}", backendDown.URL)
+	routes = strings.ReplaceAll(routes, "${backend-default}", backendDefault.URL)
+	routes = strings.ReplaceAll(routes, "${backend-set}", backendSet.URL)
 
 	p, err := newTestProxy(routes, FlagsNone)
 	if err != nil {
 		t.Error(err)
 		return
 	}
-
-	defer p.proxy.Close()
+	defer p.close()
 
 	ps := httptest.NewServer(p.proxy)
 	defer ps.Close()
@@ -1618,8 +1719,7 @@ func TestFixNoAppLogFor404(t *testing.T) {
 		t.Error(err)
 		return
 	}
-
-	defer p.proxy.Close()
+	defer p.close()
 
 	ps := httptest.NewServer(p.proxy)
 	defer ps.Close()
@@ -1677,14 +1777,14 @@ func TestRequestContentHeaders(t *testing.T) {
 			return
 		}
 	}))
+	defer backend.Close()
 
 	p, err := newTestProxy(fmt.Sprintf(`* -> "%s"`, backend.URL), FlagsNone)
 	if err != nil {
 		t.Error(err)
 		return
 	}
-
-	defer p.proxy.Close()
+	defer p.close()
 
 	ps := httptest.NewServer(p.proxy)
 	defer ps.Close()
@@ -1727,12 +1827,14 @@ func TestSettingDefaultHTTPStatus(t *testing.T) {
 		DefaultHTTPStatus: http.StatusBadGateway,
 	}
 	p := WithParams(params)
+	p.Close()
 	if p.defaultHTTPStatus != http.StatusBadGateway {
 		t.Errorf("expected default HTTP status %d, got %d", http.StatusBadGateway, p.defaultHTTPStatus)
 	}
 
 	params.DefaultHTTPStatus = http.StatusNetworkAuthenticationRequired + 1
 	p = WithParams(params)
+	p.Close()
 	if p.defaultHTTPStatus != http.StatusNotFound {
 		t.Errorf("expected default HTTP status %d, got %d", http.StatusNotFound, p.defaultHTTPStatus)
 	}
@@ -1977,49 +2079,36 @@ func TestEnableAccessLogWithFilter(t *testing.T) {
 }
 
 func TestAccessLogOnFailedRequest(t *testing.T) {
-	var buf bytes.Buffer
-	logging.Init(logging.Options{
-		AccessLogOutput: &buf})
+	testLog := NewTestLog()
+	defer testLog.Close()
 
-	s := httptest.NewServer(http.HandlerFunc(func(http.ResponseWriter, *http.Request) {}))
-	s.Close()
+	logging.Init(logging.Options{AccessLogOutput: testLog})
 
-	p, err := newTestProxy(fmt.Sprintf(`* -> "%s"`, s.URL), 0)
+	p, err := newTestProxy(`* -> "http://bad-gateway.test"`, FlagsNone)
 	if err != nil {
-		t.Error(err)
+		t.Fatalf("Failed to create test proxy: %v", err)
 		return
 	}
-
-	defer p.proxy.Close()
+	defer p.close()
 
 	ps := httptest.NewServer(p.proxy)
 	defer ps.Close()
 
-	rsp, err := http.Get(ps.URL)
+	rsp, err := ps.Client().Get(ps.URL)
 	if err != nil {
-		t.Error(err)
+		t.Fatalf("Failed to GET: %v", err)
 		return
 	}
-
 	defer rsp.Body.Close()
 
 	if rsp.StatusCode != http.StatusBadGateway {
-		t.Error("failed to return 502 Bad Gateway on failing backend connection")
+		t.Errorf("failed to return 502 Bad Gateway on failing backend connection: %d", rsp.StatusCode)
 	}
 
-	output := buf.String()
-
-	proxyURL, err := url.Parse(ps.URL)
-	if err != nil {
-		t.Error(err)
-		return
-	}
-
-	expected := fmt.Sprintf(`"GET / HTTP/1.1" %d %d "-" "Go-http-client/1.1"`, http.StatusBadGateway, len(http.StatusText(http.StatusBadGateway))+1)
-	if !strings.Contains(output, expected) || !strings.Contains(output, proxyURL.Host) {
-		t.Error("failed to log access", output, expected)
-		t.Log(output)
-		t.Log(expected)
+	const expected = `"GET / HTTP/1.1" 502 12 "-" "Go-http-client/1.1"`
+	if err = testLog.WaitFor(expected, 100*time.Millisecond); err != nil {
+		t.Errorf("Failed to get accesslog %v: %v", expected, err)
+		t.Logf("%s", cmp.Diff(testLog.String(), expected))
 	}
 }
 
@@ -2062,46 +2151,40 @@ func TestHopHeaderRemovalDisabled(t *testing.T) {
 	}
 }
 
-func thisOneWillPanic() {
-	panic("oops")
-}
+func TestUserAgent(t *testing.T) {
+	for _, tc := range []struct {
+		name      string
+		userAgent string
+	}{
+		{name: "no user agent"},
+		{name: "with user agent", userAgent: "test ua"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			s := startTestServer(nil, 0, func(r *http.Request) {
+				if got := r.Header.Get("User-Agent"); tc.userAgent != got {
+					t.Errorf("user agent mismatch: expected %q, got %q", tc.userAgent, got)
+				}
+			})
+			defer s.Close()
 
-func TestTryCatch(t *testing.T) {
-	caughtPanic = false
-	tryCatch(thisOneWillPanic, func(err interface{}, stack string) {
-		if err == nil {
-			t.Error("should provide error")
-			return
-		}
+			r := httptest.NewRequest("GET", "http://example.com/foo", nil)
+			if tc.userAgent != "" {
+				r.Header.Set("User-Agent", tc.userAgent)
+			}
 
-		if stack == "" {
-			t.Error("should provide stack trace")
-			return
-		}
+			w := httptest.NewRecorder()
 
-		if !strings.Contains(stack, "TestTryCatch") ||
-			!strings.Contains(stack, "thisOneWillPanic") ||
-			!strings.Contains(stack, "proxy_test.go") {
-			t.Error("should provide function names and file names in the stack trace")
-			return
-		}
-	})
-}
+			doc := fmt.Sprintf(`* -> "%s"`, s.URL)
 
-func TestTryCatchProvidesStackTraceOnlyOnce(t *testing.T) {
-	caughtPanic = false
-	tryCatch(thisOneWillPanic, func(err interface{}, stack string) {
-		if stack == "" {
-			t.Error("should provide stack trace the first time")
-			return
-		}
-	})
-	tryCatch(thisOneWillPanic, func(err interface{}, stack string) {
-		if stack != "" {
-			t.Error("should not provide stack trace the second time")
-			return
-		}
-	})
+			tp, err := newTestProxy(doc, FlagsNone)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer tp.close()
+
+			tp.proxy.ServeHTTP(w, r)
+		})
+	}
 }
 
 func benchmarkAccessLog(b *testing.B, filter string, responseCode int) {
@@ -2177,44 +2260,22 @@ func TestForwardToProxy(t *testing.T) {
 			TLS:  ti.tls,
 		}
 
-		forwardToProxy(incoming, outgoing)
+		outgoing = forwardToProxy(incoming, outgoing)
 
-		if outgoing.URL.String() != ti.expectedRequestURL {
-			t.Errorf("request URLs are not equal, expected %s got %s",
-				ti.expectedRequestURL, outgoing.URL.String())
-		}
+		assert.Equal(t, ti.expectedRequestURL, outgoing.URL.String())
 
-		proxyURL := outgoing.Header.Get(backendIsProxyHeader)
+		proxyURL, err := proxyFromContext(outgoing)
 
-		if proxyURL != ti.expectedProxyURL {
-			t.Errorf("proxy URLs are not equal, expected %s got %s",
-				ti.expectedProxyURL, proxyURL)
-		}
+		assert.NoError(t, err)
+		assert.Equal(t, ti.expectedProxyURL, proxyURL.String())
 	}
 }
 
-func TestProxyFromHeader(t *testing.T) {
-	u1, err := proxyFromHeader(&http.Request{})
-	if err != nil {
-		t.Error(err)
-	}
-	if u1 != nil {
-		t.Errorf("expected nil but got %v", u1)
-	}
+func TestProxyFromEmptyContext(t *testing.T) {
+	proxyUrl, err := proxyFromContext(&http.Request{})
 
-	expectedProxyURL := "http://proxy.example.com"
-
-	u2, err := proxyFromHeader(&http.Request{
-		Header: http.Header{
-			backendIsProxyHeader: []string{expectedProxyURL},
-		},
-	})
-	if err != nil {
-		t.Error(err)
-	}
-	if u2.String() != expectedProxyURL {
-		t.Errorf("expected '%s' but got '%v'", expectedProxyURL, u2)
-	}
+	assert.NoError(t, err)
+	assert.Nil(t, proxyUrl)
 }
 
 func BenchmarkAccessLogNoFilter(b *testing.B) { benchmarkAccessLog(b, "", 200) }
@@ -2226,3 +2287,275 @@ func BenchmarkAccessLogEnablePrint(b *testing.B) {
 	benchmarkAccessLog(b, "enableAccessLog(1,200,3)", 200)
 }
 func BenchmarkAccessLogEnable(b *testing.B) { benchmarkAccessLog(b, "enableAccessLog(1,3)", 200) }
+
+func TestInitPassiveHealthChecker(t *testing.T) {
+	for i, ti := range []struct {
+		inputArg        map[string]string
+		expectedEnabled bool
+		expectedParams  *PassiveHealthCheck
+		expectedError   error
+	}{
+		{
+			inputArg:        map[string]string{},
+			expectedEnabled: false,
+			expectedParams:  nil,
+			expectedError:   nil,
+		},
+		{
+			inputArg: map[string]string{
+				"period":                        "somethingInvalid",
+				"min-requests":                  "10",
+				"max-drop-probability":          "0.9",
+				"min-drop-probability":          "0.05",
+				"max-unhealthy-endpoints-ratio": "0.3",
+			},
+			expectedEnabled: false,
+			expectedParams:  nil,
+			expectedError:   fmt.Errorf("passive health check: invalid period value: somethingInvalid"),
+		},
+		{
+			inputArg: map[string]string{
+				"period":                        "1m",
+				"min-requests":                  "10",
+				"max-drop-probability":          "0.9",
+				"min-drop-probability":          "0.05",
+				"max-unhealthy-endpoints-ratio": "0.3",
+			},
+			expectedEnabled: true,
+			expectedParams: &PassiveHealthCheck{
+				Period:                     1 * time.Minute,
+				MinRequests:                10,
+				MaxDropProbability:         0.9,
+				MinDropProbability:         0.05,
+				MaxUnhealthyEndpointsRatio: 0.3,
+			},
+			expectedError: nil,
+		},
+		{
+			inputArg: map[string]string{
+				"period":                        "-1m",
+				"min-requests":                  "10",
+				"max-drop-probability":          "0.9",
+				"min-drop-probability":          "0.05",
+				"max-unhealthy-endpoints-ratio": "0.3",
+			},
+			expectedEnabled: false,
+			expectedParams:  nil,
+			expectedError:   fmt.Errorf("passive health check: invalid period value: -1m"),
+		},
+		{
+			inputArg: map[string]string{
+				"period":                        "1m",
+				"min-requests":                  "somethingInvalid",
+				"max-drop-probability":          "0.9",
+				"min-drop-probability":          "0.05",
+				"max-unhealthy-endpoints-ratio": "0.3",
+			},
+			expectedEnabled: false,
+			expectedParams:  nil,
+			expectedError:   fmt.Errorf("passive health check: invalid minRequests value: somethingInvalid"),
+		},
+		{
+			inputArg: map[string]string{
+				"period":                        "1m",
+				"min-requests":                  "-10",
+				"max-drop-probability":          "0.9",
+				"min-drop-probability":          "0.05",
+				"max-unhealthy-endpoints-ratio": "0.3",
+			},
+			expectedEnabled: false,
+			expectedParams:  nil,
+			expectedError:   fmt.Errorf("passive health check: invalid minRequests value: -10"),
+		},
+		{
+			inputArg: map[string]string{
+				"period":                        "1m",
+				"min-requests":                  "10",
+				"max-drop-probability":          "somethingInvalid",
+				"min-drop-probability":          "0.05",
+				"max-unhealthy-endpoints-ratio": "0.3",
+			},
+			expectedEnabled: false,
+			expectedParams:  nil,
+			expectedError:   fmt.Errorf("passive health check: invalid maxDropProbability value: somethingInvalid"),
+		},
+		{
+			inputArg: map[string]string{
+				"period":                        "1m",
+				"min-requests":                  "10",
+				"max-drop-probability":          "-0.1",
+				"min-drop-probability":          "0.05",
+				"max-unhealthy-endpoints-ratio": "0.3",
+			},
+			expectedEnabled: false,
+			expectedParams:  nil,
+			expectedError:   fmt.Errorf("passive health check: invalid maxDropProbability value: -0.1"),
+		},
+		{
+			inputArg: map[string]string{
+				"period":                        "1m",
+				"min-requests":                  "10",
+				"max-drop-probability":          "3.1415",
+				"min-drop-probability":          "0.05",
+				"max-unhealthy-endpoints-ratio": "0.3",
+			},
+			expectedEnabled: false,
+			expectedParams:  nil,
+			expectedError:   fmt.Errorf("passive health check: invalid maxDropProbability value: 3.1415"),
+		},
+		{
+			inputArg: map[string]string{
+				"period":                        "1m",
+				"min-requests":                  "10",
+				"max-drop-probability":          "0.9",
+				"min-drop-probability":          "somethingInvalid",
+				"max-unhealthy-endpoints-ratio": "0.3",
+			},
+			expectedEnabled: false,
+			expectedParams:  nil,
+			expectedError:   fmt.Errorf("passive health check: invalid minDropProbability value: somethingInvalid"),
+		},
+		{
+			inputArg: map[string]string{
+				"period":                        "1m",
+				"min-requests":                  "10",
+				"max-drop-probability":          "0.9",
+				"min-drop-probability":          "-0.1",
+				"max-unhealthy-endpoints-ratio": "0.3",
+			},
+			expectedEnabled: false,
+			expectedParams:  nil,
+			expectedError:   fmt.Errorf("passive health check: invalid minDropProbability value: -0.1"),
+		},
+		{
+			inputArg: map[string]string{
+				"period":                        "1m",
+				"min-requests":                  "10",
+				"max-drop-probability":          "0.9",
+				"min-drop-probability":          "3.1415",
+				"max-unhealthy-endpoints-ratio": "0.3",
+			},
+			expectedEnabled: false,
+			expectedParams:  nil,
+			expectedError:   fmt.Errorf("passive health check: invalid minDropProbability value: 3.1415"),
+		},
+		{
+			inputArg: map[string]string{
+				"period":                        "1m",
+				"min-requests":                  "10",
+				"max-drop-probability":          "0.05",
+				"min-drop-probability":          "0.9",
+				"max-unhealthy-endpoints-ratio": "0.3",
+			},
+			expectedEnabled: false,
+			expectedParams:  nil,
+			expectedError:   fmt.Errorf("passive health check: minDropProbability should be less than maxDropProbability"),
+		},
+		{
+			inputArg: map[string]string{
+				"period":                        "1m",
+				"min-requests":                  "10",
+				"max-drop-probability":          "0.9",
+				"min-drop-probability":          "0.05",
+				"max-unhealthy-endpoints-ratio": "-0.1",
+			},
+			expectedEnabled: false,
+			expectedParams:  nil,
+			expectedError:   fmt.Errorf(`passive health check: invalid maxUnhealthyEndpointsRatio value: "-0.1"`),
+		},
+		{
+			inputArg: map[string]string{
+				"period":                        "1m",
+				"min-requests":                  "10",
+				"max-drop-probability":          "0.9",
+				"min-drop-probability":          "0.05",
+				"max-unhealthy-endpoints-ratio": "3.1415",
+			},
+			expectedEnabled: false,
+			expectedParams:  nil,
+			expectedError:   fmt.Errorf(`passive health check: invalid maxUnhealthyEndpointsRatio value: "3.1415"`),
+		},
+		{
+			inputArg: map[string]string{
+				"period":                        "1m",
+				"min-requests":                  "10",
+				"max-drop-probability":          "0.9",
+				"min-drop-probability":          "0.05",
+				"max-unhealthy-endpoints-ratio": "somethingInvalid",
+			},
+			expectedEnabled: false,
+			expectedParams:  nil,
+			expectedError:   fmt.Errorf(`passive health check: invalid maxUnhealthyEndpointsRatio value: "somethingInvalid"`),
+		},
+		{
+			inputArg: map[string]string{
+				"period":                        "1m",
+				"min-requests":                  "10",
+				"max-drop-probability":          "0.9",
+				"min-drop-probability":          "0.05",
+				"max-unhealthy-endpoints-ratio": "0.3",
+				"non-existing":                  "non-existing",
+			},
+			expectedEnabled: false,
+			expectedParams:  nil,
+			expectedError:   fmt.Errorf("passive health check: invalid parameter: key=non-existing,value=non-existing"),
+		},
+		{
+			inputArg: map[string]string{
+				"period":       "1m",
+				"min-requests": "10",
+				/* forgot max-drop-probability */
+				"min-drop-probability":          "0.05",
+				"max-unhealthy-endpoints-ratio": "0.3",
+			},
+			expectedEnabled: false,
+			expectedParams:  nil,
+			expectedError:   fmt.Errorf("passive health check: missing required parameters [max-drop-probability]"),
+		},
+		{
+			inputArg: map[string]string{
+				"period":               "1m",
+				"min-requests":         "10",
+				"max-drop-probability": "0.9",
+				/* using default min-drop-probability */
+				"max-unhealthy-endpoints-ratio": "0.3",
+			},
+			expectedEnabled: true,
+			expectedParams: &PassiveHealthCheck{
+				Period:                     1 * time.Minute,
+				MinRequests:                10,
+				MaxDropProbability:         0.9,
+				MinDropProbability:         0.0,
+				MaxUnhealthyEndpointsRatio: 0.3,
+			},
+			expectedError: nil,
+		},
+		{
+			inputArg: map[string]string{
+				"period":               "1m",
+				"min-requests":         "10",
+				"max-drop-probability": "0.9",
+				"min-drop-probability": "0.05",
+				/* using default max-unhealthy-endpoints-ratio */
+			},
+			expectedEnabled: true,
+			expectedParams: &PassiveHealthCheck{
+				Period:                     1 * time.Minute,
+				MinRequests:                10,
+				MaxDropProbability:         0.9,
+				MinDropProbability:         0.05,
+				MaxUnhealthyEndpointsRatio: 1.0,
+			},
+			expectedError: nil,
+		},
+	} {
+		t.Run(fmt.Sprintf("case_%d", i), func(t *testing.T) {
+			enabled, params, err := InitPassiveHealthChecker(ti.inputArg)
+			assert.Equal(t, ti.expectedEnabled, enabled)
+			assert.Equal(t, ti.expectedError, err)
+			if enabled {
+				assert.Equal(t, ti.expectedParams, params)
+			}
+		})
+	}
+}

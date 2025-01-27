@@ -1,6 +1,3 @@
-//go:build !race || redis
-// +build !race redis
-
 package proxy_test
 
 import (
@@ -94,10 +91,7 @@ func TestBackendRatelimitRoundRobin(t *testing.T) {
 	defer backends.close()
 
 	doc := fmt.Sprintf(`* -> backendRatelimit("testapi", %d, "%s") -> <roundRobin, %v>`, maxHits, timeWindow.String(), backends)
-	r, err := eskip.Parse(doc)
-	if err != nil {
-		t.Fatal(err)
-	}
+	r := eskip.MustParse(doc)
 
 	p := proxytest.WithParams(filterRegistry, proxy.Params{RateLimiters: ratelimitRegistry}, r...)
 	defer p.Close()
@@ -115,6 +109,12 @@ func TestBackendRatelimitRoundRobin(t *testing.T) {
 }
 
 func TestBackendRatelimitScenarios(t *testing.T) {
+	// Use shared instance for all tests.
+	// If this test flakes because of backend IP reuse between test cases,
+	// implement database cleanup, see https://redis.io/commands/flushdb/.
+	redisAddr, done := redistest.NewTestRedis(t)
+	defer done()
+
 	for _, ti := range []struct {
 		name             string
 		routes           string
@@ -186,19 +186,13 @@ func TestBackendRatelimitScenarios(t *testing.T) {
 			filterRegistry := builtin.MakeRegistry()
 			filterRegistry.Register(ratelimitfilters.NewBackendRatelimit())
 
-			redisAddr, done := redistest.NewTestRedis(t)
-			defer done()
-
 			ratelimitRegistry := ratelimit.NewSwarmRegistry(nil, &snet.RedisOptions{Addrs: []string{redisAddr}})
 			defer ratelimitRegistry.Close()
 
 			backends := newCountingBackends(ti.backends)
 			defer backends.close()
 
-			r, err := eskip.Parse(strings.ReplaceAll(ti.routes, "$backends", backends.String()))
-			if err != nil {
-				t.Fatal(err)
-			}
+			r := eskip.MustParse(strings.ReplaceAll(ti.routes, "$backends", backends.String()))
 
 			p := proxytest.WithParams(filterRegistry, proxy.Params{RateLimiters: ratelimitRegistry}, r...)
 			defer p.Close()

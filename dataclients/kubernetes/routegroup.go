@@ -5,11 +5,10 @@ import (
 	"regexp"
 	"strings"
 
-	log "github.com/sirupsen/logrus"
-
 	"github.com/zalando/skipper/dataclients/kubernetes/definitions"
 	"github.com/zalando/skipper/eskip"
 	"github.com/zalando/skipper/loadbalancer"
+	"github.com/zalando/skipper/secrets/certregistry"
 )
 
 const backendNameTracingTagName = "skipper.backend_name"
@@ -22,22 +21,26 @@ type routeGroups struct {
 }
 
 type routeGroupContext struct {
-	hosts                 []string
-	allowedExternalNames  []*regexp.Regexp
-	hostRx                string
-	eastWestDomain        string
-	routeGroup            *definitions.RouteGroupItem
-	hostRoutes            map[string][]*eskip.Route
-	defaultBackendTraffic map[string]*calculatedTraffic
-	defaultFilters        defaultFilters
-	clusterState          *clusterState
-	httpsRedirectCode     int
-	backendsByName        map[string]*definitions.SkipperBackend
-	eastWestEnabled       bool
-	hasEastWestHost       bool
-	backendNameTracingTag bool
-	internal              bool
-	provideHTTPSRedirect  bool
+	state                        *clusterState
+	routeGroup                   *definitions.RouteGroupItem
+	logger                       *logger
+	hosts                        []string
+	allowedExternalNames         []*regexp.Regexp
+	hostRx                       string
+	eastWestDomain               string
+	hostRoutes                   map[string][]*eskip.Route
+	defaultBackendTraffic        map[string]backendTraffic
+	defaultFilters               defaultFilters
+	httpsRedirectCode            int
+	backendsByName               map[string]*definitions.SkipperBackend
+	eastWestEnabled              bool
+	hasEastWestHost              bool
+	backendNameTracingTag        bool
+	internal                     bool
+	provideHTTPSRedirect         bool
+	calculateTraffic             func([]*definitions.BackendReference) map[string]backendTraffic
+	defaultLoadBalancerAlgorithm string
+	certificateRegistry          *certregistry.CertRegistry
 }
 
 type routeContext struct {
@@ -48,17 +51,12 @@ type routeContext struct {
 	backend    *definitions.SkipperBackend
 }
 
-type calculatedTraffic struct {
-	value   float64
-	balance int
-}
-
 func eskipError(typ, e string, err error) error {
 	if len(e) > 48 {
 		e = e[:48]
 	}
 
-	return fmt.Errorf("[eskip] %s, '%s'; %v", typ, e, err)
+	return fmt.Errorf("[eskip] %s, '%s'; %w", typ, e, err)
 }
 
 func targetPortNotFound(serviceName string, servicePort int) error {
@@ -156,74 +154,8 @@ func mapBackends(backends []*definitions.SkipperBackend) map[string]*definitions
 	return m
 }
 
-// calculateTraffic calculates the traffic values for the skipper Traffic() predicates
-// based on the weight values in the backend references. It represents the remainder
-// traffic as 1, where no Traffic predicate is meant to be set.
-func calculateTraffic(b []*definitions.BackendReference) map[string]*calculatedTraffic {
-	var sum int
-	weights := make([]int, len(b))
-	for i, bi := range b {
-		sum += bi.Weight
-		weights[i] = bi.Weight
-	}
-
-	if sum == 0 {
-		sum = len(weights)
-		for i := range weights {
-			weights[i] = 1
-		}
-	}
-
-	var lastWithWeight int
-	for i, w := range weights {
-		if w > 0 {
-			lastWithWeight = i
-		}
-	}
-
-	t := make(map[string]*calculatedTraffic)
-	for i, bi := range b {
-		switch {
-		case i == lastWithWeight:
-			t[bi.BackendName] = &calculatedTraffic{value: 1}
-		case weights[i] == 0:
-			t[bi.BackendName] = &calculatedTraffic{value: 0}
-		default:
-			t[bi.BackendName] = &calculatedTraffic{value: float64(weights[i]) / float64(sum)}
-		}
-
-		sum -= weights[i]
-		t[bi.BackendName].balance = len(b) - i - 2
-	}
-
-	return t
-}
-
-func trafficBalance(t *calculatedTraffic) []*eskip.Predicate {
-	if t.balance <= 0 {
-		return nil
-	}
-
-	p := eskip.Predicate{Name: "True"}
-	balance := make([]*eskip.Predicate, t.balance)
-	for i := range balance {
-		balance[i] = eskip.CopyPredicate(&p)
-	}
-
-	return balance
-}
-
-func configureTraffic(r *eskip.Route, t *calculatedTraffic) {
-	if t.value == 1 {
-		return
-	}
-
-	r.Predicates = appendPredicate(r.Predicates, "Traffic", t.value)
-	r.Predicates = append(r.Predicates, trafficBalance(t)...)
-}
-
 func getBackendService(ctx *routeGroupContext, backend *definitions.SkipperBackend) (*service, error) {
-	s, err := ctx.clusterState.getServiceRG(
+	s, err := ctx.state.getServiceRG(
 		namespaceString(ctx.routeGroup.Metadata.Namespace),
 		backend.ServiceName,
 	)
@@ -254,21 +186,16 @@ func applyServiceBackend(ctx *routeGroupContext, backend *definitions.SkipperBac
 		return targetPortNotFound(backend.ServiceName, backend.ServicePort)
 	}
 
-	eps := ctx.clusterState.getEndpointsByTarget(
+	eps := ctx.state.GetEndpointsByTarget(
 		namespaceString(ctx.routeGroup.Metadata.Namespace),
 		s.Meta.Name,
+		"TCP",
 		protocol,
 		targetPort,
 	)
 
 	if len(eps) == 0 {
-		log.Debugf(
-			"[routegroup] Target endpoints not found, shuntroute for %s/%s %s:%d",
-			namespaceString(ctx.routeGroup.Metadata.Namespace),
-			ctx.routeGroup.Metadata.Name,
-			backend.ServiceName,
-			backend.ServicePort,
-		)
+		ctx.logger.Tracef("Target endpoints not found, shuntroute for %s:%d", backend.ServiceName, backend.ServicePort)
 
 		shuntRoute(r)
 		return nil
@@ -282,7 +209,7 @@ func applyServiceBackend(ctx *routeGroupContext, backend *definitions.SkipperBac
 
 	r.BackendType = eskip.LBBackend
 	r.LBEndpoints = eps
-	r.LBAlgorithm = defaultLoadBalancerAlgorithm
+	r.LBAlgorithm = ctx.defaultLoadBalancerAlgorithm
 	if backend.Algorithm != loadbalancer.None {
 		r.LBAlgorithm = backend.Algorithm.String()
 	}
@@ -335,7 +262,7 @@ func applyBackend(ctx *routeGroupContext, backend *definitions.SkipperBackend, r
 		}
 
 		r.LBEndpoints = backend.Endpoints
-		r.LBAlgorithm = defaultLoadBalancerAlgorithm
+		r.LBAlgorithm = ctx.defaultLoadBalancerAlgorithm
 		if backend.Algorithm != loadbalancer.None {
 			r.LBAlgorithm = backend.Algorithm.String()
 		}
@@ -406,10 +333,10 @@ func implicitGroupRoutes(ctx *routeGroupContext) ([]*eskip.Route, error) {
 			ri.Predicates = appendPredicate(ri.Predicates, "Host", ctx.hostRx)
 		}
 
-		configureTraffic(ri, ctx.defaultBackendTraffic[beref.BackendName])
+		ctx.defaultBackendTraffic[beref.BackendName].apply(ri)
 		if be.Type == definitions.ServiceBackend {
 			if err := applyDefaultFilters(ctx, be.ServiceName, ri); err != nil {
-				log.Errorf("[routegroup]: failed to retrieve default filters: %v.", err)
+				ctx.logger.Errorf("Failed to retrieve default filters: %v", err)
 			}
 		}
 
@@ -426,7 +353,7 @@ func transformExplicitGroupRoute(ctx *routeContext) (*eskip.Route, error) {
 	gr := ctx.groupRoute
 	r := &eskip.Route{Id: ctx.id}
 
-	// Path or PathSubtree, prefer Path if we have, because it is more specifc
+	// Path or PathSubtree, prefer Path if we have, because it is more specific
 	if gr.Path != "" {
 		r.Predicates = appendPredicate(r.Predicates, "Path", gr.Path)
 	} else if gr.PathSubtree != "" {
@@ -472,7 +399,7 @@ func transformExplicitGroupRoute(ctx *routeContext) (*eskip.Route, error) {
 
 	if ctx.backend.Type == definitions.ServiceBackend {
 		if err := applyDefaultFilters(ctx.group, ctx.backend.ServiceName, r); err != nil {
-			log.Errorf("[routegroup]: failed to retrieve default filters: %v.", err)
+			ctx.group.logger.Errorf("Failed to retrieve default filters: %v", err)
 		}
 	}
 
@@ -482,9 +409,13 @@ func transformExplicitGroupRoute(ctx *routeContext) (*eskip.Route, error) {
 // explicitGroupRoutes creates routes for those route groups that have the
 // `route` field explicitly defined.
 func explicitGroupRoutes(ctx *routeGroupContext) ([]*eskip.Route, error) {
-	var routes []*eskip.Route
+	var result []*eskip.Route
 	rg := ctx.routeGroup
+
+nextRoute:
 	for routeIndex, rgr := range rg.Spec.Routes {
+		var routes []*eskip.Route
+
 		if len(rgr.Methods) == 0 {
 			rgr.Methods = []string{""}
 		}
@@ -493,7 +424,7 @@ func explicitGroupRoutes(ctx *routeGroupContext) ([]*eskip.Route, error) {
 		backendTraffic := ctx.defaultBackendTraffic
 		if len(rgr.Backends) != 0 {
 			backendRefs = rgr.Backends
-			backendTraffic = calculateTraffic(rgr.Backends)
+			backendTraffic = ctx.calculateTraffic(rgr.Backends)
 		}
 
 		for _, method := range rgr.UniqueMethods() {
@@ -512,23 +443,26 @@ func explicitGroupRoutes(ctx *routeGroupContext) ([]*eskip.Route, error) {
 					backend:    be,
 				})
 				if err != nil {
-					return nil, err
+					ctx.logger.Errorf("Ignoring route: %v", err)
+					continue nextRoute
 				}
 
-				configureTraffic(r, backendTraffic[bref.BackendName])
+				backendTraffic[bref.BackendName].apply(r)
 				storeHostRoute(ctx, r)
 				routes = append(routes, r)
 				routes = appendEastWest(ctx, routes, r)
 				routes = appendHTTPSRedirect(ctx, routes, r)
 			}
 		}
+
+		result = append(result, routes...)
 	}
 
-	return routes, nil
+	return result, nil
 }
 
 func transformRouteGroup(ctx *routeGroupContext) ([]*eskip.Route, error) {
-	ctx.defaultBackendTraffic = calculateTraffic(ctx.routeGroup.Spec.DefaultBackends)
+	ctx.defaultBackendTraffic = ctx.calculateTraffic(ctx.routeGroup.Spec.DefaultBackends)
 	if len(ctx.routeGroup.Spec.Routes) == 0 {
 		return implicitGroupRoutes(ctx)
 	}
@@ -553,11 +487,42 @@ func splitHosts(hosts []string, domains []string) ([]string, []string) {
 	return internalHosts, externalHosts
 }
 
-func (r *routeGroups) convert(s *clusterState, df defaultFilters) ([]*eskip.Route, error) {
+// addRouteGroupTLS compares the RouteGroup host list and the RouteGroup TLS host list
+// and adds the TLS secret to the registry if a match is found.
+func (r *routeGroups) addRouteGroupTLS(ctx *routeGroupContext, tls *definitions.RouteTLSSpec) {
+	// Host in the tls section need to explicitly match the host in the RouteGroup
+	hostlist := compareStringList(tls.Hosts, ctx.routeGroup.Spec.UniqueHosts())
+	if len(hostlist) == 0 {
+		ctx.logger.Errorf("No matching tls hosts found - tls hosts: %s, routegroup hosts: %s", tls.Hosts, ctx.routeGroup.Spec.UniqueHosts())
+		return
+	} else if len(hostlist) != len(tls.Hosts) {
+		ctx.logger.Infof("Hosts in TLS and RouteGroup don't match: tls hosts: %s, routegroup hosts: %s", tls.Hosts, ctx.routeGroup.Spec.UniqueHosts())
+	}
+
+	// Skip adding certs to registry since no certs defined
+	if tls.SecretName == "" {
+		ctx.logger.Debugf("No tls secret defined for hosts - %s", tls.Hosts)
+		return
+	}
+
+	// Secrets should always reside in the same namespace as the RouteGroup
+	secretID := definitions.ResourceID{Name: tls.SecretName, Namespace: ctx.routeGroup.Metadata.Namespace}
+	secret, ok := ctx.state.secrets[secretID]
+	if !ok {
+		ctx.logger.Errorf("Failed to find secret %s in namespace %s", secretID.Name, secretID.Namespace)
+		return
+	}
+	addTLSCertToRegistry(ctx.certificateRegistry, ctx.logger, hostlist, secret)
+
+}
+
+func (r *routeGroups) convert(s *clusterState, df defaultFilters, loggingEnabled bool, cr *certregistry.CertRegistry) ([]*eskip.Route, error) {
 	var rs []*eskip.Route
 	redirect := createRedirectInfo(r.options.ProvideHTTPSRedirect, r.options.HTTPSRedirectCode)
 
 	for _, rg := range s.routeGroups {
+		logger := newLogger("RouteGroup", rg.Metadata.Namespace, rg.Metadata.Name, loggingEnabled)
+
 		redirect.initCurrent(rg.Metadata)
 
 		var internalHosts []string
@@ -585,40 +550,51 @@ func (r *routeGroups) convert(s *clusterState, df defaultFilters) ([]*eskip.Rout
 				provideRedirect = true
 			}
 			ctx := &routeGroupContext{
-				clusterState:          s,
-				defaultFilters:        df,
-				routeGroup:            rg,
-				hosts:                 externalHosts,
-				hostRx:                createHostRx(externalHosts...),
-				hostRoutes:            make(map[string][]*eskip.Route),
-				hasEastWestHost:       hasEastWestHost(r.options.KubernetesEastWestDomain, externalHosts),
-				eastWestEnabled:       r.options.KubernetesEnableEastWest,
-				eastWestDomain:        r.options.KubernetesEastWestDomain,
-				provideHTTPSRedirect:  provideRedirect,
-				httpsRedirectCode:     r.options.HTTPSRedirectCode,
-				backendsByName:        backends,
-				backendNameTracingTag: r.options.BackendNameTracingTag,
-				internal:              false,
-				allowedExternalNames:  r.options.AllowedExternalNames,
+				state:                        s,
+				routeGroup:                   rg,
+				logger:                       logger,
+				defaultFilters:               df,
+				hosts:                        externalHosts,
+				hostRx:                       createHostRx(externalHosts...),
+				hostRoutes:                   make(map[string][]*eskip.Route),
+				hasEastWestHost:              hasEastWestHost(r.options.KubernetesEastWestDomain, externalHosts),
+				eastWestEnabled:              r.options.KubernetesEnableEastWest,
+				eastWestDomain:               r.options.KubernetesEastWestDomain,
+				provideHTTPSRedirect:         provideRedirect,
+				httpsRedirectCode:            r.options.HTTPSRedirectCode,
+				backendsByName:               backends,
+				backendNameTracingTag:        r.options.BackendNameTracingTag,
+				internal:                     false,
+				allowedExternalNames:         r.options.AllowedExternalNames,
+				calculateTraffic:             getBackendTrafficCalculator[*definitions.BackendReference](r.options.BackendTrafficAlgorithm),
+				defaultLoadBalancerAlgorithm: r.options.DefaultLoadBalancerAlgorithm,
+				certificateRegistry:          cr,
 			}
 
 			ri, err := transformRouteGroup(ctx)
 			if err != nil {
-				log.Errorf(
-					"[routegroup] error transforming external hosts for %s/%s: %v.",
-					namespaceString(rg.Metadata.Namespace),
-					rg.Metadata.Name,
-					err,
-				)
-
+				ctx.logger.Errorf("Error transforming external hosts: %v", err)
 				continue
 			}
 
-			catchAll := hostCatchAllRoutes(ctx.hostRoutes, func(host string) string {
-				// "catchall" won't conflict with any HTTP method
-				return rgRouteID("", toSymbol(host), "catchall", 0, 0, false)
-			})
-			ri = append(ri, catchAll...)
+			if !r.options.DisableCatchAllRoutes {
+				catchAll := hostCatchAllRoutes(ctx.hostRoutes, func(host string) string {
+					// "catchall" won't conflict with any HTTP method
+					return rgRouteID("", toSymbol(host), "catchall", 0, 0, false)
+				})
+				ri = append(ri, catchAll...)
+			}
+
+			if ctx.certificateRegistry != nil {
+				for _, ctxTls := range rg.Spec.TLS {
+					r.addRouteGroupTLS(ctx, ctxTls)
+				}
+			}
+
+			for _, route := range ri {
+				appendAnnotationPredicates(r.options.KubernetesAnnotationPredicates, rg.Metadata.Annotations, route)
+				appendAnnotationFilters(r.options.KubernetesAnnotationFiltersAppend, rg.Metadata.Annotations, route)
+			}
 
 			rs = append(rs, ri...)
 		}
@@ -626,37 +602,48 @@ func (r *routeGroups) convert(s *clusterState, df defaultFilters) ([]*eskip.Rout
 		// Internal hosts
 		if len(internalHosts) > 0 {
 			internalCtx := &routeGroupContext{
-				clusterState:          s,
-				defaultFilters:        df,
-				routeGroup:            rg,
-				hosts:                 internalHosts,
-				hostRx:                createHostRx(internalHosts...),
-				hostRoutes:            make(map[string][]*eskip.Route),
-				backendsByName:        backends,
-				backendNameTracingTag: r.options.BackendNameTracingTag,
-				internal:              true,
-				allowedExternalNames:  r.options.AllowedExternalNames,
+				state:                        s,
+				routeGroup:                   rg,
+				logger:                       logger,
+				defaultFilters:               df,
+				hosts:                        internalHosts,
+				hostRx:                       createHostRx(internalHosts...),
+				hostRoutes:                   make(map[string][]*eskip.Route),
+				backendsByName:               backends,
+				backendNameTracingTag:        r.options.BackendNameTracingTag,
+				internal:                     true,
+				allowedExternalNames:         r.options.AllowedExternalNames,
+				calculateTraffic:             getBackendTrafficCalculator[*definitions.BackendReference](r.options.BackendTrafficAlgorithm),
+				defaultLoadBalancerAlgorithm: r.options.DefaultLoadBalancerAlgorithm,
+				certificateRegistry:          cr,
 			}
 
 			internalRi, err := transformRouteGroup(internalCtx)
 			if err != nil {
-				log.Errorf(
-					"[routegroup] error transforming internal hosts for %s/%s: %v.",
-					namespaceString(rg.Metadata.Namespace),
-					rg.Metadata.Name,
-					err,
-				)
+				internalCtx.logger.Errorf("Error transforming internal hosts: %v", err)
 
 				continue
 			}
 
-			catchAll := hostCatchAllRoutes(internalCtx.hostRoutes, func(host string) string {
-				// "catchall" won't conflict with any HTTP method
-				return rgRouteID("", toSymbol(host), "catchall", 0, 0, true)
-			})
-			internalRi = append(internalRi, catchAll...)
+			if !r.options.DisableCatchAllRoutes {
+				catchAll := hostCatchAllRoutes(internalCtx.hostRoutes, func(host string) string {
+					// "catchall" won't conflict with any HTTP method
+					return rgRouteID("", toSymbol(host), "catchall", 0, 0, true)
+				})
+				internalRi = append(internalRi, catchAll...)
+			}
 
 			applyEastWestRangePredicates(internalRi, r.options.KubernetesEastWestRangePredicates)
+			for _, route := range internalRi {
+				appendAnnotationPredicates(r.options.KubernetesEastWestRangeAnnotationPredicates, rg.Metadata.Annotations, route)
+				appendAnnotationFilters(r.options.KubernetesEastWestRangeAnnotationFiltersAppend, rg.Metadata.Annotations, route)
+			}
+
+			if internalCtx.certificateRegistry != nil {
+				for _, ctxTls := range rg.Spec.TLS {
+					r.addRouteGroupTLS(internalCtx, ctxTls)
+				}
+			}
 
 			rs = append(rs, internalRi...)
 		}

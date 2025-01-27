@@ -8,10 +8,10 @@ import (
 	"testing"
 	"time"
 
+	jwt "github.com/golang-jwt/jwt/v4"
 	"github.com/stretchr/testify/assert"
 	"github.com/zalando/skipper/eskip"
 	"github.com/zalando/skipper/filters"
-	"github.com/zalando/skipper/logging/loggingtest"
 	"github.com/zalando/skipper/proxy/proxytest"
 	"github.com/zalando/skipper/routing"
 	"github.com/zalando/skipper/routing/testdataclient"
@@ -278,18 +278,21 @@ func TestOIDCQueryClaimsFilter(t *testing.T) {
 			}
 			fr := make(filters.Registry)
 			fr.Register(spec)
+
 			dc := testdataclient.New(nil)
+			defer dc.Close()
+
 			proxy := proxytest.WithRoutingOptions(fr, routing.Options{
 				DataClients: []routing.DataClient{dc},
-				Log:         loggingtest.New(),
 			})
 			defer proxy.Close()
+
 			reqURL, err := url.Parse(proxy.URL)
 			if err != nil {
 				t.Errorf("Failed to parse url %s: %v", proxy.URL, err)
 			}
 			reqURL.Path = tc.path
-			oidcServer := createOIDCServer(proxy.URL+"/redirect", validClient, "mysec")
+			oidcServer := createOIDCServer(proxy.URL+"/redirect", validClient, "mysec", jwt.MapClaims{"groups": []string{"CD-Administrators", "Purchasing-Department", "AppX-Test-Users", "white space"}})
 			defer oidcServer.Close()
 			t.Logf("oidc/auth server URL: %s", oidcServer.URL)
 			// create filter
@@ -310,8 +313,6 @@ func TestOIDCQueryClaimsFilter(t *testing.T) {
 			} else if err != nil {
 				t.Fatalf("Unexpected error while creating filter: %v", err)
 			}
-			fOIDC := f.(*tokenOidcFilter)
-			defer fOIDC.Close()
 
 			// adding the OIDCQueryClaimsFilter to the route
 			querySpec := NewOIDCQueryClaimsFilter()

@@ -28,13 +28,14 @@ type loadResult struct {
 	parseErrors map[string]error
 }
 
-var invalidRouteExpression = errors.New("one or more invalid route expressions")
+var errInvalidRouteExpression = errors.New("one or more invalid route expressions")
 
 // store all loaded routes, even if invalid, and store the
 // parse errors if any.
 func mapRouteInfo(allInfo []*eskip.RouteInfo) loadResult {
 	lr := loadResult{make([]*eskip.Route, len(allInfo)), make(map[string]error)}
-	for i, info := range allInfo {
+	for i := range allInfo {
+		info := allInfo[i]
 		lr.routes[i] = &info.Route
 		if info.ParseError != nil {
 			lr.parseErrors[info.Id] = info.ParseError
@@ -66,7 +67,7 @@ func checkParseErrors(lr loadResult) error {
 		printStderr(id, perr)
 	}
 
-	return invalidRouteExpression
+	return errInvalidRouteExpression
 }
 
 // load, parse routes and print parse errors if any.
@@ -83,10 +84,20 @@ func checkRepeatedRouteIds(routes []*eskip.Route) error {
 	ids := map[string]bool{}
 	for _, route := range routes {
 		if ids[route.Id] {
-			return errors.New("Repeating route with id " + route.Id)
+			return fmt.Errorf("repeating route with id %s", route.Id)
 		}
 		ids[route.Id] = true
 	}
+	return nil
+}
+
+func checkEmptyBackends(routes []*eskip.Route) error {
+	for _, route := range routes {
+		if route.BackendType == eskip.NetworkBackend && route.Backend == "" {
+			return fmt.Errorf("route has empty backend: %s", route.Id)
+		}
+	}
+
 	return nil
 }
 
@@ -99,6 +110,11 @@ func loadRoutesUnchecked(in *medium) []*eskip.Route {
 // command executed for check.
 func checkCmd(a cmdArgs) error {
 	routes, err := loadRoutesChecked(a.in)
+	if err != nil {
+		return err
+	}
+
+	err = checkEmptyBackends(routes)
 	if err != nil {
 		return err
 	}
@@ -130,7 +146,7 @@ func printCmd(a cmdArgs) error {
 	}
 
 	if len(lr.parseErrors) > 0 {
-		return invalidRouteExpression
+		return errInvalidRouteExpression
 	}
 
 	return nil

@@ -77,7 +77,7 @@ func TestCreate(t *testing.T) {
 		predicate{chance: .3},
 		true,
 	}, {
-		"chance and stickyness",
+		"chance and stickiness",
 		[]interface{}{.3, "testname", "group"},
 		predicate{chance: .3, trafficGroup: "group", trafficGroupCookie: "testname"},
 		false,
@@ -178,11 +178,7 @@ func TestTrafficPredicateInRoutes(t *testing.T) {
 			epsilonFactor := 0.1
 			epsilon := float64(N) * epsilonFactor
 
-			r, err := eskip.Parse(tc.routes)
-			if err != nil {
-				t.Error(err)
-				return
-			}
+			r := eskip.MustParse(tc.routes)
 
 			p := proxytest.WithRoutingOptions(builtin.MakeRegistry(), routing.Options{
 				Predicates: []routing.PredicateSpec{

@@ -4,11 +4,12 @@ import (
 	"context"
 	"fmt"
 	"log"
+	"sync"
 	"time"
 
 	"github.com/cenkalti/backoff"
-	"github.com/go-redis/redis/v8"
 	"github.com/opentracing/opentracing-go"
+	"github.com/redis/go-redis/v9"
 	"github.com/zalando/skipper/logging"
 	"github.com/zalando/skipper/metrics"
 
@@ -25,6 +26,16 @@ import (
 type RedisOptions struct {
 	// Addrs are the list of redis shards
 	Addrs []string
+
+	// AddrUpdater is a func that is regularly called to update
+	// redis address list. This func should return a list of redis
+	// shards.
+	AddrUpdater func() ([]string, error)
+
+	// UpdateInterval is the time.Duration that AddrUpdater is
+	// triggered and SetAddrs be used to update the redis shards
+	UpdateInterval time.Duration
+
 	// Password is the password needed to connect to Redis server
 	Password string
 
@@ -80,6 +91,12 @@ type RedisRingClient struct {
 	options       *RedisOptions
 	tracer        opentracing.Tracer
 	quit          chan struct{}
+	once          sync.Once
+	closed        bool
+}
+
+type RedisScript struct {
+	script *redis.Script
 }
 
 const (
@@ -97,6 +114,7 @@ const (
 	DefaultMaxConns = 100
 
 	defaultConnMetricsInterval = 60 * time.Second
+	defaultUpdateInterval      = 10 * time.Second
 )
 
 // https://arxiv.org/pdf/1406.2294.pdf
@@ -119,15 +137,13 @@ func (j *jumpHash) Get(k string) string {
 // Multi-probe consistent hashing - mpchash
 // https://arxiv.org/pdf/1505.00062.pdf
 type multiprobe struct {
-	hash   *mpchash.Multi
-	shards []string
+	hash *mpchash.Multi
 }
 
 func NewMultiprobe(shards []string) redis.ConsistentHash {
 	return &multiprobe{
 		// 2 seeds and k=21 got from library
-		hash:   mpchash.New(shards, siphash64seed, [2]uint64{1, 2}, 21),
-		shards: shards,
+		hash: mpchash.New(shards, siphash64seed, [2]uint64{1, 2}, 21),
 	}
 }
 
@@ -180,10 +196,14 @@ func NewRendezvousVnodes(shards []string) redis.ConsistentHash {
 }
 
 func NewRedisRingClient(ro *RedisOptions) *RedisRingClient {
-	r := new(RedisRingClient)
-	r.quit = make(chan struct{})
-	r.metrics = metrics.Default
-	r.tracer = &opentracing.NoopTracer{}
+	const backOffTime = 2 * time.Second
+	const retryCount = 5
+	r := &RedisRingClient{
+		once:    sync.Once{},
+		quit:    make(chan struct{}),
+		metrics: metrics.Default,
+		tracer:  &opentracing.NoopTracer{},
+	}
 
 	ringOptions := &redis.RingOptions{
 		Addrs: map[string]string{},
@@ -200,9 +220,29 @@ func NewRedisRingClient(ro *RedisOptions) *RedisRingClient {
 			ringOptions.NewConsistentHash = NewMultiprobe
 		}
 
-		for idx, addr := range ro.Addrs {
-			ringOptions.Addrs[fmt.Sprintf("redis%d", idx)] = addr
+		if ro.Log == nil {
+			ro.Log = &logging.DefaultLog{}
 		}
+
+		if ro.AddrUpdater != nil {
+			address, err := ro.AddrUpdater()
+			for i := 0; i < retryCount; i++ {
+				if err == nil {
+					break
+				}
+				time.Sleep(backOffTime)
+				address, err = ro.AddrUpdater()
+			}
+			if err != nil {
+				ro.Log.Errorf("Failed at redisclient startup %v", err)
+			}
+			ringOptions.Addrs = createAddressMap(address)
+		} else {
+			ringOptions.Addrs = createAddressMap(ro.Addrs)
+		}
+
+		ro.Log.Infof("Created ring with addresses: %v", ro.Addrs)
+
 		ringOptions.ReadTimeout = ro.ReadTimeout
 		ringOptions.WriteTimeout = ro.WriteTimeout
 		ringOptions.PoolTimeout = ro.PoolTimeout
@@ -222,9 +262,73 @@ func NewRedisRingClient(ro *RedisOptions) *RedisRingClient {
 		r.ring = redis.NewRing(ringOptions)
 		r.log = ro.Log
 		r.metricsPrefix = ro.MetricsPrefix
+
+		if ro.AddrUpdater != nil {
+			if ro.UpdateInterval == 0 {
+				ro.UpdateInterval = defaultUpdateInterval
+			}
+			go r.startUpdater(context.Background())
+		}
 	}
 
 	return r
+}
+
+func createAddressMap(addrs []string) map[string]string {
+	res := make(map[string]string)
+	for _, addr := range addrs {
+		res[addr] = addr
+	}
+	return res
+}
+
+func hasAll(a []string, set map[string]struct{}) bool {
+	if len(a) != len(set) {
+		return false
+	}
+	for _, w := range a {
+		if _, ok := set[w]; !ok {
+			return false
+		}
+	}
+	return true
+}
+
+func (r *RedisRingClient) startUpdater(ctx context.Context) {
+	old := make(map[string]struct{})
+	for _, addr := range r.options.Addrs {
+		old[addr] = struct{}{}
+	}
+
+	r.log.Infof("Start goroutine to update redis instances every %s", r.options.UpdateInterval)
+	defer r.log.Info("Stopped goroutine to update redis")
+
+	ticker := time.NewTicker(r.options.UpdateInterval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-r.quit:
+			return
+		case <-ticker.C:
+		}
+
+		addrs, err := r.options.AddrUpdater()
+		if err != nil {
+			r.log.Errorf("Failed to start redis updater: %v", err)
+			continue
+		}
+		if !hasAll(addrs, old) {
+			r.log.Infof("Redis updater updating old(%d) != new(%d)", len(old), len(addrs))
+			r.SetAddrs(ctx, addrs)
+			r.metrics.UpdateGauge(r.metricsPrefix+"shards", float64(r.ring.Len()))
+
+			old = make(map[string]struct{})
+			for _, addr := range addrs {
+				old[addr] = struct{}{}
+			}
+
+		}
+	}
 }
 
 func (r *RedisRingClient) RingAvailable() bool {
@@ -242,9 +346,12 @@ func (r *RedisRingClient) RingAvailable() bool {
 
 func (r *RedisRingClient) StartMetricsCollection() {
 	go func() {
+		ticker := time.NewTicker(r.options.ConnMetricsInterval)
+		defer ticker.Stop()
+
 		for {
 			select {
-			case <-time.After(r.options.ConnMetricsInterval):
+			case <-ticker.C:
 				stats := r.ring.PoolStats()
 				// counter values
 				r.metrics.UpdateGauge(r.metricsPrefix+"hits", float64(stats.Hits))
@@ -268,22 +375,34 @@ func (r *RedisRingClient) StartSpan(operationName string, opts ...opentracing.St
 }
 
 func (r *RedisRingClient) Close() {
-	if r != nil {
+	r.once.Do(func() {
+		r.closed = true
 		close(r.quit)
+		if r.ring != nil {
+			r.ring.Close()
+		}
+	})
+}
+
+func (r *RedisRingClient) SetAddrs(ctx context.Context, addrs []string) {
+	if len(addrs) == 0 {
+		return
 	}
+	r.ring.SetAddrs(createAddressMap(addrs))
 }
 
 func (r *RedisRingClient) Get(ctx context.Context, key string) (string, error) {
 	res := r.ring.Get(ctx, key)
 	return res.Val(), res.Err()
 }
+
 func (r *RedisRingClient) Set(ctx context.Context, key string, value interface{}, expiration time.Duration) (string, error) {
 	res := r.ring.Set(ctx, key, value, expiration)
 	return res.Result()
 }
 
 func (r *RedisRingClient) ZAdd(ctx context.Context, key string, val int64, score float64) (int64, error) {
-	res := r.ring.ZAdd(ctx, key, &redis.Z{Member: val, Score: score})
+	res := r.ring.ZAdd(ctx, key, redis.Z{Member: val, Score: score})
 	return res.Val(), res.Err()
 }
 
@@ -308,13 +427,13 @@ func (r *RedisRingClient) ZCard(ctx context.Context, key string) (int64, error) 
 }
 
 func (r *RedisRingClient) ZRangeByScoreWithScoresFirst(ctx context.Context, key string, min, max float64, offset, count int64) (interface{}, error) {
-	opt := &redis.ZRangeBy{
+	opt := redis.ZRangeBy{
 		Min:    fmt.Sprint(min),
 		Max:    fmt.Sprint(max),
 		Offset: offset,
 		Count:  count,
 	}
-	res := r.ring.ZRangeByScoreWithScores(ctx, key, opt)
+	res := r.ring.ZRangeByScoreWithScores(ctx, key, &opt)
 	zs, err := res.Result()
 	if err != nil {
 		return nil, err
@@ -324,4 +443,12 @@ func (r *RedisRingClient) ZRangeByScoreWithScoresFirst(ctx context.Context, key 
 	}
 
 	return zs[0].Member, nil
+}
+
+func (r *RedisRingClient) NewScript(source string) *RedisScript {
+	return &RedisScript{redis.NewScript(source)}
+}
+
+func (r *RedisRingClient) RunScript(ctx context.Context, s *RedisScript, keys []string, args ...interface{}) (interface{}, error) {
+	return s.script.Run(ctx, r.ring, keys, args...).Result()
 }

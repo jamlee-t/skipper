@@ -49,10 +49,21 @@ Lua `print` builtin function writes skipper info log messages.
 
 `sleep(number)` function pauses execution for at least `number` milliseconds. A negative or zero duration causes `sleep` to return immediately.
 
+## Enable and Disable lua sources
+
+The flag `-lua-sources` allows to set 5 different values:
+
+* "file": Allows to use reference to file for scripts
+* "inline": Allows to use inline scripts
+* "inline", "file": Allows to use reference to file and inline scripts
+* "none": Disable Lua filters
+* "": the same as "inline", "file", the default value for binary and
+  library users
+
 ## Available lua modules
 
 Besides the [standard modules](https://www.lua.org/manual/5.1/manual.html#5) - except
-for `debug` - the following modules have been preloaded and can be used with e.g.
+for `debug` - the following additional modules have been preloaded and can be used with e.g.
 `local http = require("http")`, see also the examples below
 
 * `http` [gluahttp](https://github.com/cjoudrey/gluahttp) - TODO: configurable
@@ -67,6 +78,25 @@ check the [gopher-lua documentation](https://github.com/yuin/gopher-lua#differen
 Any other module can be loaded in non-byte code form from the lua path (by default
 for `require("mod")` this is `./mod.lua`, `/usr/local/share/lua/5.1/mod.lua` and
 `/usr/local/share/lua/5.1/mod/init.lua`).
+
+
+You may selectively enable standard and additional Lua modules using `-lua-modules` flag:
+```sh
+-lua-modules=package,base,json
+```
+Note that preloaded additional modules require `package` module.
+
+For standard modules you may enable only a subset of module symbols:
+```sh
+-lua-modules=base.print,base.assert
+```
+
+Use `none` to disable all modules:
+```sh
+-lua-modules=none
+```
+
+See also http://lua-users.org/wiki/SandBoxes
 
 ## Lua states
 
@@ -106,6 +136,32 @@ ctx.request.header["Authorization"] = nil -- delete authorization header
 > `header` table returns empty string for missing keys
 
 Response headers `ctx.response.header` work the same way - this is of course only valid in the `response()` phase.
+
+### Multiple header values
+
+Request and response header tables provide access to a first value of a header.
+
+To access multiple values use `add` and `values` methods:
+
+```lua
+function request(ctx, params)
+	ctx.request.header.add("X-Foo", "Bar")
+	ctx.request.header.add("X-Foo", "Baz")
+
+	-- all X-Foo values
+	for _, v in pairs(ctx.request.header.values("X-Foo")) do
+		print(v)
+	end
+
+	-- all values
+	for k, _ in ctx.request.header() do
+		for _, v in pairs(ctx.request.header.values(k)) do
+			print(k, "=", v)
+		end
+	end
+end
+```
+
 
 ## Other request fields
 
@@ -150,8 +206,8 @@ Path("/api/:id") -> lua("function request(ctx, params); print(ctx.path_param.id)
 
 ## StateBag
 
-The state bag can be used to pass values from one filter to another in the same
-chain. It is shared by all filters in one request.
+The state bag can be used to pass string, number and table values from one filter to another in the same
+chain. It is shared by all filters in one request (lua table values are only available to lua filters).
 ```lua
 function request(ctx, params)
     -- the value of "mykey" will be available to all filters in the chain now:

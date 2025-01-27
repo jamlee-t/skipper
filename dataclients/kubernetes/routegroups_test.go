@@ -22,6 +22,10 @@ func TestRouteGroupTraffic(t *testing.T) {
 	kubernetestest.FixturesToTest(t, "testdata/routegroups/traffic")
 }
 
+func TestRouteGroupTrafficSegment(t *testing.T) {
+	kubernetestest.FixturesToTest(t, "testdata/routegroups/traffic-segment")
+}
+
 func TestRouteGroupEastWest(t *testing.T) {
 	kubernetestest.FixturesToTest(t, "testdata/routegroups/east-west")
 }
@@ -48,4 +52,18 @@ func TestRouteGroupTracingTag(t *testing.T) {
 
 func TestRouteGroupExternalName(t *testing.T) {
 	kubernetestest.FixturesToTest(t, "testdata/routegroups/external-name")
+}
+
+func TestRouteGroupDefaultLoadBalancerAlgorithm(t *testing.T) {
+	kubernetestest.FixturesToTest(t, "testdata/routegroups/loadbalancer-algorithm")
+}
+
+func TestRouteGroupTLS(t *testing.T) {
+	kubernetestest.FixturesToTest(t, "testdata/routegroups/tls")
+}
+
+func TestRouteGroupAnnotationConfig(t *testing.T) {
+	kubernetestest.FixturesToTest(t,
+		"testdata/routegroups/annotation-predicates",
+		"testdata/routegroups/annotation-filters")
 }

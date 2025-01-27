@@ -11,12 +11,12 @@ nav:
         - Plugins: reference/plugins.md
         - Architecture: reference/architecture.md
         - Development: reference/development.md
-        - Video - How to build: tutorials/video-howto-build.md
         - Data Clients:
             - Eskip File: data-clients/eskip-file.md
-            - Etcd: data-clients/etcd.md
-            - Kubernetes: data-clients/kubernetes.md
+            - Remote Eskip: data-clients/eskip-remote.md
             - Route String: data-clients/route-string.md
+            - Kubernetes: data-clients/kubernetes.md
+            - Etcd: data-clients/etcd.md
         - Operation:
             - Deployment: operation/deployment.md
             - Operation: operation/operation.md
@@ -32,15 +32,16 @@ nav:
     - Tutorials:
         - Basics: tutorials/basics.md
         - Common Use Cases: tutorials/common-use-cases.md
-        - Authentication and Autorization: tutorials/auth.md
+        - Authentication and Authorization: tutorials/auth.md
         - Ratelimits: tutorials/ratelimit.md
         - Shadow Traffic: tutorials/shadow-traffic.md
         - Operations: tutorials/operations.md
         - Development: tutorials/development.md
+        - Built Your Own Proxy: tutorials/built-your-own.md
 theme:
   name: material
   favicon: favicon.ico
-  logo: favicon.ico
+  logo: skipper-h180.png
   feature:
     tabs: true
   palette:
@@ -65,6 +66,16 @@ markdown_extensions:
 - pymdownx.superfences
 - pymdownx.details
 - pymdownx.mark
+- pymdownx.arithmatex:
+    generic: true
+# https://squidfunk.github.io/mkdocs-material/reference/diagrams/
+- pymdownx.superfences:
+    custom_fences:
+      - name: mermaid
+        class: mermaid
+        format: !!python/name:pymdownx.superfences.fence_code_format
+extra_javascript:
+  - https://cdn.jsdelivr.net/npm/mathjax@3/es5/tex-mml-chtml.js
 
 plugins:
 - search

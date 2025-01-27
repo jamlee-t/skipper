@@ -1,22 +1,25 @@
 package ratelimit
 
 import (
+	"context"
 	"fmt"
 	"net/http"
 	"sync"
 	"testing"
 	"time"
+
+	"gopkg.in/yaml.v2"
 )
 
 func checkRatelimitted(t *testing.T, rl *Ratelimit, client string) {
-	if rl.Allow(client) {
-		t.Errorf("request is allowed for %s, but expected to be rate limitted", client)
+	if rl.Allow(context.Background(), client) {
+		t.Errorf("request is allowed for %s, but expected to be rate limited", client)
 	}
 }
 
 func checkNotRatelimitted(t *testing.T, rl *Ratelimit, client string) {
-	if !rl.Allow(client) {
-		t.Errorf("request is rate limitted for %s, but expected to be allowed", client)
+	if !rl.Allow(context.Background(), client) {
+		t.Errorf("request is rate limited for %s, but expected to be allowed", client)
 	}
 }
 
@@ -79,11 +82,15 @@ func TestLocalRatelimit(t *testing.T) {
 
 	t.Run("new local ratelimitter", func(t *testing.T) {
 		rl := newRatelimit(s, nil, nil)
+		defer rl.Close()
+
 		checkNotRatelimitted(t, rl, client1)
 	})
 
 	t.Run("does not rate limit unless we have enough calls", func(t *testing.T) {
 		rl := newRatelimit(s, nil, nil)
+		defer rl.Close()
+
 		for i := 0; i < s.MaxHits; i++ {
 			checkNotRatelimitted(t, rl, client1)
 		}
@@ -94,6 +101,8 @@ func TestLocalRatelimit(t *testing.T) {
 
 	t.Run("does not rate limit if TimeWindow is over", func(t *testing.T) {
 		rl := newRatelimit(s, nil, nil)
+		defer rl.Close()
+
 		for i := 0; i < s.MaxHits-1; i++ {
 			checkNotRatelimitted(t, rl, client1)
 		}
@@ -105,6 +114,8 @@ func TestLocalRatelimit(t *testing.T) {
 		s := s
 		s.MaxHits = 0
 		rl := newRatelimit(s, nil, nil)
+		defer rl.Close()
+
 		checkRatelimitted(t, rl, client1)
 	})
 }
@@ -133,6 +144,22 @@ func TestDisableRatelimit(t *testing.T) {
 	})
 }
 
+func TestSameBucketLookuper(t *testing.T) {
+	req, err := http.NewRequest("GET", "/foo", nil)
+	if err != nil {
+		t.Errorf("Could not create request: %v", err)
+	}
+
+	lookuper := NewSameBucketLookuper()
+	if s := lookuper.Lookup(req); s != sameBucket {
+		t.Errorf("Failed to lookup request %s != %s", s, sameBucket)
+	}
+
+	if s := lookuper.String(); s != "SameBucketLookuper" {
+		t.Errorf("Failed to lookuper.String(): %s", s)
+	}
+}
+
 func TestXForwardedForLookuper(t *testing.T) {
 	req, err := http.NewRequest("GET", "/foo", nil)
 	if err != nil {
@@ -144,6 +171,10 @@ func TestXForwardedForLookuper(t *testing.T) {
 		lookuper := NewXForwardedForLookuper()
 		if lookuper.Lookup(req) != "127.0.0.3" {
 			t.Errorf("Failed to lookup request")
+		}
+
+		if s := lookuper.String(); s != "XForwardedForLookuper" {
+			t.Errorf("Failed to lookuper.String(): %s", s)
 		}
 	})
 
@@ -170,6 +201,10 @@ func TestHeaderLookuper(t *testing.T) {
 		authLookuper := NewHeaderLookuper("authorizatioN")
 		if authLookuper.Lookup(req) != "foo" {
 			t.Errorf("Failed to lookup request")
+		}
+
+		if s := authLookuper.String(); s != "HeaderLookuper" {
+			t.Errorf("Failed to authLookuper.String(): %s", s)
 		}
 	})
 
@@ -198,6 +233,10 @@ func TestTupleLookuper(t *testing.T) {
 		if tupleLookuper.Lookup(req) != "foomeow" {
 			t.Errorf("Failed to lookup request")
 		}
+
+		if s := tupleLookuper.String(); s != "TupleLookuper" {
+			t.Errorf("Failed to tupleLookuper.String(): %s", s)
+		}
 	})
 
 	t.Run("header lookuper x header", func(t *testing.T) {
@@ -209,6 +248,14 @@ func TestTupleLookuper(t *testing.T) {
 		)
 		if tupleLookuper.Lookup(req) != "barmeow" {
 			t.Errorf("Failed to lookup request")
+		}
+	})
+
+	t.Run("nil tuple lookuper", func(t *testing.T) {
+		tupleLookuper := NewTupleLookuper()
+		tupleLookuper.l = nil
+		if s := tupleLookuper.Lookup(req); s != "" {
+			t.Errorf("Failed to get empty result for nil lookuper: %s", s)
 		}
 	})
 }
@@ -227,6 +274,10 @@ func TestRoundRobinLookuper(t *testing.T) {
 	} {
 		t.Run(fmt.Sprintf("n=%d, concurrency=%d, iterations=%d", tc.n, tc.concurrency, tc.iterations), func(t *testing.T) {
 			lookuper := NewRoundRobinLookuper(uint64(tc.n))
+			if l, _ := lookuper.(*RoundRobinLookuper); l.String() != "RoundRobinLookuper" {
+				t.Errorf("Failed to lookuper.String(): %s", l.String())
+			}
+
 			buckets := testRoundRobinLookuper(lookuper, tc.concurrency, tc.iterations)
 			if len(buckets) != tc.n {
 				t.Errorf("expected %d buckets, got %d", tc.n, len(buckets))
@@ -278,7 +329,7 @@ func BenchmarkServiceRatelimit(b *testing.B) {
 
 	rl := newRatelimit(s, nil, nil)
 	for i := 0; i < b.N; i++ {
-		rl.Allow("")
+		rl.Allow(context.Background(), "")
 	}
 }
 
@@ -294,7 +345,7 @@ func BenchmarkLocalRatelimit(b *testing.B) {
 
 	rl := newRatelimit(s, nil, nil)
 	for i := 0; i < b.N; i++ {
-		rl.Allow(client)
+		rl.Allow(context.Background(), client)
 	}
 }
 
@@ -310,7 +361,7 @@ func BenchmarkLocalRatelimitWithCleaner(b *testing.B) {
 
 	rl := newRatelimit(s, nil, nil)
 	for i := 0; i < b.N; i++ {
-		rl.Allow(client)
+		rl.Allow(context.Background(), client)
 	}
 }
 
@@ -330,7 +381,7 @@ func BenchmarkLocalRatelimitClients1000(b *testing.B) {
 
 	rl := newRatelimit(s, nil, nil)
 	for i := 0; i < b.N; i++ {
-		rl.Allow(clients[i%count])
+		rl.Allow(context.Background(), clients[i%count])
 	}
 }
 
@@ -351,7 +402,7 @@ func BenchmarkLocalRatelimitWithCleanerClients1000(b *testing.B) {
 
 	rl := newRatelimit(s, nil, nil)
 	for i := 0; i < b.N; i++ {
-		rl.Allow(clients[i%count])
+		rl.Allow(context.Background(), clients[i%count])
 	}
 }
 
@@ -390,4 +441,219 @@ func TestSettingsRatelimit(t *testing.T) {
 			t.Errorf("Failed to get disabled string version: %s", s)
 		}
 	})
+}
+
+func TestUnmarshalYaml(t *testing.T) {
+	for _, tt := range []struct {
+		name    string
+		yml     string
+		wantErr bool
+		want    Settings
+	}{
+		{
+			name: "test deprecated local ratelimit",
+			yml: `type: local
+max-hits: 100
+time-window: 10s`,
+			wantErr: false,
+			want: Settings{
+				Type:          ClientRatelimit,
+				MaxHits:       100,
+				TimeWindow:    10 * time.Second,
+				Group:         "",
+				CleanInterval: 10 * time.Second * 10,
+			},
+		},
+		{
+			name: "test ratelimit",
+			yml: `type: service
+max-hits: 100
+time-window: 10s`,
+			wantErr: false,
+			want: Settings{
+				Type:          ServiceRatelimit,
+				MaxHits:       100,
+				TimeWindow:    10 * time.Second,
+				Group:         "",
+				CleanInterval: 10 * time.Second * 10,
+			},
+		},
+		{
+			name: "test client ratelimit",
+			yml: `type: client
+max-hits: 50
+time-window: 2m`,
+			wantErr: false,
+			want: Settings{
+				Type:          ClientRatelimit,
+				MaxHits:       50,
+				TimeWindow:    2 * time.Minute,
+				Group:         "",
+				CleanInterval: 2 * time.Minute * 10,
+			},
+		},
+		{
+			name: "test cluster client ratelimit",
+			yml: `type: clusterClient
+group: foo
+max-hits: 50
+time-window: 2m`,
+			wantErr: false,
+			want: Settings{
+				Type:          ClusterClientRatelimit,
+				MaxHits:       50,
+				TimeWindow:    2 * time.Minute,
+				Group:         "foo",
+				CleanInterval: 2 * time.Minute * 10,
+			},
+		},
+		{
+			name: "test cluster ratelimit",
+			yml: `type: clusterService
+group: foo
+max-hits: 50
+time-window: 2m`,
+			wantErr: false,
+			want: Settings{
+				Type:          ClusterServiceRatelimit,
+				MaxHits:       50,
+				TimeWindow:    2 * time.Minute,
+				Group:         "foo",
+				CleanInterval: 2 * time.Minute * 10,
+			},
+		},
+		{
+			name: "test disabled ratelimit",
+			yml: `type: disabled
+max-hits: 50
+time-window: 2m`,
+			wantErr: false,
+			want: Settings{
+				Type:          DisableRatelimit,
+				MaxHits:       50,
+				TimeWindow:    2 * time.Minute,
+				Group:         "",
+				CleanInterval: 2 * time.Minute * 10,
+			},
+		},
+		{
+			name: "test invalid type",
+			yml: `type: invalid
+max-hits: 50
+time-window: 2m`,
+			wantErr: true,
+		},
+		{
+			name:    "test invalid yaml",
+			yml:     `type=invalid`,
+			wantErr: true,
+		},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			var rt Settings
+			if err := yaml.Unmarshal([]byte(tt.yml), &rt); err != nil && !tt.wantErr {
+				t.Fatalf("Failed to unmarshal: %v", err)
+			} else if tt.wantErr && err == nil {
+				t.Fatal("Failed to get unmarshal error")
+			}
+
+			if got := rt.Type.String(); got != tt.want.Type.String() {
+				t.Errorf("Failed to get the right ratelimit type want %s, got %s", tt.want.Type.String(), got)
+			}
+
+			if got := rt.String(); got != tt.want.String() {
+				t.Errorf("Failed to get the right ratelimit want %s, got %s", tt.want.String(), got)
+			}
+		})
+	}
+}
+
+func TestVoidRatelimit(t *testing.T) {
+	l := voidRatelimit{}
+	defer l.Close()
+	l.Resize("s", 5) // should do nothing
+	now := time.Now()
+	for i := 0; i < 100; i++ {
+		if l.Allow(context.Background(), "s") != true {
+			t.Error("voidratelimit should always allow")
+		}
+		if l.RetryAfter("s") != 0 {
+			t.Error("voidratelimit should always be retryable")
+		}
+		if d := l.Delta("s"); d >= 0 {
+			t.Errorf("There was a delta found %v, but should not", d)
+		}
+		if ti := l.Oldest("s"); now.Before(ti) {
+			t.Errorf("oldest should never have a new time: %v", ti)
+		}
+	}
+}
+func TestZeroRatelimit(t *testing.T) {
+	l := zeroRatelimit{}
+	defer l.Close()
+	l.Resize("s", 5) // should do nothing
+	now := time.Now()
+	for i := 0; i < 100; i++ {
+		if l.Allow(context.Background(), "s") != false {
+			t.Error("zerolimit should always deny")
+		}
+		if l.RetryAfter("s") != zeroRetry {
+			t.Error("zerolimit should always never be retryable")
+		}
+		if d := l.Delta("s"); d != zeroDelta {
+			t.Errorf("There was a wrong delta found %v, but should %v", d, zeroDelta)
+		}
+		if ti := l.Oldest("s"); now.Before(ti) {
+			t.Errorf("oldest should never have a new time: %v", ti)
+		}
+	}
+}
+
+func TestRatelimitImpl(t *testing.T) {
+	settings := Settings{
+		Type:          ServiceRatelimit,
+		MaxHits:       100,
+		TimeWindow:    10 * time.Second,
+		Group:         "",
+		CleanInterval: 10 * time.Second * 10,
+	}
+
+	rl := newRatelimit(settings, nil, nil)
+	defer rl.Close()
+	rl.Resize("", 5)
+
+	for i := 0; i < 5; i++ {
+		if rl.Allow(context.Background(), "") != true {
+			t.Error("service ratelimit should allow 5")
+		}
+	}
+
+	if rl.Allow(context.Background(), "") == true {
+		t.Error("After 5 allow we should get a deny")
+	}
+	if rl.RetryAfter("") == 0 {
+		t.Error("After 5 allow we should get a non zero value")
+	}
+	if d := rl.Delta(""); d == 0 {
+		t.Errorf("There was no delta found %v, but should", d)
+	}
+
+	rl = nil
+	if rl.Allow(context.Background(), "") != true {
+		t.Error("nil ratelimiter should always allow")
+	}
+	if rl.RetryAfter("") != 0 {
+		t.Error("nil ratelimiter should always allow to retry")
+	}
+}
+
+func TestHeaders(t *testing.T) {
+	h := Headers(1, time.Hour, 5)
+	t.Logf("h: %v", h)
+	if s := h.Get("X-Rate-Limit"); s != "1" {
+		t.Errorf("Failed to get X-Rate-Limit Header value: %s", s)
+	}
+	if s := h.Get("Retry-After"); s != "5" {
+		t.Errorf("Failed to get Retry-After Header value: %s", s)
+	}
 }

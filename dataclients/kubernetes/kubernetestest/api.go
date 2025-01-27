@@ -3,9 +3,11 @@ package kubernetestest
 import (
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"net/http"
 	"regexp"
+	"strings"
 
 	yaml2 "github.com/ghodss/yaml"
 	"gopkg.in/yaml.v2"
@@ -22,10 +24,12 @@ type TestAPIOptions struct {
 }
 
 type namespace struct {
-	services    []byte
-	ingresses   []byte
-	routeGroups []byte
-	endpoints   []byte
+	services       []byte
+	ingresses      []byte
+	routeGroups    []byte
+	endpoints      []byte
+	endpointslices []byte
+	secrets        []byte
 }
 
 type api struct {
@@ -40,8 +44,9 @@ type api struct {
 func NewAPI(o TestAPIOptions, specs ...io.Reader) (*api, error) {
 	a := &api{
 		namespaces: make(map[string]namespace),
+		// see https://kubernetes.io/docs/reference/using-api/api-concepts/#resource-uris
 		pathRx: regexp.MustCompile(
-			"(/namespaces/([^/]+))?/(services|ingresses|routegroups|endpoints)",
+			"(?:/namespaces/([^/]+))?/(services|ingresses|routegroups|endpointslices|endpoints|secrets)(?:/(.+))?",
 		),
 	}
 
@@ -63,10 +68,41 @@ func NewAPI(o TestAPIOptions, specs ...io.Reader) (*api, error) {
 	namespaces := make(map[string]map[string][]interface{})
 	all := make(map[string][]interface{})
 
+	addObject := func(o map[interface{}]interface{}) error {
+		kind, ok := o["kind"].(string)
+		if !ok {
+			return errInvalidFixture
+		}
+
+		meta, ok := o["metadata"].(map[interface{}]interface{})
+		if !ok {
+			return errInvalidFixture
+		}
+
+		namespace, ok := meta["namespace"]
+		if !ok || namespace == "" {
+			namespace = "default"
+		} else {
+			if _, ok := namespace.(string); !ok {
+				return errInvalidFixture
+			}
+		}
+
+		ns := namespace.(string)
+		if _, ok := namespaces[ns]; !ok {
+			namespaces[ns] = make(map[string][]interface{})
+		}
+
+		namespaces[ns][kind] = append(namespaces[ns][kind], o)
+		all[kind] = append(all[kind], o)
+
+		return nil
+	}
+
 	for _, spec := range specs {
 		d := yaml.NewDecoder(spec)
 		for {
-			var o map[string]interface{}
+			var o map[interface{}]interface{}
 			if err := d.Decode(&o); err == io.EOF || err == nil && len(o) == 0 {
 				break
 			} else if err != nil {
@@ -78,27 +114,25 @@ func NewAPI(o TestAPIOptions, specs ...io.Reader) (*api, error) {
 				return nil, errInvalidFixture
 			}
 
-			meta, ok := o["metadata"].(map[interface{}]interface{})
-			if !ok {
-				return nil, errInvalidFixture
-			}
-
-			namespace, ok := meta["namespace"]
-			if !ok || namespace == "" {
-				namespace = "default"
-			} else {
-				if _, ok := namespace.(string); !ok {
+			if kind == "List" {
+				items, ok := o["items"].([]interface{})
+				if !ok {
 					return nil, errInvalidFixture
 				}
+				for _, item := range items {
+					o, ok := item.(map[interface{}]interface{})
+					if !ok {
+						return nil, errInvalidFixture
+					}
+					if err := addObject(o); err != nil {
+						return nil, err
+					}
+				}
+			} else {
+				if err := addObject(o); err != nil {
+					return nil, err
+				}
 			}
-
-			ns := namespace.(string)
-			if _, ok := namespaces[ns]; !ok {
-				namespaces[ns] = make(map[string][]interface{})
-			}
-
-			namespaces[ns][kind] = append(namespaces[ns][kind], o)
-			all[kind] = append(all[kind], o)
 		}
 	}
 
@@ -146,26 +180,111 @@ func (a *api) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 
 	ns := a.all
-	if parts[2] != "" {
-		ns = a.namespaces[parts[2]]
+	if parts[1] != "" {
+		ns = a.namespaces[parts[1]]
 	}
 
-	var b []byte
-	switch parts[3] {
+	resourceType, name := parts[2], parts[3]
+	switch resourceType {
 	case "services":
-		b = ns.services
+		serve(w, r, ns.services, name)
 	case "ingresses":
-		b = ns.ingresses
+		serve(w, r, ns.ingresses, name)
 	case "routegroups":
-		b = ns.routeGroups
+		serve(w, r, ns.routeGroups, name)
 	case "endpoints":
-		b = ns.endpoints
+		serve(w, r, ns.endpoints, name)
+	case "endpointslices":
+		serve(w, r, ns.endpointslices, name)
+	case "secrets":
+		serve(w, r, ns.secrets, name)
 	default:
+		http.Error(w, fmt.Sprintf("unsupported resource type %s", resourceType), http.StatusBadRequest)
+	}
+}
+
+// Parses an optional parameter with `label selectors` into a map if present or, if not present, returns nil.
+func parseSelectors(r *http.Request) map[string]string {
+	rawSelector := r.URL.Query().Get("labelSelector")
+	if rawSelector == "" {
+		return nil
+	}
+
+	selectors := map[string]string{}
+	for _, selector := range strings.Split(rawSelector, ",") {
+		kv := strings.Split(selector, "=")
+		selectors[kv[0]] = kv[1]
+	}
+
+	return selectors
+}
+
+func serve(w http.ResponseWriter, r *http.Request, resources []byte, name string) {
+	selectors := parseSelectors(r)
+	if name == "" && len(selectors) == 0 {
+		w.Write(resources)
+		return
+	}
+
+	itemsMetadata := struct {
+		Items []struct {
+			Metadata struct {
+				Name   string            `json:"name"`
+				Labels map[string]string `json:"labels"`
+			} `json:"metadata"`
+		} `json:"items"`
+	}{}
+
+	if err := json.Unmarshal(resources, &itemsMetadata); err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+
+	// every resource but top level is deserialized because we need access to the indexed array
+	allItems := struct {
+		Items []interface{} `json:"items"`
+	}{}
+
+	if err := json.Unmarshal(resources, &allItems); err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+
+	// serve named resource if present
+	if name != "" {
+		for idx, item := range itemsMetadata.Items {
+			if item.Metadata.Name == name {
+				if result, err := json.Marshal(allItems.Items[idx]); err != nil {
+					http.Error(w, err.Error(), http.StatusInternalServerError)
+				} else {
+					w.Write(result)
+				}
+				return
+			}
+		}
 		w.WriteHeader(http.StatusNotFound)
 		return
 	}
 
-	w.Write(b)
+	// go over each item's label and check if all selectors with their values are present
+	var filteredItems []interface{}
+	for idx, item := range itemsMetadata.Items {
+		allMatch := true
+		for k, v := range selectors {
+			label, ok := item.Metadata.Labels[k]
+			allMatch = allMatch && ok && label == v
+		}
+		if allMatch {
+			filteredItems = append(filteredItems, allItems.Items[idx])
+		}
+	}
+
+	var result []byte
+	if err := itemsJSON(&result, filteredItems); err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+	} else {
+		w.Write(result)
+	}
 }
 
 func initNamespace(kinds map[string][]interface{}) (ns namespace, err error) {
@@ -182,6 +301,14 @@ func initNamespace(kinds map[string][]interface{}) (ns namespace, err error) {
 	}
 
 	if err = itemsJSON(&ns.endpoints, kinds["Endpoints"]); err != nil {
+		return
+	}
+
+	if err = itemsJSON(&ns.endpointslices, kinds["EndpointSlice"]); err != nil {
+		return
+	}
+
+	if err = itemsJSON(&ns.secrets, kinds["Secret"]); err != nil {
 		return
 	}
 

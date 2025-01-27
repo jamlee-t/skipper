@@ -2,12 +2,15 @@ package net
 
 import (
 	"crypto/tls"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptrace"
 	"net/url"
 	"strings"
+	"sync"
 	"time"
+	"unicode/utf8"
 
 	"github.com/opentracing/opentracing-go"
 	"github.com/opentracing/opentracing-go/ext"
@@ -24,9 +27,9 @@ const (
 // opentracing to the wrapped http.Client with the same interface as
 // http.Client from the stdlib.
 type Client struct {
+	once   sync.Once
 	client http.Client
 	tr     *Transport
-	log    logging.Logger
 	sr     secrets.SecretsReader
 }
 
@@ -58,22 +61,25 @@ func NewClient(o Options) *Client {
 	}
 
 	c := &Client{
+		once: sync.Once{},
 		client: http.Client{
-			Transport: tr,
+			Transport:     tr,
+			CheckRedirect: o.CheckRedirect,
 		},
-		tr:  tr,
-		log: o.Log,
-		sr:  sr,
+		tr: tr,
+		sr: sr,
 	}
 
 	return c
 }
 
 func (c *Client) Close() {
-	c.tr.Close()
-	if c.sr != nil {
-		c.sr.Close()
-	}
+	c.once.Do(func() {
+		c.tr.Close()
+		if c.sr != nil {
+			c.sr.Close()
+		}
+	})
 }
 
 func (c *Client) Head(url string) (*http.Response, error) {
@@ -136,6 +142,8 @@ type Options struct {
 	// Transport see https://golang.org/pkg/net/http/#Transport
 	// In case Transport is not nil, the Transport arguments are used below.
 	Transport *http.Transport
+	// CheckRedirect see https://golang.org/pkg/net/http/#Client
+	CheckRedirect func(req *http.Request, via []*http.Request) error
 	// Proxy see https://golang.org/pkg/net/http/#Transport.Proxy
 	Proxy func(req *http.Request) (*url.URL, error)
 	// DisableKeepAlives see https://golang.org/pkg/net/http/#Transport.DisableKeepAlives
@@ -197,18 +205,25 @@ type Options struct {
 
 	// Log is used for error logging
 	Log logging.Logger
+
+	// BeforeSend is a hook function that runs just before executing RoundTrip(*http.Request)
+	BeforeSend func(*http.Request)
+	// AfterResponse is a hook function that runs just after executing RoundTrip(*http.Request)
+	AfterResponse func(*http.Response, error)
 }
 
 // Transport wraps an http.Transport and adds support for tracing and
 // bearerToken injection.
 type Transport struct {
+	once          sync.Once
 	quit          chan struct{}
-	closed        bool
 	tr            *http.Transport
 	tracer        opentracing.Tracer
 	spanName      string
 	componentName string
 	bearerToken   string
+	beforeSend    func(*http.Request)
+	afterResponse func(*http.Response, error)
 }
 
 // NewTransport creates a wrapped http.Transport, with regular DNS
@@ -265,9 +280,12 @@ func NewTransport(options Options) *Transport {
 	}
 
 	t := &Transport{
-		quit:   make(chan struct{}),
-		tr:     htransport,
-		tracer: options.Tracer,
+		once:          sync.Once{},
+		quit:          make(chan struct{}),
+		tr:            htransport,
+		tracer:        options.Tracer,
+		beforeSend:    options.BeforeSend,
+		afterResponse: options.AfterResponse,
 	}
 
 	if t.tracer != nil {
@@ -280,11 +298,14 @@ func NewTransport(options Options) *Transport {
 	}
 
 	go func() {
+		ticker := time.NewTicker(options.IdleConnTimeout)
+		defer ticker.Stop()
 		for {
 			select {
-			case <-time.After(options.IdleConnTimeout):
+			case <-ticker.C:
 				htransport.CloseIdleConnections()
 			case <-t.quit:
+				htransport.CloseIdleConnections()
 				return
 			}
 		}
@@ -320,15 +341,23 @@ func WithBearerToken(t *Transport, bearerToken string) *Transport {
 }
 
 func (t *Transport) shallowCopy() *Transport {
-	tt := *t
-	return &tt
+	return &Transport{
+		once:          sync.Once{},
+		quit:          t.quit,
+		tr:            t.tr,
+		tracer:        t.tracer,
+		spanName:      t.spanName,
+		componentName: t.componentName,
+		bearerToken:   t.bearerToken,
+		beforeSend:    t.beforeSend,
+		afterResponse: t.afterResponse,
+	}
 }
 
 func (t *Transport) Close() {
-	if !t.closed {
-		t.closed = true
+	t.once.Do(func() {
 		close(t.quit)
-	}
+	})
 }
 
 func (t *Transport) CloseIdleConnections() {
@@ -349,7 +378,13 @@ func (t *Transport) RoundTrip(req *http.Request) (*http.Response, error) {
 	if t.bearerToken != "" {
 		req.Header.Set("Authorization", "Bearer "+t.bearerToken)
 	}
+	if t.beforeSend != nil {
+		t.beforeSend(req)
+	}
 	rsp, err := t.tr.RoundTrip(req)
+	if t.afterResponse != nil {
+		t.afterResponse(rsp, err)
+	}
 	if span != nil {
 		span.LogKV("http_do", "stop")
 		if rsp != nil {
@@ -361,20 +396,17 @@ func (t *Transport) RoundTrip(req *http.Request) (*http.Response, error) {
 }
 
 func (t *Transport) injectSpan(req *http.Request) (*http.Request, opentracing.Span) {
-	parentSpan := opentracing.SpanFromContext(req.Context())
-	var span opentracing.Span
-	if parentSpan != nil {
-		req = req.WithContext(opentracing.ContextWithSpan(req.Context(), parentSpan))
-		span = t.tracer.StartSpan(t.spanName, opentracing.ChildOf(parentSpan.Context()))
-	} else {
-		span = t.tracer.StartSpan(t.spanName)
+	spanOpts := []opentracing.StartSpanOption{opentracing.Tags{
+		string(ext.Component):  t.componentName,
+		string(ext.SpanKind):   "client",
+		string(ext.HTTPMethod): req.Method,
+		string(ext.HTTPUrl):    req.URL.String(),
+	}}
+	if parentSpan := opentracing.SpanFromContext(req.Context()); parentSpan != nil {
+		spanOpts = append(spanOpts, opentracing.ChildOf(parentSpan.Context()))
 	}
-
-	// add Tags
-	ext.Component.Set(span, t.componentName)
-	ext.HTTPUrl.Set(span, req.URL.String())
-	ext.HTTPMethod.Set(span, req.Method)
-	ext.SpanKind.Set(span, "client")
+	span := t.tracer.StartSpan(t.spanName, spanOpts...)
+	req = req.WithContext(opentracing.ContextWithSpan(req.Context(), span))
 
 	_ = t.tracer.Inject(span.Context(), opentracing.HTTPHeaders, opentracing.HTTPHeadersCarrier(req.Header))
 
@@ -412,7 +444,7 @@ func injectClientTrace(req *http.Request, span opentracing.Span) *http.Request {
 		},
 		WroteRequest: func(wri httptrace.WroteRequestInfo) {
 			if wri.Err != nil {
-				span.LogKV("wrote_request", wri.Err.Error())
+				span.LogKV("wrote_request", ensureUTF8(wri.Err.Error()))
 			} else {
 				span.LogKV("wrote_request", "done")
 			}
@@ -422,4 +454,11 @@ func injectClientTrace(req *http.Request, span opentracing.Span) *http.Request {
 		},
 	}
 	return req.WithContext(httptrace.WithClientTrace(req.Context(), trace))
+}
+
+func ensureUTF8(s string) string {
+	if utf8.ValidString(s) {
+		return s
+	}
+	return fmt.Sprintf("invalid utf-8: %q", s)
 }

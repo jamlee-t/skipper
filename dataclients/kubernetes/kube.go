@@ -7,22 +7,26 @@ import (
 	"os"
 	"regexp"
 	"strings"
+	"sync"
 	"text/template"
 	"time"
 
 	log "github.com/sirupsen/logrus"
 	"github.com/zalando/skipper/eskip"
 	"github.com/zalando/skipper/filters"
+	"github.com/zalando/skipper/loadbalancer"
+	"github.com/zalando/skipper/secrets/certregistry"
 )
 
+const DefaultLoadBalancerAlgorithm = "roundRobin"
+
 const (
-	defaultIngressClass          = "skipper"
-	defaultRouteGroupClass       = "skipper"
-	serviceHostEnvVar            = "KUBERNETES_SERVICE_HOST"
-	servicePortEnvVar            = "KUBERNETES_SERVICE_PORT"
-	httpRedirectRouteID          = "kube__redirect"
-	defaultLoadBalancerAlgorithm = "roundRobin"
-	defaultEastWestDomain        = "skipper.cluster.local"
+	defaultIngressClass    = "skipper"
+	defaultRouteGroupClass = "skipper"
+	serviceHostEnvVar      = "KUBERNETES_SERVICE_HOST"
+	servicePortEnvVar      = "KUBERNETES_SERVICE_PORT"
+	httpRedirectRouteID    = "kube__redirect"
+	defaultEastWestDomain  = "skipper.cluster.local"
 )
 
 // PathMode values are used to control the ingress path interpretation. The path mode can
@@ -82,14 +86,18 @@ type Options struct {
 	// environment variables.)
 	KubernetesURL string
 
+	// TokenFile configures path to the token file.
+	// Defaults to /var/run/secrets/kubernetes.io/serviceaccount/token when running in-cluster.
+	TokenFile string
+
 	// KubernetesNamespace is used to switch between finding ingresses in the cluster-scope or limit
 	// the ingresses to only those in the specified namespace. Defaults to "" which means monitor ingresses
 	// in the cluster-scope.
 	KubernetesNamespace string
 
-	// KubernetesIngressV1 is used to switch between v1beta1 and v1. Kubernetes version 1.22 stopped support
-	// for v1beta1, so we have to provide a migration path and this will someday become the default.
-	KubernetesIngressV1 bool
+	// KubernetesEnableEndpointslices if set skipper will fetch
+	// endpointslices instead of endpoints to scale more than 1000 pods within a service
+	KubernetesEnableEndpointslices bool
 
 	// *DEPRECATED* KubernetesEnableEastWest if set adds automatically routes
 	// with "%s.%s.skipper.cluster.local" domain pattern
@@ -118,6 +126,9 @@ type Options struct {
 	// By default, 308 StatusPermanentRedirect is used.
 	HTTPSRedirectCode int
 
+	// DisableCatchAllRoutes, when set, tells the data client to not create catchall routes.
+	DisableCatchAllRoutes bool
+
 	// IngressClass is a regular expression to filter only those ingresses that match. If an ingress does
 	// not have a class annotation or the annotation is an empty string, skipper will load it. The default
 	// value for the ingress class is 'skipper'.
@@ -130,6 +141,42 @@ type Options struct {
 	// does not have the required annotation (zalando.org/routegroup.class) or the annotation is an empty string,
 	// skipper will load it. The default value for the RouteGroup class is 'skipper'.
 	RouteGroupClass string
+
+	// IngressLabelSelectors is a map of kubernetes labels to their values that must be present on a resource to be loaded
+	// by the client. A label and its value on an Ingress must be match exactly to be loaded by Skipper.
+	// If the value is irrelevant for a given configuration, it can be left empty. The default
+	// value is no labels required.
+	// Examples:
+	//  Config [] will load all Ingresses.
+	// 	Config ["skipper-enabled": ""] will load only Ingresses with a label "skipper-enabled", no matter the value.
+	// 	Config ["skipper-enabled": "true"] will load only Ingresses with a label "skipper-enabled: true"
+	// 	Config ["skipper-enabled": "", "foo": "bar"] will load only Ingresses with both labels while label "foo" must have a value "bar".
+	IngressLabelSelectors map[string]string
+
+	// ServicesLabelSelectors is a map of kubernetes labels to their values that must be present on a resource to be loaded
+	// by the client. Read documentation for IngressLabelSelectors for examples and more details.
+	// The default value is no labels required.
+	ServicesLabelSelectors map[string]string
+
+	// EndpointsLabelSelectors is a map of kubernetes labels to their values that must be present on a resource to be loaded
+	// by the client. Read documentation for IngressLabelSelectors for examples and more details.
+	// The default value is no labels required.
+	EndpointsLabelSelectors map[string]string
+
+	// EndpointSlicesLabelSelectors is a map of kubernetes labels to their values that must be present on a resource to be loaded
+	// by the client. Read documentation for IngressLabelSelectors for examples and more details.
+	// The default value is no labels required.
+	EndpointSlicesLabelSelectors map[string]string
+
+	// SecretsLabelSelectors is a map of kubernetes labels to their values that must be present on a resource to be loaded
+	// by the client. Read documentation for IngressLabelSelectors for examples and more details.
+	// The default value is no labels required.
+	SecretsLabelSelectors map[string]string
+
+	// RouteGroupsLabelSelectors is a map of kubernetes labels to their values that must be present on a resource to be loaded
+	// by the client. Read documentation for IngressLabelSelectors for examples and more details.
+	// The default value is no labels required.
+	RouteGroupsLabelSelectors map[string]string
 
 	// ReverseSourcePredicate set to true will do the Source IP
 	// whitelisting for the heartbeat endpoint correctly in AWS.
@@ -161,6 +208,20 @@ type Options struct {
 	// appended to routes identified as to KubernetesEastWestRangeDomains.
 	KubernetesEastWestRangePredicates []*eskip.Predicate
 
+	// KubernetesEastWestRangeAnnotationPredicates same as KubernetesAnnotationPredicates but will append to
+	// routes that has KubernetesEastWestRangeDomains suffix.
+	KubernetesEastWestRangeAnnotationPredicates []AnnotationPredicates
+
+	// KubernetesEastWestRangeAnnotationFiltersAppend same as KubernetesAnnotationFiltersAppend but will append to
+	// routes that has KubernetesEastWestRangeDomains suffix.
+	KubernetesEastWestRangeAnnotationFiltersAppend []AnnotationFilters
+
+	// KubernetesAnnotationPredicates sets predicates to append for each annotation key and value
+	KubernetesAnnotationPredicates []AnnotationPredicates
+
+	// KubernetesAnnotationFiltersAppend sets filters to append for each annotation key and value
+	KubernetesAnnotationFiltersAppend []AnnotationFilters
+
 	// DefaultFiltersDir enables default filters mechanism and sets the location of the default filters.
 	// The provided filters are then applied to all routes.
 	DefaultFiltersDir string
@@ -173,17 +234,31 @@ type Options struct {
 	BackendNameTracingTag bool
 
 	// OnlyAllowedExternalNames will enable validation of ingress external names and route groups network
-	// backend addresses, explicit LB endpoints validation agains the list of patterns in
+	// backend addresses, explicit LB endpoints validation against the list of patterns in
 	// AllowedExternalNames.
 	OnlyAllowedExternalNames bool
 
 	// AllowedExternalNames contains regexp patterns of those domain names that are allowed to be
 	// used with external name services (type=ExternalName).
 	AllowedExternalNames []*regexp.Regexp
+
+	CertificateRegistry *certregistry.CertRegistry
+
+	// ForceKubernetesService overrides the default Skipper functionality to route traffic using
+	// Kubernetes Endpoint, instead using Kubernetes Services.
+	ForceKubernetesService bool
+
+	// BackendTrafficAlgorithm specifies the algorithm to calculate the backend traffic.
+	BackendTrafficAlgorithm BackendTrafficAlgorithm
+
+	// DefaultLoadBalancerAlgorithm sets the default algorithm to be used for load balancing between backend endpoints,
+	// available options: roundRobin, consistentHash, random, powerOfRandomNChoices
+	DefaultLoadBalancerAlgorithm string
 }
 
 // Client is a Skipper DataClient implementation used to create routes based on Kubernetes Ingress settings.
 type Client struct {
+	mu                     sync.Mutex
 	ClusterClient          *clusterClient
 	ingress                *ingress
 	routeGroups            *routeGroups
@@ -194,6 +269,9 @@ type Client struct {
 	current                map[string]*eskip.Route
 	quit                   chan struct{}
 	defaultFiltersDir      string
+	state                  *clusterState
+	loggingInterval        time.Duration
+	loggingLastEnabled     time.Time
 }
 
 // New creates and initializes a Kubernetes DataClient.
@@ -253,6 +331,10 @@ func New(o Options) (*Client, error) {
 		o.AllowedExternalNames = []*regexp.Regexp{regexp.MustCompile(".*")}
 	}
 
+	if algo, err := loadbalancer.AlgorithmFromString(o.DefaultLoadBalancerAlgorithm); err != nil || algo == loadbalancer.None {
+		o.DefaultLoadBalancerAlgorithm = DefaultLoadBalancerAlgorithm
+	}
+
 	ing := newIngress(o)
 	rg := newRouteGroups(o)
 
@@ -267,6 +349,7 @@ func New(o Options) (*Client, error) {
 		reverseSourcePredicate: o.ReverseSourcePredicate,
 		quit:                   quit,
 		defaultFiltersDir:      o.DefaultFiltersDir,
+		loggingInterval:        1 * time.Minute,
 	}, nil
 }
 
@@ -314,29 +397,46 @@ func ParsePathMode(s string) (PathMode, error) {
 	}
 }
 
-func mapRoutes(r []*eskip.Route) map[string]*eskip.Route {
-	m := make(map[string]*eskip.Route)
-	for _, ri := range r {
-		m[ri.Id] = ri
+func mapRoutes(routes []*eskip.Route) (map[string]*eskip.Route, []*eskip.Route) {
+	var uniqueRoutes []*eskip.Route
+	routesById := make(map[string]*eskip.Route)
+	for _, route := range routes {
+		if existing, ok := routesById[route.Id]; ok {
+			existingEskip, routeEskip := existing.String(), route.String()
+			if existingEskip != routeEskip {
+				log.Errorf("Ignoring route with the same id %s, existing: %s, ignored: %s", route.Id, existingEskip, routeEskip)
+			}
+		} else {
+			routesById[route.Id] = route
+			uniqueRoutes = append(uniqueRoutes, route)
+		}
 	}
-
-	return m
+	return routesById, uniqueRoutes
 }
 
 func (c *Client) loadAndConvert() ([]*eskip.Route, error) {
+	c.mu.Lock()
 	state, err := c.ClusterClient.fetchClusterState()
 	if err != nil {
+		c.mu.Unlock()
 		return nil, err
 	}
+	c.state = state
+
+	loggingEnabled := log.GetLevel() >= log.DebugLevel || time.Since(c.loggingLastEnabled) >= c.loggingInterval
+	if loggingEnabled {
+		c.loggingLastEnabled = time.Now()
+	}
+	c.mu.Unlock()
 
 	defaultFilters := c.fetchDefaultFilterConfigs()
 
-	ri, err := c.ingress.convert(state, defaultFilters)
+	ri, err := c.ingress.convert(state, defaultFilters, c.ClusterClient.certificateRegistry, loggingEnabled)
 	if err != nil {
 		return nil, err
 	}
 
-	rg, err := c.routeGroups.convert(state, defaultFilters)
+	rg, err := c.routeGroups.convert(state, defaultFilters, loggingEnabled, c.ClusterClient.certificateRegistry)
 	if err != nil {
 		return nil, err
 	}
@@ -354,6 +454,8 @@ func (c *Client) loadAndConvert() ([]*eskip.Route, error) {
 	return r, nil
 }
 
+// shuntRoute creates a route that returns a 502 status code when there are no endpoints found,
+// see https://github.com/zalando/skipper/issues/1525
 func shuntRoute(r *eskip.Route) {
 	r.Filters = []*eskip.Filter{
 		{
@@ -414,8 +516,9 @@ func (c *Client) LoadAll() ([]*eskip.Route, error) {
 		return nil, fmt.Errorf("failed to load cluster state: %w", err)
 	}
 
-	c.current = mapRoutes(r)
-	log.Debugf("all routes loaded and mapped")
+	c.current, r = mapRoutes(r)
+
+	log.Debugf("all routes loaded and mapped: %d", len(r))
 
 	return r, nil
 }
@@ -432,7 +535,7 @@ func (c *Client) LoadUpdate() ([]*eskip.Route, []string, error) {
 		return nil, nil, err
 	}
 
-	next := mapRoutes(r)
+	next, _ := mapRoutes(r)
 	log.Debugf("next version of routes loaded and mapped")
 
 	var (
@@ -483,4 +586,49 @@ func (c *Client) fetchDefaultFilterConfigs() defaultFilters {
 
 	log.WithField("#configs", len(filters)).Debug("default filter configurations loaded")
 	return filters
+}
+
+// GetEndpointAddresses returns the list of all addresses for the given service
+// loaded by previous call to LoadAll or LoadUpdate.
+func (c *Client) GetEndpointAddresses(ns, name string) []string {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.state == nil {
+		return nil
+	}
+	return c.state.getEndpointAddresses(ns, name)
+}
+
+// LoadEndpointAddresses returns the list of all addresses for the given service.
+func (c *Client) LoadEndpointAddresses(namespace, name string) ([]string, error) {
+	return c.ClusterClient.loadEndpointAddresses(namespace, name)
+}
+
+func compareStringList(a, b []string) []string {
+	c := make([]string, 0)
+	for i := len(a) - 1; i >= 0; i-- {
+		for _, vD := range b {
+			if a[i] == vD {
+				c = append(c, vD)
+				break
+			}
+		}
+	}
+	return c
+}
+
+// addTLSCertToRegistry adds a TLS certificate to the certificate registry per host using the provided
+// Kubernetes TLS secret
+func addTLSCertToRegistry(cr *certregistry.CertRegistry, logger *logger, hosts []string, secret *secret) {
+	cert, err := generateTLSCertFromSecret(secret)
+	if err != nil {
+		logger.Errorf("Failed to generate TLS certificate from secret: %v", err)
+		return
+	}
+	for _, host := range hosts {
+		err := cr.ConfigureCertificate(host, cert)
+		if err != nil {
+			logger.Errorf("Failed to configure certificate: %v", err)
+		}
+	}
 }

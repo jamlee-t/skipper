@@ -12,6 +12,7 @@ import (
 	"github.com/zalando/skipper/predicates/source"
 	teePredicate "github.com/zalando/skipper/predicates/tee"
 	"github.com/zalando/skipper/predicates/traffic"
+	"github.com/zalando/skipper/proxy"
 	"github.com/zalando/skipper/proxy/backendtest"
 	"github.com/zalando/skipper/proxy/proxytest"
 	"github.com/zalando/skipper/routing"
@@ -43,7 +44,7 @@ func TestLoopbackAndMatchPredicate(t *testing.T) {
 	split := backendtest.NewBackendRecorder(listenFor)
 	shadow := backendtest.NewBackendRecorder(listenFor)
 
-	routes, _ := eskip.Parse(fmt.Sprintf(routeDoc, original.GetURL(), split.GetURL(), shadow.GetURL()))
+	routes := eskip.MustParse(fmt.Sprintf(routeDoc, original.GetURL(), split.GetURL(), shadow.GetURL()))
 	registry := make(filters.Registry)
 	registry.Register(NewTeeLoopback())
 	p := proxytest.WithRoutingOptions(registry, routing.Options{
@@ -52,6 +53,8 @@ func TestLoopbackAndMatchPredicate(t *testing.T) {
 			traffic.New(),
 		},
 	}, routes...)
+	defer p.Close()
+
 	_, err := http.Get(p.URL + "/foo")
 	if err != nil {
 		t.Error("teeloopback: failed to execute the request.", err)
@@ -73,18 +76,29 @@ func TestOriginalBackendServeEvenWhenShadowDoesNotReply(t *testing.T) {
 	`
 	original := backendtest.NewBackendRecorder(listenFor)
 	split := backendtest.NewBackendRecorder(listenFor)
+
+	const responseTimeout = 2 * time.Second
 	shadow := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		time.Sleep(time.Second * 120)
+		time.Sleep(2 * responseTimeout)
 	}))
-	routes, _ := eskip.Parse(fmt.Sprintf(routeDoc, split.GetURL(), split.GetURL(), shadow.URL))
+	defer shadow.Close()
+
+	routes := eskip.MustParse(fmt.Sprintf(routeDoc, split.GetURL(), split.GetURL(), shadow.URL))
 	registry := make(filters.Registry)
 	registry.Register(NewTeeLoopback())
-	p := proxytest.WithRoutingOptions(registry, routing.Options{
-		Predicates: []routing.PredicateSpec{
-			teePredicate.New(),
-			traffic.New(),
+	p := proxytest.WithParamsAndRoutingOptions(registry,
+		proxy.Params{
+			ResponseHeaderTimeout: responseTimeout,
+			CloseIdleConnsPeriod:  -time.Second,
 		},
-	}, routes...)
+		routing.Options{
+			Predicates: []routing.PredicateSpec{
+				teePredicate.New(),
+				traffic.New(),
+			},
+		}, routes...)
+	defer p.Close()
+
 	_, err := http.Get(p.URL + "/foo")
 	if err != nil {
 		t.Error("teeloopback: failed to execute the request.", err)
@@ -107,7 +121,7 @@ func TestOriginalBackendServeEvenWhenShadowIsDown(t *testing.T) {
 		shadow: Path("/foo") && Traffic(1) && Tee("A") -> "%v";
 	`
 	split := backendtest.NewBackendRecorder(listenFor)
-	routes, _ := eskip.Parse(fmt.Sprintf(routeDoc, split.GetURL(), split.GetURL(), "http://fakeurl"))
+	routes := eskip.MustParse(fmt.Sprintf(routeDoc, split.GetURL(), split.GetURL(), "http://fakeurl"))
 	registry := make(filters.Registry)
 	registry.Register(NewTeeLoopback())
 	p := proxytest.WithRoutingOptions(registry, routing.Options{
@@ -116,6 +130,8 @@ func TestOriginalBackendServeEvenWhenShadowIsDown(t *testing.T) {
 			traffic.New(),
 		},
 	}, routes...)
+	defer p.Close()
+
 	_, err := http.Get(p.URL + "/foo")
 	if err != nil {
 		t.Error("teeloopback: failed to execute the request.", err)
@@ -135,7 +151,7 @@ func TestInfiniteLoopback(t *testing.T) {
 	split := backendtest.NewBackendRecorder(listenFor)
 	shadow := backendtest.NewBackendRecorder(listenFor)
 
-	routes, _ := eskip.Parse(fmt.Sprintf(routeDoc, split.GetURL(), shadow.GetURL()))
+	routes := eskip.MustParse(fmt.Sprintf(routeDoc, split.GetURL(), shadow.GetURL()))
 	registry := make(filters.Registry)
 	registry.Register(NewTeeLoopback())
 	p := proxytest.WithRoutingOptions(registry, routing.Options{
@@ -143,6 +159,8 @@ func TestInfiniteLoopback(t *testing.T) {
 			teePredicate.New(),
 		},
 	}, routes...)
+	defer p.Close()
+
 	_, err := http.Get(p.URL + "/foo")
 	if err != nil {
 		t.Error("teeloopback: failed to execute the request.", err)
@@ -164,10 +182,7 @@ func TestLoopbackWithClientIP(t *testing.T) {
 	shadow := backendtest.NewBackendRecorder(listenFor)
 
 	routeDoc := fmt.Sprintf(routeFmt, split.GetURL(), shadow.GetURL())
-	routes, err := eskip.Parse(routeDoc)
-	if err != nil {
-		t.Fatal(err)
-	}
+	routes := eskip.MustParse(routeDoc)
 
 	filterRegistry := make(filters.Registry)
 	filterRegistry.Register(NewTeeLoopback())
@@ -177,6 +192,7 @@ func TestLoopbackWithClientIP(t *testing.T) {
 			source.NewClientIP(),
 		},
 	}, routes...)
+	defer p.Close()
 
 	rsp, err := http.Get(p.URL + "/foo")
 	if err != nil {

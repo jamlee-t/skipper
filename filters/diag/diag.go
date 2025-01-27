@@ -8,6 +8,8 @@ additional filter, randomContent, can be used to generate response with random t
 package diag
 
 import (
+	"bytes"
+	"encoding/hex"
 	"fmt"
 	"io"
 	"math/rand"
@@ -52,20 +54,37 @@ const (
 )
 
 type random struct {
-	mx   sync.Mutex
+	mu   sync.Mutex
 	rand *rand.Rand
 	len  int64
 }
 
-type repeat struct {
-	bytes []byte
-	len   int64
-}
+type (
+	repeatSpec struct {
+		hex bool
+	}
+	repeat struct {
+		bytes []byte
+		len   int64
+	}
+	repeatReader struct {
+		bytes  []byte
+		offset int
+	}
+)
 
-type repeatReader struct {
-	bytes  []byte
-	offset int
-}
+type (
+	wrapSpec struct {
+		hex bool
+	}
+	wrap struct {
+		prefix, suffix []byte
+	}
+	wrapReadCloser struct {
+		io.Reader
+		io.Closer
+	}
+)
 
 type throttle struct {
 	typ       throttleType
@@ -86,6 +105,7 @@ type jitter struct {
 	mean  time.Duration
 	delta time.Duration
 	typ   distribution
+	sleep func(time.Duration)
 }
 
 var randomChars = []byte("ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789")
@@ -99,8 +119,7 @@ func kbps2bpms(kbps float64) float64 {
 // the byte length of the random response to be generated as an argument.
 // Eskip example:
 //
-// 	* -> randomContent(2048) -> <shunt>;
-//
+//	r: * -> randomContent(2048) -> <shunt>;
 func NewRandom() filters.Spec { return &random{} }
 
 // NewRepeat creates a filter specification whose filter instances can be used
@@ -108,82 +127,94 @@ func NewRandom() filters.Spec { return &random{} }
 // the byte length of the response body to be generated as arguments.
 // Eskip example:
 //
-// 	* -> repeatContent("x", 100) -> <shunt>;
+//	r: * -> repeatContent("x", 100) -> <shunt>;
+func NewRepeat() filters.Spec { return &repeatSpec{hex: false} }
+
+// NewRepeatHex creates a filter specification whose filter instances can be used
+// to respond to requests with a repeated bytes.
+// It expects the bytes represented by the hexadecimal string of an even length and
+// the byte length of the response body to be generated as arguments.
+// Eskip example:
 //
-func NewRepeat() filters.Spec { return &repeat{} }
+//	r: * -> repeatContentHex("0123456789abcdef", 16) -> <shunt>;
+func NewRepeatHex() filters.Spec { return &repeatSpec{hex: true} }
+
+// NewWrap creates a filter specification whose filter instances can be used
+// to add prefix and suffix to the response.
+// Eskip example:
+//
+//	r: * -> wrapContent("foo", "baz") -> inlineContent("bar") -> <shunt>;
+func NewWrap() filters.Spec { return &wrapSpec{hex: false} }
+
+// NewWrapHex creates a filter specification whose filter instances can be used
+// to add prefix and suffix represented by the hexadecimal strings of an even length to the response.
+// Eskip example:
+//
+//	r: * -> wrapContentHex("68657861", "6d616c") -> inlineContent("deci") -> <shunt>;
+func NewWrapHex() filters.Spec { return &wrapSpec{hex: true} }
 
 // NewLatency creates a filter specification whose filter instances can be used
 // to add additional latency to responses. It expects the latency in milliseconds
 // as an argument. It always adds this value in addition to the natural latency,
 // and does not do any adjustments. Eskip example:
 //
-// 	* -> latency(120) -> "https://www.example.org";
-//
+//	r: * -> latency(120) -> "https://www.example.org";
 func NewLatency() filters.Spec { return &throttle{typ: latency} }
 
 // NewBandwidth creates a filter specification whose filter instances can be used
 // to maximize the bandwidth of the responses. It expects the bandwidth in
 // kbyte/sec as an argument.
 //
-// 	* -> bandwidth(30) -> "https://www.example.org";
-//
+//	r: * -> bandwidth(30) -> "https://www.example.org";
 func NewBandwidth() filters.Spec { return &throttle{typ: bandwidth} }
 
 // NewChunks creates a filter specification whose filter instances can be used
 // set artificial delays in between response chunks. It expects the byte length
 // of the chunks and the delay milliseconds.
 //
-// 	* -> chunks(1024, "120ms") -> "https://www.example.org";
-//
+//	r: * -> chunks(1024, "120ms") -> "https://www.example.org";
 func NewChunks() filters.Spec { return &throttle{typ: chunks} }
 
 // NewBackendLatency is the equivalent of NewLatency but for outgoing backend
 // requests. Eskip example:
 //
-// 	* -> backendLatency(120) -> "https://www.example.org";
-//
+//	r: * -> backendLatency(120) -> "https://www.example.org";
 func NewBackendLatency() filters.Spec { return &throttle{typ: backendLatency} }
 
 // NewBackendBandwidth is the equivalent of NewBandwidth but for outgoing backend
 // requests. Eskip example:
 //
-// 	* -> backendBandwidth(30) -> "https://www.example.org";
-//
+//	r: * -> backendBandwidth(30) -> "https://www.example.org";
 func NewBackendBandwidth() filters.Spec { return &throttle{typ: backendBandwidth} }
 
 // NewBackendChunks is the equivalent of NewChunks but for outgoing backend
 // requests. Eskip example:
 //
-// 	* -> backendChunks(1024, 120) -> "https://www.example.org";
-//
+//	r: * -> backendChunks(1024, 120) -> "https://www.example.org";
 func NewBackendChunks() filters.Spec { return &throttle{typ: backendChunks} }
 
 // NewUniformRequestLatency creates a latency for requests with uniform
 // distribution. Example delay around 1s with +/-120ms.
 //
-// 	* -> uniformRequestLatency("1s", "120ms") -> "https://www.example.org";
-//
+//	r: * -> uniformRequestLatency("1s", "120ms") -> "https://www.example.org";
 func NewUniformRequestLatency() filters.Spec { return &jitter{typ: uniformRequestDistribution} }
 
 // NewNormalRequestLatency creates a latency for requests with normal
 // distribution. Example delay around 1s with +/-120ms.
 //
-// 	* -> normalRequestLatency("1s", "120ms") -> "https://www.example.org";
-//
+//	r: * -> normalRequestLatency("1s", "120ms") -> "https://www.example.org";
 func NewNormalRequestLatency() filters.Spec { return &jitter{typ: normalRequestDistribution} }
 
 // NewUniformResponseLatency creates a latency for responses with uniform
 // distribution. Example delay around 1s with +/-120ms.
 //
-// 	* -> uniformRequestLatency("1s", "120ms") -> "https://www.example.org";
-//
+//	r: * -> uniformRequestLatency("1s", "120ms") -> "https://www.example.org";
 func NewUniformResponseLatency() filters.Spec { return &jitter{typ: uniformResponseDistribution} }
 
 // NewNormalResponseLatency creates a latency for responses with normal
 // distribution. Example delay around 1s with +/-120ms.
 //
-// 	* -> normalRequestLatency("1s", "120ms") -> "https://www.example.org";
-//
+//	r: * -> normalRequestLatency("1s", "120ms") -> "https://www.example.org";
 func NewNormalResponseLatency() filters.Spec { return &jitter{typ: normalResponseDistribution} }
 
 func (r *random) Name() string { return filters.RandomContentName }
@@ -201,8 +232,8 @@ func (r *random) CreateFilter(args []interface{}) (filters.Filter, error) {
 }
 
 func (r *random) Read(p []byte) (int, error) {
-	r.mx.Lock()
-	defer r.mx.Unlock()
+	r.mu.Lock()
+	defer r.mu.Unlock()
 	for i := 0; i < len(p); i++ {
 		p[i] = randomChars[r.rand.Intn(len(randomChars))]
 	}
@@ -218,9 +249,15 @@ func (r *random) Request(ctx filters.FilterContext) {
 
 func (r *random) Response(ctx filters.FilterContext) {}
 
-func (r *repeat) Name() string { return filters.RepeatContentName }
+func (r *repeatSpec) Name() string {
+	if r.hex {
+		return filters.RepeatContentHexName
+	} else {
+		return filters.RepeatContentName
+	}
+}
 
-func (r *repeat) CreateFilter(args []interface{}) (filters.Filter, error) {
+func (r *repeatSpec) CreateFilter(args []interface{}) (filters.Filter, error) {
 	if len(args) != 2 {
 		return nil, filters.ErrInvalidFilterParameters
 	}
@@ -230,22 +267,32 @@ func (r *repeat) CreateFilter(args []interface{}) (filters.Filter, error) {
 		return nil, filters.ErrInvalidFilterParameters
 	}
 
-	var len int64
+	f := &repeat{}
+	if r.hex {
+		var err error
+		f.bytes, err = hex.DecodeString(text)
+		if err != nil {
+			return nil, err
+		}
+	} else {
+		f.bytes = []byte(text)
+	}
+
 	switch v := args[1].(type) {
 	case float64:
-		len = int64(v)
+		f.len = int64(v)
 	case int:
-		len = int64(v)
+		f.len = int64(v)
 	case int64:
-		len = v
+		f.len = v
 	default:
 		return nil, filters.ErrInvalidFilterParameters
 	}
-	if len < 0 {
+	if f.len < 0 {
 		return nil, filters.ErrInvalidFilterParameters
 	}
 
-	return &repeat{[]byte(text), len}, nil
+	return f, nil
 }
 
 func (r *repeat) Request(ctx filters.FilterContext) {
@@ -270,6 +317,74 @@ func (r *repeatReader) Read(p []byte) (int, error) {
 }
 
 func (r *repeat) Response(ctx filters.FilterContext) {}
+
+func (w *wrapSpec) Name() string {
+	if w.hex {
+		return filters.WrapContentHexName
+	} else {
+		return filters.WrapContentName
+	}
+}
+
+func (w *wrapSpec) CreateFilter(args []interface{}) (filters.Filter, error) {
+	if len(args) != 2 {
+		return nil, filters.ErrInvalidFilterParameters
+	}
+
+	prefix, ok := args[0].(string)
+	if !ok {
+		return nil, filters.ErrInvalidFilterParameters
+	}
+
+	suffix, ok := args[1].(string)
+	if !ok {
+		return nil, filters.ErrInvalidFilterParameters
+	}
+
+	f := &wrap{}
+	if w.hex {
+		var err error
+		f.prefix, err = hex.DecodeString(prefix)
+		if err != nil {
+			return nil, err
+		}
+		f.suffix, err = hex.DecodeString(suffix)
+		if err != nil {
+			return nil, err
+		}
+	} else {
+		f.prefix = []byte(prefix)
+		f.suffix = []byte(suffix)
+	}
+
+	return f, nil
+}
+
+func (w *wrap) Request(ctx filters.FilterContext) {}
+
+func (w *wrap) Response(ctx filters.FilterContext) {
+	rsp := ctx.Response()
+
+	if s := rsp.Header.Get("Content-Length"); s != "" {
+		if n, err := strconv.ParseInt(s, 10, 64); err == nil {
+			n += int64(len(w.prefix) + len(w.suffix))
+			rsp.Header["Content-Length"] = []string{strconv.FormatInt(n, 10)}
+		}
+	}
+
+	if rsp.ContentLength != -1 {
+		rsp.ContentLength += int64(len(w.prefix) + len(w.suffix))
+	}
+
+	rsp.Body = &wrapReadCloser{
+		Reader: io.MultiReader(
+			bytes.NewReader(w.prefix),
+			rsp.Body,
+			bytes.NewReader(w.suffix),
+		),
+		Closer: rsp.Body,
+	}
+}
 
 func (t *throttle) Name() string {
 	switch t.typ {
@@ -505,6 +620,7 @@ func (j *jitter) CreateFilter(args []interface{}) (filters.Filter, error) {
 		typ:   j.typ,
 		mean:  mean,
 		delta: delta,
+		sleep: time.Sleep,
 	}, nil
 }
 
@@ -521,7 +637,7 @@ func (j *jitter) Request(filters.FilterContext) {
 		return
 	}
 	f := r * float64(j.delta)
-	time.Sleep(j.mean + time.Duration(int64(f)))
+	j.sleep(j.mean + time.Duration(int64(f)))
 }
 
 func (j *jitter) Response(filters.FilterContext) {
@@ -537,5 +653,5 @@ func (j *jitter) Response(filters.FilterContext) {
 		return
 	}
 	f := r * float64(j.delta)
-	time.Sleep(j.mean + time.Duration(int64(f)))
+	j.sleep(j.mean + time.Duration(int64(f)))
 }

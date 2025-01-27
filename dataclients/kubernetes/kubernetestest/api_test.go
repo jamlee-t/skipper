@@ -7,8 +7,11 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"os"
 	"testing"
 
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 	"github.com/zalando/skipper/dataclients/kubernetes"
 )
 
@@ -29,7 +32,7 @@ spec:
     application: foo
   type: ClusterIP
 ---
-apiVersion: extensions/v1beta1
+apiVersion: networking.k8s.io/v1
 kind: Ingress
 metadata:
   labels:
@@ -42,8 +45,10 @@ spec:
     http:
       paths:
       - backend:
-          serviceName: foo
-          servicePort: main
+          service:
+            name: foo
+            port:
+              name: main
 ---
 apiVersion: v1
 kind: Endpoints
@@ -60,6 +65,26 @@ subsets:
   - name: main
     port: 7272
     protocol: TCP
+---
+apiVersion: v1
+kind: EndpointSlice
+metadata:
+  labels:
+    application: foo
+  name: foo-braj
+  namespace: default
+endpoints:
+- addresses:
+  - 10.0.0.0
+  conditions:
+    ready: true
+    serving: true
+    terminating: false
+  zone: eu-central-1a
+ports:
+- name: main
+  port: 7272
+  protocol: TCP
 ---
 `
 
@@ -113,6 +138,38 @@ subsets:
   - name: main
     port: 7878
     protocol: TCP
+---
+apiVersion: v1
+kind: EndpointSlice
+metadata:
+  labels:
+    application: bar
+  name: bar-kaiw
+  namespace: internal
+endpoints:
+- addresses:
+  - 10.0.0.2
+  conditions:
+    ready: true
+    serving: true
+    terminating: false
+  zone: eu-central-1c
+ports:
+- name: main
+  port: 7878
+  protocol: TCP
+---
+apiVersion: v1
+kind: Secret
+metadata:
+  labels:
+    application: bar
+  name: bar
+  namespace: internal
+data:
+  tls.crt: foo
+  tls.key: bar
+type: kubernetes.io/tls
 `
 
 func getJSON(u string, o interface{}) error {
@@ -134,8 +191,34 @@ func getJSON(u string, o interface{}) error {
 	return json.Unmarshal(b, o)
 }
 
+func getField(o map[string]interface{}, names ...string) interface{} {
+	name := names[0]
+	if f, ok := o[name]; ok {
+		if len(names) == 1 {
+			return f
+		}
+
+		if m, ok := f.(map[string]interface{}); ok {
+			return getField(m, names[1:]...)
+		} else {
+			return nil
+		}
+	}
+	return nil
+}
+
 func TestTestAPI(t *testing.T) {
-	a, err := NewAPI(TestAPIOptions{}, bytes.NewBufferString(testAPISpec1), bytes.NewBufferString(testAPISpec2))
+	kindListSpec, err := os.Open("testdata/kind-list.yaml")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer kindListSpec.Close()
+
+	a, err := NewAPI(TestAPIOptions{},
+		bytes.NewBufferString(testAPISpec1),
+		bytes.NewBufferString(testAPISpec2),
+		kindListSpec,
+	)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -143,14 +226,17 @@ func TestTestAPI(t *testing.T) {
 	s := httptest.NewServer(a)
 	defer s.Close()
 
-	get := func(uri string, o interface{}) error {
-		return getJSON(s.URL+uri, o)
+	get := func(t *testing.T, uri string, o interface{}) {
+		t.Helper()
+		err := getJSON(s.URL+uri, o)
+		require.NoError(t, err)
 	}
 
 	check := func(t *testing.T, data map[string]interface{}, itemsLength int, kind string) {
+		t.Helper()
 		items, ok := data["items"].([]interface{})
 		if !ok || len(items) != itemsLength {
-			t.Fatalf("failed to get the right number of items of: %s", kind)
+			t.Fatalf("failed to get the right number of %s: expected %d, got %d", kind, itemsLength, len(items))
 		}
 
 		if itemsLength == 0 {
@@ -158,8 +244,11 @@ func TestTestAPI(t *testing.T) {
 		}
 
 		resource, ok := items[0].(map[string]interface{})
-		if !ok || resource["kind"] != kind {
+		if !ok {
 			t.Fatalf("failed to get the right resource: %s", kind)
+		}
+		if resource["kind"] != kind {
+			t.Fatalf("failed to get the right resource: %s != %s", resource["kind"], kind)
 		}
 	}
 
@@ -167,61 +256,108 @@ func TestTestAPI(t *testing.T) {
 		const namespace = "internal"
 
 		var s map[string]interface{}
-		if err := get(fmt.Sprintf(kubernetes.ServicesNamespaceFmt, namespace), &s); err != nil {
-			t.Fatal(err)
-		}
-
+		get(t, fmt.Sprintf(kubernetes.ServicesNamespaceFmt, namespace), &s)
 		check(t, s, 1, "Service")
 
 		var i map[string]interface{}
-		if err := get(fmt.Sprintf(kubernetes.IngressesNamespaceFmt, namespace), &i); err != nil {
-			t.Fatal(err)
-		}
-
+		get(t, fmt.Sprintf(kubernetes.IngressesV1NamespaceFmt, namespace), &i)
 		check(t, i, 0, "Ingress")
 
 		var r map[string]interface{}
-		if err := get(fmt.Sprintf("/apis/zalando.org/v1/namespaces/%s/routegroups", namespace), &r); err != nil {
-			t.Fatal(err)
-		}
-
+		get(t, fmt.Sprintf(kubernetes.RouteGroupsNamespaceFmt, namespace), &r)
 		check(t, r, 1, "RouteGroup")
 
 		var e map[string]interface{}
-		if err := get(fmt.Sprintf(kubernetes.EndpointsNamespaceFmt, namespace), &e); err != nil {
-			t.Fatal(err)
-		}
-
+		get(t, fmt.Sprintf(kubernetes.EndpointsNamespaceFmt, namespace), &e)
 		check(t, e, 1, "Endpoints")
+
+		var eps map[string]interface{}
+		get(t, fmt.Sprintf(kubernetes.EndpointSlicesNamespaceFmt, namespace), &eps)
+		check(t, eps, 1, "EndpointSlice")
+
+		var sec map[string]interface{}
+		get(t, fmt.Sprintf(kubernetes.SecretsNamespaceFmt, namespace), &sec)
+		check(t, sec, 1, "Secret")
 	})
 
 	t.Run("without namespace", func(t *testing.T) {
 		var s map[string]interface{}
-		if err := get(kubernetes.ServicesClusterURI, &s); err != nil {
-			t.Fatal(err)
-		}
-
-		check(t, s, 2, "Service")
+		get(t, kubernetes.ServicesClusterURI, &s)
+		check(t, s, 3, "Service")
 
 		var i map[string]interface{}
-		if err := get(kubernetes.IngressesClusterURI, &i); err != nil {
-			t.Fatal(err)
-		}
-
+		get(t, kubernetes.IngressesV1ClusterURI, &i)
 		check(t, i, 1, "Ingress")
 
 		var r map[string]interface{}
-		if err := get("/apis/zalando.org/v1/routegroups", &r); err != nil {
-			t.Fatal(err)
-		}
+		get(t, kubernetes.RouteGroupsClusterURI, &r)
+		check(t, r, 2, "RouteGroup")
 
+		var e map[string]interface{}
+		get(t, kubernetes.EndpointsClusterURI, &e)
+		check(t, e, 3, "Endpoints")
+
+		var eps map[string]interface{}
+		get(t, kubernetes.EndpointSlicesClusterURI, &eps)
+		check(t, eps, 3, "EndpointSlice")
+
+		var sec map[string]interface{}
+		get(t, kubernetes.SecretsClusterURI, &sec)
+		check(t, sec, 1, "Secret")
+	})
+
+	t.Run("kind: List", func(t *testing.T) {
+		const namespace = "baz"
+
+		var s map[string]interface{}
+		get(t, fmt.Sprintf(kubernetes.ServicesNamespaceFmt, namespace), &s)
+		check(t, s, 1, "Service")
+
+		var i map[string]interface{}
+		get(t, fmt.Sprintf(kubernetes.IngressesV1NamespaceFmt, namespace), &i)
+		check(t, i, 0, "Ingress")
+
+		var r map[string]interface{}
+		get(t, fmt.Sprintf(kubernetes.RouteGroupsNamespaceFmt, namespace), &r)
 		check(t, r, 1, "RouteGroup")
 
 		var e map[string]interface{}
-		if err := get(kubernetes.EndpointsClusterURI, &e); err != nil {
-			t.Fatal(err)
-		}
+		get(t, fmt.Sprintf(kubernetes.EndpointsNamespaceFmt, namespace), &e)
+		check(t, e, 1, "Endpoints")
 
-		check(t, e, 2, "Endpoints")
+		var eps map[string]interface{}
+		get(t, fmt.Sprintf(kubernetes.EndpointSlicesNamespaceFmt, namespace), &eps)
+		check(t, eps, 1, "EndpointSlice")
+
+		var sec map[string]interface{}
+		get(t, fmt.Sprintf(kubernetes.SecretsNamespaceFmt, namespace), &sec)
+		check(t, sec, 0, "Secret")
+	})
+
+	t.Run("resource by name", func(t *testing.T) {
+		const namespace = "internal"
+
+		var s map[string]interface{}
+		get(t, fmt.Sprintf(kubernetes.ServicesNamespaceFmt, namespace)+"/bar", &s)
+
+		assert.Equal(t, "Service", getField(s, "kind"))
+		assert.Equal(t, namespace, getField(s, "metadata", "namespace"))
+		assert.Equal(t, "bar", getField(s, "metadata", "name"))
+
+		var e map[string]interface{}
+		get(t, fmt.Sprintf(kubernetes.EndpointsNamespaceFmt, namespace)+"/bar", &e)
+
+		assert.Equal(t, "Endpoints", getField(e, "kind"))
+		assert.Equal(t, namespace, getField(e, "metadata", "namespace"))
+		assert.Equal(t, "bar", getField(e, "metadata", "name"))
+	})
+
+	t.Run("resource name does not exist", func(t *testing.T) {
+		const namespace = "internal"
+
+		var o map[string]interface{}
+		err := getJSON(s.URL+fmt.Sprintf(kubernetes.ServicesNamespaceFmt, namespace)+"/does-not-exist", &o)
+
+		assert.EqualError(t, err, "unexpected status code: 404")
 	})
 }
