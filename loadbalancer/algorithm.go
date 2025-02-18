@@ -3,17 +3,15 @@ package loadbalancer
 import (
 	"errors"
 	"fmt"
-	"math"
 	"math/rand"
-	"net/url"
 	"sort"
 	"sync"
-	"time"
+	"sync/atomic"
 
-	xxhash "github.com/cespare/xxhash/v2"
+	"github.com/cespare/xxhash/v2"
 	log "github.com/sirupsen/logrus"
 	"github.com/zalando/skipper/eskip"
-	"github.com/zalando/skipper/net"
+	snet "github.com/zalando/skipper/net"
 	"github.com/zalando/skipper/routing"
 )
 
@@ -53,147 +51,46 @@ var (
 	defaultAlgorithm = newRoundRobin
 )
 
-func fadeInState(now time.Time, duration time.Duration, detected time.Time) (time.Duration, bool) {
-	rel := now.Sub(detected)
-	return rel, rel > 0 && rel < duration
-}
-
-func fadeIn(now time.Time, duration time.Duration, exponent float64, detected time.Time) float64 {
-	rel, fadingIn := fadeInState(now, duration, detected)
-	if !fadingIn {
-		return 1
-	}
-
-	return math.Pow(float64(rel)/float64(duration), exponent)
-}
-
-func shiftWeighted(rnd *rand.Rand, ctx *routing.LBContext, w []float64, now time.Time) routing.LBEndpoint {
-	var sum float64
-	weightSums := w
-	rt := ctx.Route
-	ep := ctx.Route.LBEndpoints
-	for _, epi := range ep {
-		wi := fadeIn(now, rt.LBFadeInDuration, rt.LBFadeInExponent, epi.Detected)
-		sum += wi
-		weightSums = append(weightSums, sum)
-	}
-
-	choice := ep[len(weightSums)-1]
-	r := rnd.Float64() * sum
-	for i := range weightSums {
-		if weightSums[i] > r {
-			choice = ep[i]
-			break
-		}
-	}
-
-	return choice
-}
-
-func shiftToRemaining(rnd *rand.Rand, ctx *routing.LBContext, wi []int, wf []float64, now time.Time) routing.LBEndpoint {
-	notFadingIndexes := wi
-	ep := ctx.Route.LBEndpoints
-	for i := 0; i < len(ep); i++ {
-		if _, fadingIn := fadeInState(now, ctx.Route.LBFadeInDuration, ep[i].Detected); !fadingIn {
-			notFadingIndexes = append(notFadingIndexes, i)
-		}
-	}
-
-	// if all endpoints are fading, the simplest approach is to use the oldest,
-	// this departs from the desired curve, but guarantees monotonic fade-in. From
-	// the perspective of the oldest endpoint, this is temporarily the same as if
-	// there was no fade-in.
-	if len(notFadingIndexes) == 0 {
-		return shiftWeighted(rnd, ctx, wf, now)
-	}
-
-	// otherwise equally distribute between the old endpoints
-	return ep[notFadingIndexes[rnd.Intn(len(notFadingIndexes))]]
-}
-
-func withFadeIn(rnd *rand.Rand, ctx *routing.LBContext, wi []int, wf []float64, choice int) routing.LBEndpoint {
-	now := time.Now()
-	f := fadeIn(
-		now,
-		ctx.Route.LBFadeInDuration,
-		ctx.Route.LBFadeInExponent,
-		ctx.Route.LBEndpoints[choice].Detected,
-	)
-
-	if rnd.Float64() < f {
-		return ctx.Route.LBEndpoints[choice]
-	}
-
-	return shiftToRemaining(rnd, ctx, wi, wf, now)
-}
-
 type roundRobin struct {
-	mx               sync.Mutex
-	index            int
-	rnd              *rand.Rand
-	notFadingIndexes []int
-	fadingWeights    []float64
+	index int64
 }
 
 func newRoundRobin(endpoints []string) routing.LBAlgorithm {
-	rnd := rand.New(rand.NewSource(time.Now().UnixNano())) // #nosec
+	rnd := rand.New(NewLockedSource()) // #nosec
 	return &roundRobin{
-		index: rnd.Intn(len(endpoints)),
-		rnd:   rnd,
-
-		// preallocating frequently used slice
-		notFadingIndexes: make([]int, 0, len(endpoints)),
-		fadingWeights:    make([]float64, 0, len(endpoints)),
+		index: int64(rnd.Intn(len(endpoints))),
 	}
 }
 
 // Apply implements routing.LBAlgorithm with a roundrobin algorithm.
 func (r *roundRobin) Apply(ctx *routing.LBContext) routing.LBEndpoint {
-	if len(ctx.Route.LBEndpoints) == 1 {
-		return ctx.Route.LBEndpoints[0]
+	if len(ctx.LBEndpoints) == 1 {
+		return ctx.LBEndpoints[0]
 	}
 
-	r.mx.Lock()
-	defer r.mx.Unlock()
-	r.index = (r.index + 1) % len(ctx.Route.LBEndpoints)
-
-	if ctx.Route.LBFadeInDuration <= 0 {
-		return ctx.Route.LBEndpoints[r.index]
-	}
-
-	return withFadeIn(r.rnd, ctx, r.notFadingIndexes, r.fadingWeights, r.index)
+	choice := int(atomic.AddInt64(&r.index, 1) % int64(len(ctx.LBEndpoints)))
+	return ctx.LBEndpoints[choice]
 }
 
 type random struct {
-	rand             *rand.Rand
-	notFadingIndexes []int
-	fadingWeights    []float64
+	rnd *rand.Rand
 }
 
 func newRandom(endpoints []string) routing.LBAlgorithm {
-	t := time.Now().UnixNano()
 	// #nosec
 	return &random{
-		rand: rand.New(rand.NewSource(t)),
-
-		// preallocating frequently used slice
-		notFadingIndexes: make([]int, 0, len(endpoints)),
-		fadingWeights:    make([]float64, 0, len(endpoints)),
+		rnd: rand.New(NewLockedSource()),
 	}
 }
 
 // Apply implements routing.LBAlgorithm with a stateless random algorithm.
 func (r *random) Apply(ctx *routing.LBContext) routing.LBEndpoint {
-	if len(ctx.Route.LBEndpoints) == 1 {
-		return ctx.Route.LBEndpoints[0]
+	if len(ctx.LBEndpoints) == 1 {
+		return ctx.LBEndpoints[0]
 	}
 
-	i := r.rand.Intn(len(ctx.Route.LBEndpoints))
-	if ctx.Route.LBFadeInDuration <= 0 {
-		return ctx.Route.LBEndpoints[i]
-	}
-
-	return withFadeIn(r.rand, ctx, r.notFadingIndexes, r.fadingWeights, i)
+	choice := r.rnd.Intn(len(ctx.LBEndpoints))
+	return ctx.LBEndpoints[choice]
 }
 
 type (
@@ -201,19 +98,25 @@ type (
 		index int    // index of endpoint in endpoint list
 		hash  uint64 // hash of endpoint
 	}
-	consistentHash []endpointHash // list of endpoints sorted by hash value
+	consistentHash struct {
+		hashRing []endpointHash // list of endpoints sorted by hash value
+	}
 )
 
-func (ch consistentHash) Len() int           { return len(ch) }
-func (ch consistentHash) Less(i, j int) bool { return ch[i].hash < ch[j].hash }
-func (ch consistentHash) Swap(i, j int)      { ch[i], ch[j] = ch[j], ch[i] }
+func (ch *consistentHash) Len() int           { return len(ch.hashRing) }
+func (ch *consistentHash) Less(i, j int) bool { return ch.hashRing[i].hash < ch.hashRing[j].hash }
+func (ch *consistentHash) Swap(i, j int) {
+	ch.hashRing[i], ch.hashRing[j] = ch.hashRing[j], ch.hashRing[i]
+}
 
 func newConsistentHashInternal(endpoints []string, hashesPerEndpoint int) routing.LBAlgorithm {
-	ch := consistentHash(make([]endpointHash, hashesPerEndpoint*len(endpoints)))
+	ch := &consistentHash{
+		hashRing: make([]endpointHash, hashesPerEndpoint*len(endpoints)),
+	}
 	for i, ep := range endpoints {
 		endpointStartIndex := hashesPerEndpoint * i
 		for j := 0; j < hashesPerEndpoint; j++ {
-			ch[endpointStartIndex+j] = endpointHash{i, hash(fmt.Sprintf("%s-%d", ep, j))}
+			ch.hashRing[endpointStartIndex+j] = endpointHash{i, hash(fmt.Sprintf("%s-%d", ep, j))}
 		}
 	}
 	sort.Sort(ch)
@@ -228,98 +131,123 @@ func hash(s string) uint64 {
 	return xxhash.Sum64String(s)
 }
 
+func skipEndpoint(c *routing.LBContext, index int) bool {
+	host := c.Route.LBEndpoints[index].Host
+	for i := range c.LBEndpoints {
+		if c.LBEndpoints[i].Host == host {
+			return false
+		}
+	}
+	return true
+}
+
 // Returns index in hash ring with the closest hash to key's hash
-func (ch consistentHash) searchRing(key string) int {
+func (ch *consistentHash) searchRing(key string, ctx *routing.LBContext) int {
 	h := hash(key)
-	i := sort.Search(ch.Len(), func(i int) bool { return ch[i].hash >= h })
+	i := sort.Search(ch.Len(), func(i int) bool { return ch.hashRing[i].hash >= h })
 	if i == ch.Len() { // rollover
 		i = 0
+	}
+	for skipEndpoint(ctx, ch.hashRing[i].index) {
+		i = (i + 1) % ch.Len()
 	}
 	return i
 }
 
 // Returns index of endpoint with closest hash to key's hash
-func (ch consistentHash) search(key string) int {
-	ringIndex := ch.searchRing(key)
-	return ch[ringIndex].index
+func (ch *consistentHash) search(key string, ctx *routing.LBContext) int {
+	ringIndex := ch.searchRing(key, ctx)
+	return ch.hashRing[ringIndex].index
 }
 
 func computeLoadAverage(ctx *routing.LBContext) float64 {
 	sum := 1.0 // add 1 to include the request that just arrived
-	endpoints := ctx.Route.LBEndpoints
+	endpoints := ctx.LBEndpoints
 	for _, v := range endpoints {
-		sum += float64(v.Metrics.GetInflightRequests())
+		sum += float64(v.Metrics.InflightRequests())
 	}
 	return sum / float64(len(endpoints))
 }
 
 // Returns index of endpoint with closest hash to key's hash, which is also below the target load
-func (ch consistentHash) boundedLoadSearch(key string, balanceFactor float64, ctx *routing.LBContext) int {
-	ringIndex := ch.searchRing(key)
+// skipEndpoint function is used to skip endpoints we don't want, for example, fading endpoints
+func (ch *consistentHash) boundedLoadSearch(key string, balanceFactor float64, ctx *routing.LBContext) int {
+	ringIndex := ch.searchRing(key, ctx)
 	averageLoad := computeLoadAverage(ctx)
 	targetLoad := averageLoad * balanceFactor
 	// Loop round ring, starting at endpoint with closest hash. Stop when we find one whose load is less than targetLoad.
 	for i := 0; i < ch.Len(); i++ {
-		endpointIndex := ch[ringIndex].index
-		load := ctx.Route.LBEndpoints[endpointIndex].Metrics.GetInflightRequests()
+		endpointIndex := ch.hashRing[ringIndex].index
+		if skipEndpoint(ctx, endpointIndex) {
+			continue
+		}
+		load := ctx.Route.LBEndpoints[endpointIndex].Metrics.InflightRequests()
 		// We know there must be an endpoint whose load <= average load.
 		// Since targetLoad >= average load (balancerFactor >= 1), there must also be an endpoint with load <= targetLoad.
-		if load <= int(targetLoad) {
+		if float64(load) <= targetLoad {
 			break
 		}
 		ringIndex = (ringIndex + 1) % ch.Len()
 	}
 
-	return ch[ringIndex].index
+	return ch.hashRing[ringIndex].index
 }
 
 // Apply implements routing.LBAlgorithm with a consistent hash algorithm.
-func (ch consistentHash) Apply(ctx *routing.LBContext) routing.LBEndpoint {
-	if len(ctx.Route.LBEndpoints) == 1 {
-		return ctx.Route.LBEndpoints[0]
+func (ch *consistentHash) Apply(ctx *routing.LBContext) routing.LBEndpoint {
+	if len(ctx.LBEndpoints) == 1 {
+		return ctx.LBEndpoints[0]
 	}
 
+	// The index returned from this call is taken from hash ring which is built from data about
+	// all endpoints, including fading in, unhealthy, etc. ones. The index stored in hash ring is
+	// the index of the endpoint in the original list of endpoints.
+	choice := ch.chooseConsistentHashEndpoint(ctx)
+	return ctx.Route.LBEndpoints[choice]
+}
+
+func (ch *consistentHash) chooseConsistentHashEndpoint(ctx *routing.LBContext) int {
 	key, ok := ctx.Params[ConsistentHashKey].(string)
 	if !ok {
-		key = net.RemoteHost(ctx.Request).String()
+		key = snet.RemoteHost(ctx.Request).String()
 	}
 	balanceFactor, ok := ctx.Params[ConsistentHashBalanceFactor].(float64)
 	var choice int
 	if !ok {
-		choice = ch.search(key)
+		choice = ch.search(key, ctx)
 	} else {
 		choice = ch.boundedLoadSearch(key, balanceFactor, ctx)
 	}
 
-	return ctx.Route.LBEndpoints[choice]
+	return choice
 }
 
 type powerOfRandomNChoices struct {
-	mx              sync.Mutex
-	rand            *rand.Rand
+	mu              sync.Mutex
+	rnd             *rand.Rand
 	numberOfChoices int
 }
 
 // newPowerOfRandomNChoices selects N random backends and picks the one with less outstanding requests.
-func newPowerOfRandomNChoices(endpoints []string) routing.LBAlgorithm {
-	rnd := rand.New(rand.NewSource(time.Now().UnixNano())) // #nosec
+func newPowerOfRandomNChoices([]string) routing.LBAlgorithm {
+	rnd := rand.New(NewLockedSource()) // #nosec
 	return &powerOfRandomNChoices{
-		rand:            rnd,
+		rnd:             rnd,
 		numberOfChoices: powerOfRandomNChoicesDefaultN,
 	}
 }
 
 // Apply implements routing.LBAlgorithm with power of random N choices algorithm.
 func (p *powerOfRandomNChoices) Apply(ctx *routing.LBContext) routing.LBEndpoint {
-	ne := len(ctx.Route.LBEndpoints)
+	ne := len(ctx.LBEndpoints)
 
-	p.mx.Lock()
-	defer p.mx.Unlock()
+	p.mu.Lock()
+	defer p.mu.Unlock()
 
-	best := ctx.Route.LBEndpoints[p.rand.Intn(ne)]
+	best := ctx.LBEndpoints[p.rnd.Intn(ne)]
 
 	for i := 1; i < p.numberOfChoices; i++ {
-		ce := ctx.Route.LBEndpoints[p.rand.Intn(ne)]
+		ce := ctx.LBEndpoints[p.rnd.Intn(ne)]
 
 		if p.getScore(ce) > p.getScore(best) {
 			best = ce
@@ -329,9 +257,9 @@ func (p *powerOfRandomNChoices) Apply(ctx *routing.LBContext) routing.LBEndpoint
 }
 
 // getScore returns negative value of inflightrequests count.
-func (p *powerOfRandomNChoices) getScore(e routing.LBEndpoint) int {
+func (p *powerOfRandomNChoices) getScore(e routing.LBEndpoint) int64 {
 	// endpoints with higher inflight request should have lower score
-	return -e.Metrics.GetInflightRequests()
+	return -int64(e.Metrics.InflightRequests())
 }
 
 type (
@@ -384,15 +312,14 @@ func (a Algorithm) String() string {
 func parseEndpoints(r *routing.Route) error {
 	r.LBEndpoints = make([]routing.LBEndpoint, len(r.Route.LBEndpoints))
 	for i, e := range r.Route.LBEndpoints {
-		eu, err := url.ParseRequestURI(e)
+		scheme, host, err := snet.SchemeHost(e)
 		if err != nil {
 			return err
 		}
 
 		r.LBEndpoints[i] = routing.LBEndpoint{
-			Scheme:  eu.Scheme,
-			Host:    eu.Host,
-			Metrics: &routing.LBMetrics{},
+			Scheme: scheme,
+			Host:   host,
 		}
 	}
 

@@ -2,6 +2,7 @@ package routesrv
 
 import (
 	"context"
+	"fmt"
 	"net/http"
 	"os"
 	"os/signal"
@@ -9,25 +10,48 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/prometheus/client_golang/prometheus/promhttp"
+	"github.com/prometheus/client_golang/prometheus"
 	log "github.com/sirupsen/logrus"
+
+	"github.com/zalando/skipper"
 	"github.com/zalando/skipper/dataclients/kubernetes"
+	"github.com/zalando/skipper/filters/auth"
+	"github.com/zalando/skipper/metrics"
 	"github.com/zalando/skipper/tracing"
 )
 
 // RouteServer is used to serve eskip-formatted routes,
 // that originate from the polled data source.
 type RouteServer struct {
-	server *http.Server
-	poller *poller
-	wg     *sync.WaitGroup
+	server        *http.Server
+	supportServer *http.Server
+	poller        *poller
+	wg            *sync.WaitGroup
 }
 
 // New returns an initialized route server according to the passed options.
 // This call does not start data source updates automatically. Kept routes
 // will stay in an uninitialized state, till StartUpdates is called and
 // in effect data source is queried and routes initialized/updated.
-func New(opts Options) (*RouteServer, error) {
+func New(opts skipper.Options) (*RouteServer, error) {
+	if opts.PrometheusRegistry == nil {
+		opts.PrometheusRegistry = prometheus.NewRegistry()
+	}
+
+	mopt := metrics.Options{
+		Format:               metrics.PrometheusKind,
+		Prefix:               "routesrv",
+		PrometheusRegistry:   opts.PrometheusRegistry,
+		EnableDebugGcMetrics: true,
+		EnableRuntimeMetrics: true,
+		EnableProfile:        opts.EnableProfile,
+		BlockProfileRate:     opts.BlockProfileRate,
+		MutexProfileFraction: opts.MutexProfileFraction,
+		MemProfileRate:       opts.MemProfileRate,
+	}
+	m := metrics.NewMetrics(mopt)
+	metricsHandler := metrics.NewHandler(mopt, m)
+
 	rs := &RouteServer{}
 
 	opentracingOpts := opts.OpenTracing
@@ -39,46 +63,78 @@ func New(opts Options) (*RouteServer, error) {
 		return nil, err
 	}
 
-	b := &eskipBytes{tracer: tracer}
-	bs := &eskipBytesStatus{b: b}
-	handler := http.NewServeMux()
-	handler.Handle("/health", bs)
-	handler.Handle("/routes", b)
-	handler.Handle("/metrics", promhttp.Handler())
-	rs.server = &http.Server{Addr: opts.Address, Handler: handler}
+	b := &eskipBytes{
+		tracer:  tracer,
+		metrics: m,
+		now:     time.Now,
+	}
+	bs := &eskipBytesStatus{
+		b: b,
+	}
+	mux := http.NewServeMux()
+	mux.Handle("/health", bs)
+	mux.Handle("/routes", b)
+	supportHandler := http.NewServeMux()
+	supportHandler.Handle("/metrics", metricsHandler)
+	supportHandler.Handle("/metrics/", metricsHandler)
 
-	dataclient, err := kubernetes.New(kubernetes.Options{
-		AllowedExternalNames:              opts.KubernetesAllowedExternalNames,
-		BackendNameTracingTag:             opts.OpenTracingBackendNameTag,
-		DefaultFiltersDir:                 opts.DefaultFiltersDir,
-		KubernetesIngressV1:               opts.KubernetesIngressV1,
-		KubernetesInCluster:               opts.KubernetesInCluster,
-		KubernetesURL:                     opts.KubernetesURL,
-		KubernetesNamespace:               opts.KubernetesNamespace,
-		KubernetesEnableEastWest:          opts.KubernetesEnableEastWest,
-		KubernetesEastWestDomain:          opts.KubernetesEastWestDomain,
-		KubernetesEastWestRangeDomains:    opts.KubernetesEastWestRangeDomains,
-		KubernetesEastWestRangePredicates: opts.KubernetesEastWestRangePredicates,
-		HTTPSRedirectCode:                 opts.KubernetesHTTPSRedirectCode,
-		IngressClass:                      opts.KubernetesIngressClass,
-		OnlyAllowedExternalNames:          opts.KubernetesOnlyAllowedExternalNames,
-		OriginMarker:                      opts.OriginMarker,
-		PathMode:                          opts.KubernetesPathMode,
-		ProvideHealthcheck:                opts.KubernetesHealthcheck,
-		ProvideHTTPSRedirect:              opts.KubernetesHTTPSRedirect,
-		ReverseSourcePredicate:            opts.ReverseSourcePredicate,
-		RouteGroupClass:                   opts.KubernetesRouteGroupClass,
-		WhitelistedHealthCheckCIDR:        opts.WhitelistedHealthCheckCIDR,
-	})
+	if opts.EnableProfile {
+		supportHandler.Handle("/debug/pprof", metricsHandler)
+		supportHandler.Handle("/debug/pprof/", metricsHandler)
+	}
+
+	if !opts.Kubernetes {
+		return nil, fmt.Errorf(`option "Kubernetes" is required`)
+	}
+
+	dataclient, err := kubernetes.New(opts.KubernetesDataClientOptions())
 	if err != nil {
 		return nil, err
 	}
+	var oauthConfig *auth.OAuthConfig
+	if opts.EnableOAuth2GrantFlow /* explicitly enable grant flow */ {
+		oauthConfig = &auth.OAuthConfig{}
+		oauthConfig.CallbackPath = opts.OAuth2CallbackPath
+	}
+
+	var rh *RedisHandler
+	// in case we have kubernetes dataclient and we can detect redis instances, we patch redisOptions
+	if opts.KubernetesRedisServiceNamespace != "" && opts.KubernetesRedisServiceName != "" {
+		log.Infof("Use endpoints %s/%s to fetch updated redis shards", opts.KubernetesRedisServiceNamespace, opts.KubernetesRedisServiceName)
+		rh = &RedisHandler{}
+		_, err := dataclient.LoadAll()
+		if err != nil {
+			return nil, err
+		}
+		rh.AddrUpdater = getRedisAddresses(&opts, dataclient, m)
+		mux.Handle("/swarm/redis/shards", rh)
+	}
+
+	rs.server = &http.Server{
+		Addr:              opts.Address,
+		Handler:           mux,
+		ReadTimeout:       1 * time.Minute,
+		ReadHeaderTimeout: 1 * time.Minute,
+	}
+
+	rs.supportServer = &http.Server{
+		Addr:              opts.SupportListener,
+		Handler:           supportHandler,
+		ReadTimeout:       1 * time.Minute,
+		ReadHeaderTimeout: 1 * time.Minute,
+	}
+
 	rs.poller = &poller{
-		client:  dataclient,
-		timeout: opts.SourcePollTimeout,
-		b:       b,
-		quit:    make(chan struct{}),
-		tracer:  tracer,
+		client:         dataclient,
+		timeout:        opts.SourcePollTimeout,
+		b:              b,
+		quit:           make(chan struct{}),
+		defaultFilters: opts.DefaultFilters,
+		editRoute:      opts.EditRoute,
+		cloneRoute:     opts.CloneRoute,
+		oauth2Config:   oauthConfig,
+		tracer:         tracer,
+		metrics:        m,
 	}
 
 	rs.wg = &sync.WaitGroup{}
@@ -104,8 +160,17 @@ func (rs *RouteServer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	rs.server.Handler.ServeHTTP(w, r)
 }
 
+func (rs *RouteServer) startSupportListener() {
+	if rs.supportServer != nil {
+		err := rs.supportServer.ListenAndServe()
+		if err != nil {
+			log.Errorf("Failed support listener: %v", err)
+		}
+	}
+}
+
 func newShutdownFunc(rs *RouteServer) func(delay time.Duration) {
-	once := &sync.Once{}
+	once := sync.Once{}
 	rs.wg.Add(1)
 
 	return func(delay time.Duration) {
@@ -115,6 +180,12 @@ func newShutdownFunc(rs *RouteServer) func(delay time.Duration) {
 
 			log.Infof("shutting down the server in %s...", delay)
 			time.Sleep(delay)
+			if rs.supportServer != nil {
+				if err := rs.supportServer.Shutdown(context.Background()); err != nil {
+					log.Error("unable to shut down the support server: ", err)
+				}
+				log.Info("supportServer shut down")
+			}
 			if err := rs.server.Shutdown(context.Background()); err != nil {
 				log.Error("unable to shut down the server: ", err)
 			}
@@ -123,21 +194,11 @@ func newShutdownFunc(rs *RouteServer) func(delay time.Duration) {
 	}
 }
 
-// Run starts a route server set up according to the passed options.
-// It is a blocking call designed to be used as a single call/entry point,
-// when running the route server as a standalone binary. It returns, when
-// the server is closed, which can happen due to server startup errors or
-// gracefully handled SIGTERM signal. In case of a server startup error,
-// the error is returned as is.
-func Run(opts Options) error {
-	rs, err := New(opts)
-	if err != nil {
-		return err
-	}
+func run(rs *RouteServer, opts skipper.Options, sigs chan os.Signal) error {
+	var err error
 
 	shutdown := newShutdownFunc(rs)
 
-	sigs := make(chan os.Signal, 1)
 	signal.Notify(sigs, syscall.SIGTERM)
 	go func() {
 		<-sigs
@@ -146,6 +207,7 @@ func Run(opts Options) error {
 
 	rs.StartUpdates()
 
+	go rs.startSupportListener()
 	if err = rs.server.ListenAndServe(); err != http.ErrServerClosed {
 		go shutdown(0)
 	} else {
@@ -155,4 +217,20 @@ func Run(opts Options) error {
 	rs.wg.Wait()
 
 	return err
+}
+
+// Run starts a route server set up according to the passed options.
+// It is a blocking call designed to be used as a single call/entry point,
+// when running the route server as a standalone binary. It returns, when
+// the server is closed, which can happen due to server startup errors or
+// gracefully handled SIGTERM signal. In case of a server startup error,
+// the error is returned as is.
+func Run(opts skipper.Options) error {
+	rs, err := New(opts)
+	if err != nil {
+		return err
+	}
+	sigs := make(chan os.Signal, 1)
+	return run(rs, opts, sigs)
+
 }

@@ -14,6 +14,7 @@ type Metadata struct {
 	Created     time.Time         `json:"creationTimestamp"`
 	Uid         string            `json:"uid"`
 	Annotations map[string]string `json:"annotations"`
+	Labels      map[string]string `json:"labels"`
 }
 
 func (meta *Metadata) ToResourceID() ResourceID {
@@ -36,4 +37,9 @@ func namespaceString(ns string) string {
 	}
 
 	return ns
+}
+
+type WeightedBackend interface {
+	GetName() string
+	GetWeight() float64
 }

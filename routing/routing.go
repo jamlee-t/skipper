@@ -12,6 +12,7 @@ import (
 	"github.com/zalando/skipper/eskip"
 	"github.com/zalando/skipper/filters"
 	"github.com/zalando/skipper/logging"
+	"github.com/zalando/skipper/metrics"
 	"github.com/zalando/skipper/predicates"
 )
 
@@ -26,7 +27,7 @@ const (
 	WeightPredicateName = predicates.WeightName
 
 	routesTimestampName      = "X-Timestamp"
-	routesCountName          = "X-Count"
+	RoutesCountName          = "X-Count"
 	defaultRouteListingLimit = 1024
 )
 
@@ -70,6 +71,13 @@ type PredicateSpec interface {
 
 	// Creates a predicate instance with concrete arguments.
 	Create([]interface{}) (Predicate, error)
+}
+
+type WeightedPredicateSpec interface {
+	PredicateSpec
+
+	// Extra Weight of the predicate
+	Weight() int
 }
 
 // Options for initialization for routing.
@@ -116,6 +124,10 @@ type Options struct {
 	// SuppressLogs indicates whether to log only a summary of the route changes.
 	SuppressLogs bool
 
+	// Metrics is used to collect monitoring data about the routes health, including
+	// total number of routes applied and UNIX time of the last routes update.
+	Metrics metrics.Metrics
+
 	// PreProcessors contains custom eskip.Route pre-processors.
 	PreProcessors []PreProcessor
 
@@ -138,35 +150,11 @@ type RouteFilter struct {
 	Index int
 }
 
-// LBMetrics contains metrics used by LB algorithms
-type LBMetrics struct {
-	inflightRequests int64
-}
-
-// IncInflightRequest increments the number of outstanding requests from the proxy to a given backend.
-func (m *LBMetrics) IncInflightRequest() {
-	atomic.AddInt64(&m.inflightRequests, 1)
-}
-
-// DecInflightRequest decrements the number of outstanding requests from the proxy to a given backend.
-func (m *LBMetrics) DecInflightRequest() {
-	atomic.AddInt64(&m.inflightRequests, -1)
-}
-
-// GetInflightRequests decrements the number of outstanding requests from the proxy to a given backend.
-func (m *LBMetrics) GetInflightRequests() int {
-	return int(atomic.LoadInt64(&m.inflightRequests))
-}
-
 // LBEndpoint represents the scheme and the host of load balanced
 // backends.
 type LBEndpoint struct {
 	Scheme, Host string
-	Metrics      *LBMetrics
-
-	// Detected represents the time when skipper instances first detected a new LB endpoint. This detection
-	// time is used for the fade-in feature of the round-robin and random LB algorithms.
-	Detected time.Time
+	Metrics      Metrics
 }
 
 // LBAlgorithm implementations apply a load balancing algorithm
@@ -178,9 +166,10 @@ type LBAlgorithm interface {
 // LBContext is used to pass data to the load balancer to decide based
 // on that data which endpoint to call from the backends
 type LBContext struct {
-	Request *http.Request
-	Route   *Route
-	Params  map[string]interface{}
+	Request     *http.Request
+	Route       *Route
+	LBEndpoints []LBEndpoint
+	Params      map[string]interface{}
 }
 
 // NewLBContext is used to create a new LBContext, to pass data to the
@@ -242,16 +231,12 @@ type Route struct {
 // PostProcessor is an interface for custom post-processors applying changes
 // to the routes after they were created from their data representation and
 // before they were passed to the proxy.
-//
-// This feature is experimental.
 type PostProcessor interface {
 	Do([]*Route) []*Route
 }
 
 // PreProcessor is an interface for custom pre-processors applying changes
 // to the routes before they were created from eskip.Route representation.
-//
-// This feature is experimental.
 type PreProcessor interface {
 	Do([]*eskip.Route) []*eskip.Route
 }
@@ -264,6 +249,7 @@ type Routing struct {
 	firstLoad         chan struct{}
 	firstLoadSignaled bool
 	quit              chan struct{}
+	metrics           metrics.Metrics
 }
 
 // New initializes a routing instance, and starts listening for route
@@ -274,6 +260,7 @@ func New(o Options) *Routing {
 	}
 
 	r := &Routing{log: o.Log, firstLoad: make(chan struct{}), quit: make(chan struct{})}
+	r.metrics = o.Metrics
 	if !o.SignalFirstLoad {
 		close(r.firstLoad)
 		r.firstLoadSignaled = true
@@ -282,7 +269,7 @@ func New(o Options) *Routing {
 	initialMatcher, _ := newMatcher(nil, MatchingOptionsNone)
 	rt := &routeTable{
 		m:       initialMatcher,
-		created: time.Now().UTC(),
+		created: time.Now(),
 	}
 	r.routeTable.Store(rt)
 	r.startReceivingUpdates(o)
@@ -307,7 +294,7 @@ func (r *Routing) ServeHTTP(w http.ResponseWriter, req *http.Request) {
 
 	if req.Method == "HEAD" {
 		w.Header().Set(routesTimestampName, createdUnix)
-		w.Header().Set(routesCountName, strconv.Itoa(len(rt.validRoutes)))
+		w.Header().Set(RoutesCountName, strconv.Itoa(len(rt.validRoutes)))
 
 		if strings.Contains(req.Header.Get("Accept"), "application/json") {
 			w.Header().Set("Content-Type", "application/json")
@@ -331,7 +318,7 @@ func (r *Routing) ServeHTTP(w http.ResponseWriter, req *http.Request) {
 	}
 
 	w.Header().Set(routesTimestampName, createdUnix)
-	w.Header().Set(routesCountName, strconv.Itoa(len(rt.validRoutes)))
+	w.Header().Set(RoutesCountName, strconv.Itoa(len(rt.validRoutes)))
 
 	routes := slice(rt.validRoutes, offset, limit)
 	if strings.Contains(req.Header.Get("Accept"), "application/json") {
@@ -366,8 +353,18 @@ func (r *Routing) startReceivingUpdates(o Options) {
 						r.firstLoadSignaled = true
 					}
 				}
-				r.log.Info("route settings applied")
+				r.log.Infof("route settings applied, id: %d", rt.id)
+				if r.metrics != nil { // existing codebases might not supply metrics instance
+					r.metrics.UpdateGauge("routes.total", float64(len(rt.validRoutes)))
+					r.metrics.UpdateGauge("routes.updated_timestamp", float64(rt.created.Unix()))
+					r.metrics.MeasureSince("routes.update_latency", rt.created)
+				}
 			case <-r.quit:
+				var rt *routeTable
+				rt, ok := r.routeTable.Load().(*routeTable)
+				if ok {
+					rt.close()
+				}
 				return
 			}
 		}
@@ -417,7 +414,7 @@ func (r *Routing) Get() *RouteLookup {
 	return &RouteLookup{matcher: rt.m}
 }
 
-// Close closes routing, stops receiving routes.
+// Close closes routing, routeTable and stops statemachine for receiving routes.
 func (r *Routing) Close() {
 	close(r.quit)
 }

@@ -6,18 +6,6 @@ import (
 	"github.com/zalando/skipper/dataclients/kubernetes/kubernetestest"
 )
 
-func TestIngressFixtures(t *testing.T) {
-	kubernetestest.FixturesToTest(
-		t,
-		"testdata/ingress/named-ports",
-		"testdata/ingress/ingress-data",
-		"testdata/ingress/eastwest",
-		"testdata/ingress/eastwestrange",
-		"testdata/ingress/service-ports",
-		"testdata/ingress/external-name",
-	)
-}
-
 func TestIngressV1Fixtures(t *testing.T) {
 	kubernetestest.FixturesToTest(
 		t,
@@ -26,6 +14,18 @@ func TestIngressV1Fixtures(t *testing.T) {
 		"testdata/ingressV1/eastwest",
 		"testdata/ingressV1/eastwestrange",
 		"testdata/ingressV1/service-ports",
+		"testdata/ingressV1/service-ports-endpointslices",
 		"testdata/ingressV1/external-name",
+		"testdata/ingressV1/tls",
+		"testdata/ingressV1/traffic",
+		"testdata/ingressV1/traffic-segment",
+		"testdata/ingressV1/loadbalancer-algorithm",
+	)
+}
+
+func TestIngressV1AnnotationConfig(t *testing.T) {
+	kubernetestest.FixturesToTest(t,
+		"testdata/ingressV1/annotation-predicates",
+		"testdata/ingressV1/annotation-filters",
 	)
 }

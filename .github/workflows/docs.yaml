@@ -1,0 +1,28 @@
+name: docs-ci
+
+permissions: {}
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - 'master'
+    paths:
+      - 'docs/**'
+
+jobs:
+  deploy:
+    permissions:
+      contents: write
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+      - uses: actions/setup-python@42375524e23c412d93fb67b49958b491fce71c38
+        with:
+          python-version: 3.x
+      - uses: actions/cache@1bd1e32a3bdc45362d1e726936510720a7c30a57
+        with:
+          key: ${{ github.ref }}
+          path: .cache
+      - run: pip install mkdocs mkdocs-material markdown-include
+      - run: mkdocs gh-deploy --force

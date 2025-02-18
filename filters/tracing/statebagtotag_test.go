@@ -16,17 +16,41 @@ import (
 func TestStateBagToTag(t *testing.T) {
 	req := &http.Request{Header: http.Header{}}
 
-	span := tracingtest.NewSpan("start_span")
+	tracer := tracingtest.NewTracer()
+	span := tracer.StartSpan("start_span").(*tracingtest.MockSpan)
+
 	req = req.WithContext(opentracing.ContextWithSpan(req.Context(), span))
-	ctx := &filtertest.Context{FRequest: req, FStateBag: make(map[string]interface{})}
-	ctx.StateBag()["item"] = "val"
+	ctx := &filtertest.Context{FRequest: req, FStateBag: map[string]interface{}{"item": "val"}}
 
 	f, err := NewStateBagToTag().CreateFilter([]interface{}{"item", "tag"})
 	require.NoError(t, err)
 
 	f.Request(ctx)
 
-	assert.Equal(t, "val", span.Tags["tag"])
+	span.Finish()
+
+	assert.Equal(t, "val", span.Tag("tag"))
+}
+
+func TestStateBagToTagAllocs(t *testing.T) {
+	req := &http.Request{Header: http.Header{}}
+
+	tracer := tracingtest.NewTracer()
+	span := tracer.StartSpan("start_span")
+	defer span.Finish()
+
+	req = req.WithContext(opentracing.ContextWithSpan(req.Context(), span))
+	ctx := &filtertest.Context{FRequest: req, FStateBag: map[string]interface{}{"item": "val"}}
+
+	f, err := NewStateBagToTag().CreateFilter([]interface{}{"item", "tag"})
+	require.NoError(t, err)
+
+	allocs := testing.AllocsPerRun(100, func() {
+		f.Request(ctx)
+	})
+	if allocs != 0.0 {
+		t.Errorf("Expected zero allocations, got %f", allocs)
+	}
 }
 
 func TestStateBagToTag_CreateFilter(t *testing.T) {
@@ -59,17 +83,46 @@ func TestStateBagToTag_CreateFilter(t *testing.T) {
 			args: []interface{}{""},
 			err:  filters.ErrInvalidFilterParameters,
 		},
+		{
+			msg:  "too many args",
+			args: []interface{}{"foo", "bar", "baz"},
+			err:  filters.ErrInvalidFilterParameters,
+		},
 	} {
 		t.Run(ti.msg, func(t *testing.T) {
 			f, err := NewStateBagToTag().CreateFilter(ti.args)
 
 			assert.Equal(t, ti.err, err)
 			if err == nil {
-				ff := f.(stateBagToTagFilter)
+				ff := f.(*stateBagToTagFilter)
 
 				assert.Equal(t, ti.stateBag, ff.stateBagItemName)
 				assert.Equal(t, ti.tag, ff.tagName)
 			}
 		})
+	}
+}
+
+func BenchmarkStateBagToTag_StringValue(b *testing.B) {
+	f, err := NewStateBagToTag().CreateFilter([]interface{}{"item", "tag"})
+	require.NoError(b, err)
+
+	tracer := tracingtest.NewTracer()
+	span := tracer.StartSpan("start_span").(*tracingtest.MockSpan)
+	defer span.Finish()
+
+	req := &http.Request{Header: http.Header{}}
+	req = req.WithContext(opentracing.ContextWithSpan(req.Context(), span))
+
+	ctx := &filtertest.Context{FRequest: req, FStateBag: map[string]interface{}{"item": "val"}}
+	f.Request(ctx)
+
+	require.Equal(b, "val", span.Tag("tag"))
+
+	b.ReportAllocs()
+	b.ResetTimer()
+
+	for i := 0; i < b.N; i++ {
+		f.Request(ctx)
 	}
 }

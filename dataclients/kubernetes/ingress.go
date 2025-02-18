@@ -1,6 +1,8 @@
 package kubernetes
 
 import (
+	"crypto/tls"
+	b64 "encoding/base64"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -11,27 +13,26 @@ import (
 	log "github.com/sirupsen/logrus"
 	"github.com/zalando/skipper/dataclients/kubernetes/definitions"
 	"github.com/zalando/skipper/eskip"
-	"github.com/zalando/skipper/predicates"
+	"github.com/zalando/skipper/secrets/certregistry"
 )
 
 const (
 	ingressRouteIDPrefix                = "kube"
 	backendWeightsAnnotationKey         = "zalando.org/backend-weights"
 	ratelimitAnnotationKey              = "zalando.org/ratelimit"
-	skipperfilterAnnotationKey          = "zalando.org/skipper-filter"
-	skipperpredicateAnnotationKey       = "zalando.org/skipper-predicate"
-	skipperRoutesAnnotationKey          = "zalando.org/skipper-routes"
 	skipperLoadBalancerAnnotationKey    = "zalando.org/skipper-loadbalancer"
 	skipperBackendProtocolAnnotationKey = "zalando.org/skipper-backend-protocol"
 	pathModeAnnotationKey               = "zalando.org/skipper-ingress-path-mode"
 	ingressOriginName                   = "ingress"
+	tlsSecretType                       = "kubernetes.io/tls"
+	tlsSecretDataCrt                    = "tls.crt"
+	tlsSecretDataKey                    = "tls.key"
 )
 
 type ingressContext struct {
 	state               *clusterState
-	ingress             *definitions.IngressItem
 	ingressV1           *definitions.IngressV1Item
-	logger              *log.Entry
+	logger              *logger
 	annotationFilters   []*eskip.Filter
 	annotationPredicate string
 	extraRoutes         []*eskip.Route
@@ -40,18 +41,27 @@ type ingressContext struct {
 	redirect            *redirectInfo
 	hostRoutes          map[string][]*eskip.Route
 	defaultFilters      defaultFilters
+	certificateRegistry *certregistry.CertRegistry
+	calculateTraffic    func([]*weightedIngressBackend) map[string]backendTraffic
 }
 
 type ingress struct {
-	eastWestRangeDomains     []string
-	eastWestRangePredicates  []*eskip.Predicate
-	allowedExternalNames     []*regexp.Regexp
-	kubernetesEastWestDomain string
-	pathMode                 PathMode
-	httpsRedirectCode        int
-	kubernetesEnableEastWest bool
-	ingressV1                bool
-	provideHTTPSRedirect     bool
+	eastWestRangeDomains                           []string
+	eastWestRangePredicates                        []*eskip.Predicate
+	allowedExternalNames                           []*regexp.Regexp
+	kubernetesEastWestDomain                       string
+	pathMode                                       PathMode
+	httpsRedirectCode                              int
+	kubernetesEnableEastWest                       bool
+	provideHTTPSRedirect                           bool
+	disableCatchAllRoutes                          bool
+	forceKubernetesService                         bool
+	backendTrafficAlgorithm                        BackendTrafficAlgorithm
+	defaultLoadBalancerAlgorithm                   string
+	kubernetesAnnotationPredicates                 []AnnotationPredicates
+	kubernetesAnnotationFiltersAppend              []AnnotationFilters
+	kubernetesEastWestRangeAnnotationPredicates    []AnnotationPredicates
+	kubernetesEastWestRangeAnnotationFiltersAppend []AnnotationFilters
 }
 
 var nonWord = regexp.MustCompile(`\W`)
@@ -64,20 +74,27 @@ func (ic *ingressContext) addHostRoute(host string, route *eskip.Route) {
 
 func newIngress(o Options) *ingress {
 	return &ingress{
-		ingressV1:                o.KubernetesIngressV1,
-		provideHTTPSRedirect:     o.ProvideHTTPSRedirect,
-		httpsRedirectCode:        o.HTTPSRedirectCode,
-		pathMode:                 o.PathMode,
-		kubernetesEnableEastWest: o.KubernetesEnableEastWest,
-		kubernetesEastWestDomain: o.KubernetesEastWestDomain,
-		eastWestRangeDomains:     o.KubernetesEastWestRangeDomains,
-		eastWestRangePredicates:  o.KubernetesEastWestRangePredicates,
-		allowedExternalNames:     o.AllowedExternalNames,
+		provideHTTPSRedirect:                           o.ProvideHTTPSRedirect,
+		httpsRedirectCode:                              o.HTTPSRedirectCode,
+		disableCatchAllRoutes:                          o.DisableCatchAllRoutes,
+		pathMode:                                       o.PathMode,
+		kubernetesEnableEastWest:                       o.KubernetesEnableEastWest,
+		kubernetesEastWestDomain:                       o.KubernetesEastWestDomain,
+		eastWestRangeDomains:                           o.KubernetesEastWestRangeDomains,
+		eastWestRangePredicates:                        o.KubernetesEastWestRangePredicates,
+		allowedExternalNames:                           o.AllowedExternalNames,
+		forceKubernetesService:                         o.ForceKubernetesService,
+		backendTrafficAlgorithm:                        o.BackendTrafficAlgorithm,
+		defaultLoadBalancerAlgorithm:                   o.DefaultLoadBalancerAlgorithm,
+		kubernetesAnnotationPredicates:                 o.KubernetesAnnotationPredicates,
+		kubernetesAnnotationFiltersAppend:              o.KubernetesAnnotationFiltersAppend,
+		kubernetesEastWestRangeAnnotationPredicates:    o.KubernetesEastWestRangeAnnotationPredicates,
+		kubernetesEastWestRangeAnnotationFiltersAppend: o.KubernetesEastWestRangeAnnotationFiltersAppend,
 	}
 }
 
-func getLoadBalancerAlgorithm(m *definitions.Metadata) string {
-	algorithm := defaultLoadBalancerAlgorithm
+func getLoadBalancerAlgorithm(m *definitions.Metadata, defaultAlgorithm string) string {
+	algorithm := defaultAlgorithm
 	if algorithmAnnotationValue, ok := m.Annotations[skipperLoadBalancerAnnotationKey]; ok {
 		algorithm = algorithmAnnotationValue
 	}
@@ -133,23 +150,6 @@ func externalNameRoute(
 	}, nil
 }
 
-func setTraffic(r *eskip.Route, svcName string, weight float64, noopCount int) {
-	// add traffic predicate if traffic weight is between 0.0 and 1.0
-	if 0.0 < weight && weight < 1.0 {
-		r.Predicates = append([]*eskip.Predicate{{
-			Name: predicates.TrafficName,
-			Args: []interface{}{weight},
-		}}, r.Predicates...)
-		log.Debugf("Traffic weight %.2f for backend '%s'", weight, svcName)
-	}
-	for i := 0; i < noopCount; i++ {
-		r.Predicates = append([]*eskip.Predicate{{
-			Name: predicates.TrueName,
-			Args: []interface{}{},
-		}}, r.Predicates...)
-	}
-}
-
 func applyAnnotationPredicates(m PathMode, r *eskip.Route, annotation string) error {
 	if annotation == "" {
 		return nil
@@ -186,18 +186,14 @@ func applyAnnotationPredicates(m PathMode, r *eskip.Route, annotation string) er
 	return nil
 }
 
-func addExtraRoutes(ic ingressContext, ruleHost, path, pathType, eastWestDomain string, enableEastWest bool) {
+func (ing *ingress) addExtraRoutes(ic *ingressContext, ruleHost, path, pathType string) {
 	hosts := []string{createHostRx(ruleHost)}
 	var ns, name string
-	if ic.ingressV1 != nil {
-		name = ic.ingressV1.Metadata.Name
-		ns = ic.ingressV1.Metadata.Namespace
-
-	} else {
-		name = ic.ingress.Metadata.Name
-		ns = ic.ingress.Metadata.Namespace
-	}
-
+	name = ic.ingressV1.Metadata.Name
+	ns = ic.ingressV1.Metadata.Namespace
+	eastWestDomain := ing.kubernetesEastWestDomain
+	enableEastWest := ing.kubernetesEnableEastWest
+	ewHost := isEastWestHost(ruleHost, ing.eastWestRangeDomains)
 	// add extra routes from optional annotation
 	for extraIndex, r := range ic.extraRoutes {
 		route := *r
@@ -206,14 +202,21 @@ func addExtraRoutes(ic ingressContext, ruleHost, path, pathType, eastWestDomain 
 			ns,
 			name,
 			route.Id,
-			ruleHost+strings.Replace(path, "/", "_", -1),
+			ruleHost+strings.ReplaceAll(path, "/", "_"),
 			extraIndex)
 		setPathV1(ic.pathMode, &route, pathType, path)
-		if n := countPathRoutes(&route); n <= 1 {
+		if n := countPathPredicates(&route); n <= 1 {
+			if ewHost {
+				appendAnnotationPredicates(ing.kubernetesEastWestRangeAnnotationPredicates, ic.ingressV1.Metadata.Annotations, &route)
+				appendAnnotationFilters(ing.kubernetesEastWestRangeAnnotationFiltersAppend, ic.ingressV1.Metadata.Annotations, &route)
+			} else {
+				appendAnnotationPredicates(ing.kubernetesAnnotationPredicates, ic.ingressV1.Metadata.Annotations, &route)
+				appendAnnotationFilters(ing.kubernetesAnnotationFiltersAppend, ic.ingressV1.Metadata.Annotations, &route)
+			}
 			ic.addHostRoute(ruleHost, &route)
 			ic.redirect.updateHost(ruleHost)
 		} else {
-			log.Errorf("Failed to add route having %d path routes: %v", n, r)
+			ic.logger.Errorf("Ignoring route due to multiple path predicates: %d path predicates, route: %v", n, route)
 		}
 		if enableEastWest {
 			ewRoute := createEastWestRouteIng(eastWestDomain, name, ns, &route)
@@ -223,7 +226,7 @@ func addExtraRoutes(ic ingressContext, ruleHost, path, pathType, eastWestDomain 
 	}
 }
 
-func countPathRoutes(r *eskip.Route) int {
+func countPathPredicates(r *eskip.Route) int {
 	i := 0
 	for _, p := range r.Predicates {
 		if p.Name == "PathSubtree" || p.Name == "Path" {
@@ -237,12 +240,12 @@ func countPathRoutes(r *eskip.Route) int {
 }
 
 // parse filter and ratelimit annotation
-func annotationFilter(m *definitions.Metadata, logger *log.Entry) []*eskip.Filter {
+func annotationFilter(m *definitions.Metadata, logger *logger) []*eskip.Filter {
 	var annotationFilter string
 	if ratelimitAnnotationValue, ok := m.Annotations[ratelimitAnnotationKey]; ok {
 		annotationFilter = ratelimitAnnotationValue
 	}
-	if val, ok := m.Annotations[skipperfilterAnnotationKey]; ok {
+	if val, ok := m.Annotations[definitions.IngressFilterAnnotation]; ok {
 		if annotationFilter != "" {
 			annotationFilter += " -> "
 		}
@@ -262,47 +265,43 @@ func annotationFilter(m *definitions.Metadata, logger *log.Entry) []*eskip.Filte
 // parse predicate annotation
 func annotationPredicate(m *definitions.Metadata) string {
 	var annotationPredicate string
-	if val, ok := m.Annotations[skipperpredicateAnnotationKey]; ok {
+	if val, ok := m.Annotations[definitions.IngressPredicateAnnotation]; ok {
 		annotationPredicate = val
 	}
 	return annotationPredicate
 }
 
 // parse routes annotation
-func extraRoutes(m *definitions.Metadata, logger *log.Entry) []*eskip.Route {
+func extraRoutes(m *definitions.Metadata) []*eskip.Route {
 	var extraRoutes []*eskip.Route
-	annotationRoutes := m.Annotations[skipperRoutesAnnotationKey]
+	annotationRoutes := m.Annotations[definitions.IngressRoutesAnnotation]
 	if annotationRoutes != "" {
-		var err error
-		extraRoutes, err = eskip.Parse(annotationRoutes)
-		if err != nil {
-			logger.Errorf("failed to parse routes from %s, skipping: %v", skipperRoutesAnnotationKey, err)
-		}
+		extraRoutes, _ = eskip.Parse(annotationRoutes) // We ignore the error here because it should be handled by the validator object
 	}
 	return extraRoutes
 }
 
 // parse backend-weights annotation if it exists
-func backendWeights(m *definitions.Metadata, logger *log.Entry) map[string]float64 {
+func backendWeights(m *definitions.Metadata, logger *logger) map[string]float64 {
 	var backendWeights map[string]float64
 	if backends, ok := m.Annotations[backendWeightsAnnotationKey]; ok {
 		err := json.Unmarshal([]byte(backends), &backendWeights)
 		if err != nil {
-			logger.Errorf("error while parsing backend-weights annotation: %v", err)
+			logger.Errorf("Error while parsing backend-weights annotation: %v", err)
 		}
 	}
 	return backendWeights
 }
 
 // parse pathmode from annotation or fallback to global default
-func pathMode(m *definitions.Metadata, globalDefault PathMode) PathMode {
+func pathMode(m *definitions.Metadata, globalDefault PathMode, logger *logger) PathMode {
 	pathMode := globalDefault
 
 	if pathModeString, ok := m.Annotations[pathModeAnnotationKey]; ok {
 		if p, err := ParsePathMode(pathModeString); err != nil {
-			log.Errorf("Failed to get path mode for ingress %s/%s: %v", m.Namespace, m.Name, err)
+			logger.Errorf("Failed to get path mode: %v", err)
 		} else {
-			log.Debugf("Set pathMode to %s", p)
+			logger.Debugf("Set pathMode to %s", p)
 			pathMode = p
 		}
 	}
@@ -351,43 +350,26 @@ func hasCatchAllRoutes(routes []*eskip.Route) bool {
 	return false
 }
 
-// convert logs if an invalid found, but proceeds with the
-// valid ones.  Reporting failures in Ingress status is not possible,
-// because Ingress status field is v1beta1.LoadBalancerIngress that only
-// supports IP and Hostname as string.
-func (ing *ingress) convert(state *clusterState, df defaultFilters) ([]*eskip.Route, error) {
+// convert logs if an invalid found, but proceeds with the valid ones.
+// Reporting failures in Ingress status is not possible, because
+// Ingress status field only supports IP and Hostname as string.
+func (ing *ingress) convert(state *clusterState, df defaultFilters, r *certregistry.CertRegistry, loggingEnabled bool) ([]*eskip.Route, error) {
 	var ewIngInfo map[string][]string // r.Id -> {namespace, name}
 	if ing.kubernetesEnableEastWest {
 		ewIngInfo = make(map[string][]string)
 	}
-	routes := make([]*eskip.Route, 0, len(state.ingresses))
+	routes := make([]*eskip.Route, 0, len(state.ingressesV1))
 	hostRoutes := make(map[string][]*eskip.Route)
 	redirect := createRedirectInfo(ing.provideHTTPSRedirect, ing.httpsRedirectCode)
-	if ing.ingressV1 {
-		for _, i := range state.ingressesV1 {
-			r, err := ing.ingressV1Route(i, redirect, state, hostRoutes, df)
-			if err != nil {
-				return nil, err
-			}
-			if r != nil {
-				routes = append(routes, r)
-				if ing.kubernetesEnableEastWest {
-					ewIngInfo[r.Id] = []string{i.Metadata.Namespace, i.Metadata.Name}
-				}
-			}
+	for _, i := range state.ingressesV1 {
+		r, err := ing.ingressV1Route(i, redirect, state, hostRoutes, df, r, loggingEnabled)
+		if err != nil {
+			return nil, err
 		}
-
-	} else {
-		for _, i := range state.ingresses {
-			r, err := ing.ingressRoute(i, redirect, state, hostRoutes, df)
-			if err != nil {
-				return nil, err
-			}
-			if r != nil {
-				routes = append(routes, r)
-				if ing.kubernetesEnableEastWest {
-					ewIngInfo[r.Id] = []string{i.Metadata.Namespace, i.Metadata.Name}
-				}
+		if r != nil {
+			routes = append(routes, r)
+			if ing.kubernetesEnableEastWest {
+				ewIngInfo[r.Id] = []string{i.Metadata.Namespace, i.Metadata.Name}
 			}
 		}
 	}
@@ -400,10 +382,12 @@ func (ing *ingress) convert(state *clusterState, df defaultFilters) ([]*eskip.Ro
 		applyEastWestRange(ing.eastWestRangeDomains, ing.eastWestRangePredicates, host, rs)
 		routes = append(routes, rs...)
 
-		// if routes were configured, but there is no catchall route
-		// defined for the host name, create a route which returns 404
-		if !hasCatchAllRoutes(rs) {
-			routes = append(routes, ing.addCatchAllRoutes(host, rs[0], redirect)...)
+		if !ing.disableCatchAllRoutes {
+			// if routes were configured, but there is no catchall route
+			// defined for the host name, create a route which returns 404
+			if !hasCatchAllRoutes(rs) {
+				routes = append(routes, ing.addCatchAllRoutes(host, rs[0], redirect)...)
+			}
 		}
 	}
 
@@ -416,8 +400,30 @@ func (ing *ingress) convert(state *clusterState, df defaultFilters) ([]*eskip.Ro
 		}
 		l := len(routes)
 		routes = append(routes, ewroutes...)
-		log.Infof("enabled east west routes: %d %d %d %d", l, len(routes), len(ewroutes), len(hostRoutes))
+		log.Infof("Enabled east west routes: %d %d %d %d", l, len(routes), len(ewroutes), len(hostRoutes))
 	}
 
 	return routes, nil
+}
+
+func generateTLSCertFromSecret(secret *secret) (*tls.Certificate, error) {
+	if secret.Data[tlsSecretDataCrt] == "" || secret.Data[tlsSecretDataKey] == "" {
+		return nil, fmt.Errorf("secret must contain %s and %s in data field", tlsSecretDataCrt, tlsSecretDataKey)
+	}
+	crt, err := b64.StdEncoding.DecodeString(secret.Data[tlsSecretDataCrt])
+	if err != nil {
+		return nil, fmt.Errorf("failed to decode %s from secret %s", tlsSecretDataCrt, secret.Metadata.Name)
+	}
+	key, err := b64.StdEncoding.DecodeString(secret.Data[tlsSecretDataKey])
+	if err != nil {
+		return nil, fmt.Errorf("failed to decode %s from secret %s", tlsSecretDataKey, secret.Metadata.Name)
+	}
+	cert, err := tls.X509KeyPair([]byte(crt), []byte(key))
+	if err != nil {
+		return nil, fmt.Errorf("failed to create tls certificate from secret %s", secret.Metadata.Name)
+	}
+	if secret.Type != tlsSecretType {
+		return nil, fmt.Errorf("secret %s is not of type %s", secret.Metadata.Name, tlsSecretType)
+	}
+	return &cert, nil
 }

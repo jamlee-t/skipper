@@ -9,6 +9,8 @@ import (
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/collectors"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
+	dto "github.com/prometheus/client_model/go"
+	"google.golang.org/protobuf/proto"
 )
 
 const (
@@ -28,6 +30,7 @@ type Prometheus struct {
 	routeLookupM               *prometheus.HistogramVec
 	routeErrorsM               *prometheus.CounterVec
 	responseM                  *prometheus.HistogramVec
+	filterCreateM              *prometheus.HistogramVec
 	filterRequestM             *prometheus.HistogramVec
 	filterAllRequestM          *prometheus.HistogramVec
 	filterAllCombinedRequestM  *prometheus.HistogramVec
@@ -56,196 +59,7 @@ type Prometheus struct {
 func NewPrometheus(opts Options) *Prometheus {
 	opts = applyCompatibilityDefaults(opts)
 
-	namespace := promNamespace
-	if opts.Prefix != "" {
-		namespace = strings.TrimSuffix(opts.Prefix, ".")
-	}
-
-	routeLookup := prometheus.NewHistogramVec(prometheus.HistogramOpts{
-		Namespace: namespace,
-		Subsystem: promRouteSubsystem,
-		Name:      "lookup_duration_seconds",
-		Help:      "Duration in seconds of a route lookup.",
-		Buckets:   opts.HistogramBuckets,
-	}, []string{})
-
-	routeErrors := prometheus.NewCounterVec(prometheus.CounterOpts{
-		Namespace: namespace,
-		Subsystem: promRouteSubsystem,
-		Name:      "error_total",
-		Help:      "The total of route lookup errors.",
-	}, []string{})
-
-	response := prometheus.NewHistogramVec(prometheus.HistogramOpts{
-		Namespace: namespace,
-		Subsystem: promResponseSubsystem,
-		Name:      "duration_seconds",
-		Help:      "Duration in seconds of a response.",
-		Buckets:   opts.HistogramBuckets,
-	}, []string{"code", "method", "route"})
-
-	filterRequest := prometheus.NewHistogramVec(prometheus.HistogramOpts{
-		Namespace: namespace,
-		Subsystem: promFilterSubsystem,
-		Name:      "request_duration_seconds",
-		Help:      "Duration in seconds of a filter request.",
-		Buckets:   opts.HistogramBuckets,
-	}, []string{"filter"})
-
-	filterAllRequest := prometheus.NewHistogramVec(prometheus.HistogramOpts{
-		Namespace: namespace,
-		Subsystem: promFilterSubsystem,
-		Name:      "all_request_duration_seconds",
-		Help:      "Duration in seconds of a filter request by all filters.",
-		Buckets:   opts.HistogramBuckets,
-	}, []string{"route"})
-
-	filterAllCombinedRequest := prometheus.NewHistogramVec(prometheus.HistogramOpts{
-		Namespace: namespace,
-		Subsystem: promFilterSubsystem,
-		Name:      "all_combined_request_duration_seconds",
-		Help:      "Duration in seconds of a filter request combined by all filters.",
-		Buckets:   opts.HistogramBuckets,
-	}, []string{})
-
-	proxyBackend := prometheus.NewHistogramVec(prometheus.HistogramOpts{
-		Namespace: namespace,
-		Subsystem: promProxySubsystem,
-		Name:      "duration_seconds",
-		Help:      "Duration in seconds of a proxy backend.",
-		Buckets:   opts.HistogramBuckets,
-	}, []string{"route", "host"})
-
-	proxyBackendCombined := prometheus.NewHistogramVec(prometheus.HistogramOpts{
-		Namespace: namespace,
-		Subsystem: promProxySubsystem,
-		Name:      "combined_duration_seconds",
-		Help:      "Duration in seconds of a proxy backend combined.",
-		Buckets:   opts.HistogramBuckets,
-	}, []string{})
-
-	filterResponse := prometheus.NewHistogramVec(prometheus.HistogramOpts{
-		Namespace: namespace,
-		Subsystem: promFilterSubsystem,
-		Name:      "response_duration_seconds",
-		Help:      "Duration in seconds of a filter request.",
-		Buckets:   opts.HistogramBuckets,
-	}, []string{"filter"})
-
-	filterAllResponse := prometheus.NewHistogramVec(prometheus.HistogramOpts{
-		Namespace: namespace,
-		Subsystem: promFilterSubsystem,
-		Name:      "all_response_duration_seconds",
-		Help:      "Duration in seconds of a filter response by all filters.",
-		Buckets:   opts.HistogramBuckets,
-	}, []string{"route"})
-
-	filterAllCombinedResponse := prometheus.NewHistogramVec(prometheus.HistogramOpts{
-		Namespace: namespace,
-		Subsystem: promFilterSubsystem,
-		Name:      "all_combined_response_duration_seconds",
-		Help:      "Duration in seconds of a filter response combined by all filters.",
-		Buckets:   opts.HistogramBuckets,
-	}, []string{})
-
-	metrics := []string{}
-	if opts.EnableServeStatusCodeMetric {
-		metrics = append(metrics, "code")
-	}
-	if opts.EnableServeMethodMetric {
-		metrics = append(metrics, "method")
-	}
-	serveRoute := prometheus.NewHistogramVec(prometheus.HistogramOpts{
-		Namespace: namespace,
-		Subsystem: promServeSubsystem,
-		Name:      "route_duration_seconds",
-		Help:      "Duration in seconds of serving a route.",
-		Buckets:   opts.HistogramBuckets,
-	}, append(metrics, "route"))
-	serveRouteCounter := prometheus.NewCounterVec(prometheus.CounterOpts{
-		Namespace: namespace,
-		Subsystem: promServeSubsystem,
-		Name:      "route_count",
-		Help:      "Total number of requests of serving a route.",
-	}, []string{"code", "method", "route"})
-
-	serveHost := prometheus.NewHistogramVec(prometheus.HistogramOpts{
-		Namespace: namespace,
-		Subsystem: promServeSubsystem,
-		Name:      "host_duration_seconds",
-		Help:      "Duration in seconds of serving a host.",
-		Buckets:   opts.HistogramBuckets,
-	}, append(metrics, "host"))
-	serveHostCounter := prometheus.NewCounterVec(prometheus.CounterOpts{
-		Namespace: namespace,
-		Subsystem: promServeSubsystem,
-		Name:      "host_count",
-		Help:      "Total number of requests of serving a host.",
-	}, []string{"code", "method", "host"})
-
-	proxyBackend5xx := prometheus.NewHistogramVec(prometheus.HistogramOpts{
-		Namespace: namespace,
-		Subsystem: promProxySubsystem,
-		Name:      "5xx_duration_seconds",
-		Help:      "Duration in seconds of backend 5xx.",
-		Buckets:   opts.HistogramBuckets,
-	}, []string{})
-	proxyBackendErrors := prometheus.NewCounterVec(prometheus.CounterOpts{
-		Namespace: namespace,
-		Subsystem: promProxySubsystem,
-		Name:      "error_total",
-		Help:      "Total number of backend route errors.",
-	}, []string{"route"})
-	proxyStreamingErrors := prometheus.NewCounterVec(prometheus.CounterOpts{
-		Namespace: namespace,
-		Subsystem: promStreamingSubsystem,
-		Name:      "error_total",
-		Help:      "Total number of streaming route errors.",
-	}, []string{"route"})
-
-	customCounter := prometheus.NewCounterVec(prometheus.CounterOpts{
-		Namespace: namespace,
-		Subsystem: promCustomSubsystem,
-		Name:      "total",
-		Help:      "Total number of custom metrics.",
-	}, []string{"key"})
-	customGauge := prometheus.NewGaugeVec(prometheus.GaugeOpts{
-		Namespace: namespace,
-		Subsystem: promCustomSubsystem,
-		Name:      "gauges",
-		Help:      "Gauges number of custom metrics.",
-	}, []string{"key"})
-	customHistogram := prometheus.NewHistogramVec(prometheus.HistogramOpts{
-		Namespace: namespace,
-		Subsystem: promCustomSubsystem,
-		Name:      "duration_seconds",
-		Help:      "Duration in seconds of custom metrics.",
-		Buckets:   opts.HistogramBuckets,
-	}, []string{"key"})
-
 	p := &Prometheus{
-		routeLookupM:               routeLookup,
-		routeErrorsM:               routeErrors,
-		responseM:                  response,
-		filterRequestM:             filterRequest,
-		filterAllRequestM:          filterAllRequest,
-		filterAllCombinedRequestM:  filterAllCombinedRequest,
-		proxyBackendM:              proxyBackend,
-		proxyBackendCombinedM:      proxyBackendCombined,
-		filterResponseM:            filterResponse,
-		filterAllResponseM:         filterAllResponse,
-		filterAllCombinedResponseM: filterAllCombinedResponse,
-		serveRouteM:                serveRoute,
-		serveRouteCounterM:         serveRouteCounter,
-		serveHostM:                 serveHost,
-		serveHostCounterM:          serveHostCounter,
-		proxyBackend5xxM:           proxyBackend5xx,
-		proxyBackendErrorsM:        proxyBackendErrors,
-		proxyStreamingErrorsM:      proxyStreamingErrors,
-		customCounterM:             customCounter,
-		customGaugeM:               customGauge,
-		customHistogramM:           customHistogram,
-
 		registry: opts.PrometheusRegistry,
 		opts:     opts,
 	}
@@ -254,8 +68,187 @@ func NewPrometheus(opts Options) *Prometheus {
 		p.registry = prometheus.NewRegistry()
 	}
 
-	// Register all metrics.
-	p.registerMetrics()
+	namespace := promNamespace
+	if opts.Prefix != "" {
+		namespace = strings.TrimSuffix(opts.Prefix, ".")
+	}
+
+	p.routeLookupM = register(p, prometheus.NewHistogramVec(prometheus.HistogramOpts{
+		Namespace: namespace,
+		Subsystem: promRouteSubsystem,
+		Name:      "lookup_duration_seconds",
+		Help:      "Duration in seconds of a route lookup.",
+		Buckets:   opts.HistogramBuckets,
+	}, []string{}))
+
+	p.routeErrorsM = register(p, prometheus.NewCounterVec(prometheus.CounterOpts{
+		Namespace: namespace,
+		Subsystem: promRouteSubsystem,
+		Name:      "error_total",
+		Help:      "The total of route lookup errors.",
+	}, []string{}))
+
+	p.responseM = register(p, prometheus.NewHistogramVec(prometheus.HistogramOpts{
+		Namespace: namespace,
+		Subsystem: promResponseSubsystem,
+		Name:      "duration_seconds",
+		Help:      "Duration in seconds of a response.",
+		Buckets:   opts.HistogramBuckets,
+	}, []string{"code", "method", "route"}))
+
+	p.filterCreateM = register(p, prometheus.NewHistogramVec(prometheus.HistogramOpts{
+		Namespace: namespace,
+		Subsystem: promFilterSubsystem,
+		Name:      "create_duration_seconds",
+		Help:      "Duration in seconds of filter creation.",
+		Buckets:   opts.HistogramBuckets,
+	}, []string{"filter"}))
+
+	p.filterRequestM = register(p, prometheus.NewHistogramVec(prometheus.HistogramOpts{
+		Namespace: namespace,
+		Subsystem: promFilterSubsystem,
+		Name:      "request_duration_seconds",
+		Help:      "Duration in seconds of a filter request.",
+		Buckets:   opts.HistogramBuckets,
+	}, []string{"filter"}))
+
+	p.filterAllRequestM = register(p, prometheus.NewHistogramVec(prometheus.HistogramOpts{
+		Namespace: namespace,
+		Subsystem: promFilterSubsystem,
+		Name:      "all_request_duration_seconds",
+		Help:      "Duration in seconds of a filter request by all filters.",
+		Buckets:   opts.HistogramBuckets,
+	}, []string{"route"}))
+
+	p.filterAllCombinedRequestM = register(p, prometheus.NewHistogramVec(prometheus.HistogramOpts{
+		Namespace: namespace,
+		Subsystem: promFilterSubsystem,
+		Name:      "all_combined_request_duration_seconds",
+		Help:      "Duration in seconds of a filter request combined by all filters.",
+		Buckets:   opts.HistogramBuckets,
+	}, []string{}))
+
+	p.proxyBackendM = register(p, prometheus.NewHistogramVec(prometheus.HistogramOpts{
+		Namespace: namespace,
+		Subsystem: promProxySubsystem,
+		Name:      "duration_seconds",
+		Help:      "Duration in seconds of a proxy backend.",
+		Buckets:   opts.HistogramBuckets,
+	}, []string{"route", "host"}))
+
+	p.proxyBackendCombinedM = register(p, prometheus.NewHistogramVec(prometheus.HistogramOpts{
+		Namespace: namespace,
+		Subsystem: promProxySubsystem,
+		Name:      "combined_duration_seconds",
+		Help:      "Duration in seconds of a proxy backend combined.",
+		Buckets:   opts.HistogramBuckets,
+	}, []string{}))
+
+	p.filterResponseM = register(p, prometheus.NewHistogramVec(prometheus.HistogramOpts{
+		Namespace: namespace,
+		Subsystem: promFilterSubsystem,
+		Name:      "response_duration_seconds",
+		Help:      "Duration in seconds of a filter request.",
+		Buckets:   opts.HistogramBuckets,
+	}, []string{"filter"}))
+
+	p.filterAllResponseM = register(p, prometheus.NewHistogramVec(prometheus.HistogramOpts{
+		Namespace: namespace,
+		Subsystem: promFilterSubsystem,
+		Name:      "all_response_duration_seconds",
+		Help:      "Duration in seconds of a filter response by all filters.",
+		Buckets:   opts.HistogramBuckets,
+	}, []string{"route"}))
+
+	p.filterAllCombinedResponseM = register(p, prometheus.NewHistogramVec(prometheus.HistogramOpts{
+		Namespace: namespace,
+		Subsystem: promFilterSubsystem,
+		Name:      "all_combined_response_duration_seconds",
+		Help:      "Duration in seconds of a filter response combined by all filters.",
+		Buckets:   opts.HistogramBuckets,
+	}, []string{}))
+
+	metrics := []string{}
+	if opts.EnableServeStatusCodeMetric {
+		metrics = append(metrics, "code")
+	}
+	if opts.EnableServeMethodMetric {
+		metrics = append(metrics, "method")
+	}
+	p.serveRouteM = register(p, prometheus.NewHistogramVec(prometheus.HistogramOpts{
+		Namespace: namespace,
+		Subsystem: promServeSubsystem,
+		Name:      "route_duration_seconds",
+		Help:      "Duration in seconds of serving a route.",
+		Buckets:   opts.HistogramBuckets,
+	}, append(metrics, "route")))
+	p.serveRouteCounterM = register(p, prometheus.NewCounterVec(prometheus.CounterOpts{
+		Namespace: namespace,
+		Subsystem: promServeSubsystem,
+		Name:      "route_count",
+		Help:      "Total number of requests of serving a route.",
+	}, []string{"code", "method", "route"}))
+
+	p.serveHostM = register(p, prometheus.NewHistogramVec(prometheus.HistogramOpts{
+		Namespace: namespace,
+		Subsystem: promServeSubsystem,
+		Name:      "host_duration_seconds",
+		Help:      "Duration in seconds of serving a host.",
+		Buckets:   opts.HistogramBuckets,
+	}, append(metrics, "host")))
+	p.serveHostCounterM = register(p, prometheus.NewCounterVec(prometheus.CounterOpts{
+		Namespace: namespace,
+		Subsystem: promServeSubsystem,
+		Name:      "host_count",
+		Help:      "Total number of requests of serving a host.",
+	}, []string{"code", "method", "host"}))
+
+	p.proxyBackend5xxM = register(p, prometheus.NewHistogramVec(prometheus.HistogramOpts{
+		Namespace: namespace,
+		Subsystem: promProxySubsystem,
+		Name:      "5xx_duration_seconds",
+		Help:      "Duration in seconds of backend 5xx.",
+		Buckets:   opts.HistogramBuckets,
+	}, []string{}))
+	p.proxyBackendErrorsM = register(p, prometheus.NewCounterVec(prometheus.CounterOpts{
+		Namespace: namespace,
+		Subsystem: promProxySubsystem,
+		Name:      "error_total",
+		Help:      "Total number of backend route errors.",
+	}, []string{"route"}))
+	p.proxyStreamingErrorsM = register(p, prometheus.NewCounterVec(prometheus.CounterOpts{
+		Namespace: namespace,
+		Subsystem: promStreamingSubsystem,
+		Name:      "error_total",
+		Help:      "Total number of streaming route errors.",
+	}, []string{"route"}))
+
+	p.customCounterM = register(p, prometheus.NewCounterVec(prometheus.CounterOpts{
+		Namespace: namespace,
+		Subsystem: promCustomSubsystem,
+		Name:      "total",
+		Help:      "Total number of custom metrics.",
+	}, []string{"key"}))
+	p.customGaugeM = register(p, prometheus.NewGaugeVec(prometheus.GaugeOpts{
+		Namespace: namespace,
+		Subsystem: promCustomSubsystem,
+		Name:      "gauges",
+		Help:      "Gauges number of custom metrics.",
+	}, []string{"key"}))
+	p.customHistogramM = register(p, prometheus.NewHistogramVec(prometheus.HistogramOpts{
+		Namespace: namespace,
+		Subsystem: promCustomSubsystem,
+		Name:      "duration_seconds",
+		Help:      "Duration in seconds of custom metrics.",
+		Buckets:   opts.HistogramBuckets,
+	}, []string{"key"}))
+
+	// Register prometheus runtime collectors if required.
+	if opts.EnableRuntimeMetrics {
+		register(p, collectors.NewProcessCollector(collectors.ProcessCollectorOpts{}))
+		register(p, collectors.NewGoCollector())
+	}
+
 	return p
 }
 
@@ -264,38 +257,17 @@ func (p *Prometheus) sinceS(start time.Time) float64 {
 	return time.Since(start).Seconds()
 }
 
-func (p *Prometheus) registerMetrics() {
-	p.registry.MustRegister(p.routeLookupM)
-	p.registry.MustRegister(p.responseM)
-	p.registry.MustRegister(p.routeErrorsM)
-	p.registry.MustRegister(p.filterRequestM)
-	p.registry.MustRegister(p.filterAllRequestM)
-	p.registry.MustRegister(p.filterAllCombinedRequestM)
-	p.registry.MustRegister(p.proxyBackendM)
-	p.registry.MustRegister(p.proxyBackendCombinedM)
-	p.registry.MustRegister(p.filterResponseM)
-	p.registry.MustRegister(p.filterAllResponseM)
-	p.registry.MustRegister(p.filterAllCombinedResponseM)
-	p.registry.MustRegister(p.serveRouteM)
-	p.registry.MustRegister(p.serveRouteCounterM)
-	p.registry.MustRegister(p.serveHostM)
-	p.registry.MustRegister(p.serveHostCounterM)
-	p.registry.MustRegister(p.proxyBackend5xxM)
-	p.registry.MustRegister(p.proxyBackendErrorsM)
-	p.registry.MustRegister(p.proxyStreamingErrorsM)
-	p.registry.MustRegister(p.customCounterM)
-	p.registry.MustRegister(p.customHistogramM)
-	p.registry.MustRegister(p.customGaugeM)
-
-	// Register prometheus runtime collectors if required.
-	if p.opts.EnableRuntimeMetrics {
-		p.registry.MustRegister(collectors.NewProcessCollector(collectors.ProcessCollectorOpts{}))
-		p.registry.MustRegister(collectors.NewGoCollector())
-	}
+func register[T prometheus.Collector](p *Prometheus, cs T) T {
+	p.registry.MustRegister(cs)
+	return cs
 }
 
 func (p *Prometheus) CreateHandler() http.Handler {
-	return promhttp.HandlerFor(p.registry, promhttp.HandlerOpts{})
+	var gatherer prometheus.Gatherer = p.registry
+	if p.opts.EnablePrometheusStartLabel {
+		gatherer = withStartLabelGatherer{p.registry}
+	}
+	return promhttp.HandlerFor(gatherer, promhttp.HandlerOpts{})
 }
 
 func (p *Prometheus) getHandler() http.Handler {
@@ -344,6 +316,11 @@ func (p *Prometheus) UpdateGauge(key string, v float64) {
 func (p *Prometheus) MeasureRouteLookup(start time.Time) {
 	t := p.sinceS(start)
 	p.routeLookupM.WithLabelValues().Observe(t)
+}
+
+func (p *Prometheus) MeasureFilterCreate(filterName string, start time.Time) {
+	t := p.sinceS(start)
+	p.filterCreateM.WithLabelValues(filterName).Observe(t)
 }
 
 // MeasureFilterRequest satisfies Metrics interface.
@@ -454,4 +431,27 @@ func (p *Prometheus) MeasureBackend5xx(start time.Time) {
 // IncErrorsStreaming satisfies Metrics interface.
 func (p *Prometheus) IncErrorsStreaming(routeID string) {
 	p.proxyStreamingErrorsM.WithLabelValues(routeID).Inc()
+}
+
+func (p *Prometheus) Close() {}
+
+// withStartLabelGatherer adds a "start" label to all counters with
+// the value of counter creation timestamp as unix nanoseconds.
+type withStartLabelGatherer struct {
+	*prometheus.Registry
+}
+
+func (g withStartLabelGatherer) Gather() ([]*dto.MetricFamily, error) {
+	metricFamilies, err := g.Registry.Gather()
+	for _, metricFamily := range metricFamilies {
+		if metricFamily.GetType() == dto.MetricType_COUNTER {
+			for _, metric := range metricFamily.Metric {
+				metric.Label = append(metric.Label, &dto.LabelPair{
+					Name:  proto.String("start"),
+					Value: proto.String(fmt.Sprintf("%d", metric.Counter.CreatedTimestamp.AsTime().UnixNano())),
+				})
+			}
+		}
+	}
+	return metricFamilies, err
 }

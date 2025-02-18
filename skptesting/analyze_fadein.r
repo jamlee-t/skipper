@@ -46,7 +46,8 @@ if (is.null(opt$title)) {
 ## set that we write to png file
 png(out)
 
-dat <- read.csv(con, sep=opt$sep)
+datWithT <- read.csv(con, sep=opt$sep)
+dat <- datWithT[,-1]
 
 ## hack to parameterize formula
 ## we have to create c(a,b,c,d,e,f) where a,b,..,f depend on the read CSV we don't know yet
@@ -55,11 +56,14 @@ strFactor <- paste(
     paste(names(dat), collapse=","),
     ")",
     collapse=" ", sep="")
-## create the formula c(a,b,c,d,e,f) ~ c(1:length(dat$a))
-f <- eval(parse(text=strFactor)) ~ c(1:length(dat$a))
+## create the formula c(a,b,c,d,e,f) ~ c(1:nrow(dat))
+f <- eval(parse(text=strFactor)) ~ c(1:nrow(dat))
+colors <- c("blue", "green", "red", "black", "magenta", "yellow", "cyan")
 
 xyplot(f,
        data=dat,
-       xlab="iterations", ylab="hits", ylim=c(0:max(dat$a)+200), between=list(x=0,y=100),
-       auto.key=TRUE,
-       main=title)
+       xlab="iterations", ylab="hits", ylim=c(0, max(dat)+200), between=list(x=0,y=100),
+       key=list(space="bottom",
+         points=list(col=head(colors, n=ncol(dat)), pch=1),
+         text=list(names(dat)), cex=0.6),
+       main=title, col=rep(colors, each=nrow(dat)))

@@ -16,6 +16,7 @@ import (
 	log "github.com/sirupsen/logrus"
 	"github.com/zalando/skipper/dataclients/kubernetes"
 	"github.com/zalando/skipper/eskip"
+	"github.com/zalando/skipper/secrets/certregistry"
 	"gopkg.in/yaml.v2"
 )
 
@@ -31,17 +32,31 @@ type fixtureSet struct {
 }
 
 type kubeOptionsParser struct {
-	IngressV1                bool               `yaml:"ingressv1"`
-	EastWest                 bool               `yaml:"eastWest"`
-	EastWestDomain           string             `yaml:"eastWestDomain"`
-	EastWestRangeDomains     []string           `yaml:"eastWestRangeDomains"`
-	EastWestRangePredicates  []*eskip.Predicate `yaml:"eastWestRangePredicatesAppend"`
-	HTTPSRedirect            bool               `yaml:"httpsRedirect"`
-	HTTPSRedirectCode        int                `yaml:"httpsRedirectCode"`
-	BackendNameTracingTag    bool               `yaml:"backendNameTracingTag"`
-	OnlyAllowedExternalNames bool               `yaml:"onlyAllowedExternalNames"`
-	AllowedExternalNames     []string           `yaml:"allowedExternalNames"`
-	IngressClass             string             `yaml:"kubernetes-ingress-class"`
+	IngressV1                                      bool                              `yaml:"ingressv1"`
+	EastWest                                       bool                              `yaml:"eastWest"`
+	EastWestDomain                                 string                            `yaml:"eastWestDomain"`
+	EastWestRangeDomains                           []string                          `yaml:"eastWestRangeDomains"`
+	EastWestRangePredicates                        []*eskip.Predicate                `yaml:"eastWestRangePredicatesAppend"`
+	HTTPSRedirect                                  bool                              `yaml:"httpsRedirect"`
+	HTTPSRedirectCode                              int                               `yaml:"httpsRedirectCode"`
+	DisableCatchAllRoutes                          bool                              `yaml:"disableCatchAllRoutes"`
+	BackendNameTracingTag                          bool                              `yaml:"backendNameTracingTag"`
+	OnlyAllowedExternalNames                       bool                              `yaml:"onlyAllowedExternalNames"`
+	AllowedExternalNames                           []string                          `yaml:"allowedExternalNames"`
+	IngressClass                                   string                            `yaml:"kubernetes-ingress-class"`
+	KubernetesEnableEndpointSlices                 bool                              `yaml:"enable-kubernetes-endpointslices"`
+	KubernetesEnableTLS                            bool                              `yaml:"kubernetes-enable-tls"`
+	IngressesLabels                                map[string]string                 `yaml:"kubernetes-ingresses-label-selector"`
+	ServicesLabels                                 map[string]string                 `yaml:"kubernetes-services-label-selector"`
+	EndpointsLabels                                map[string]string                 `yaml:"kubernetes-endpoints-label-selector"`
+	EndpointsliceLabels                            map[string]string                 `yaml:"kubernetes-endpointslice-label-selector"`
+	ForceKubernetesService                         bool                              `yaml:"force-kubernetes-service"`
+	BackendTrafficAlgorithm                        string                            `yaml:"backend-traffic-algorithm"`
+	DefaultLoadBalancerAlgorithm                   string                            `yaml:"default-lb-algorithm"`
+	KubernetesAnnotationPredicates                 []kubernetes.AnnotationPredicates `yaml:"kubernetesAnnotationPredicates"`
+	KubernetesAnnotationFiltersAppend              []kubernetes.AnnotationFilters    `yaml:"kubernetesAnnotationFiltersAppend"`
+	KubernetesEastWestRangeAnnotationPredicates    []kubernetes.AnnotationPredicates `yaml:"kubernetesEastWestRangeAnnotationPredicates"`
+	KubernetesEastWestRangeAnnotationFiltersAppend []kubernetes.AnnotationFilters    `yaml:"kubernetesEastWestRangeAnnotationFiltersAppend"`
 }
 
 func baseNoExt(n string) string {
@@ -51,7 +66,7 @@ func baseNoExt(n string) string {
 
 // iterate over file names, looking for the ones with '.yaml' and '.eskip' extensions
 // and same name, tolerating other files among the fixtures.
-func rangeOverFixtures(t *testing.T, dir string, fs []os.FileInfo, test func(fixtureSet)) {
+func rangeOverFixtures(dir string, fs []os.FileInfo, test func(fixtureSet)) {
 	// sort to ensure that the files belonging together by name are next to each other,
 	// without extension
 	sort.Slice(fs, func(i, j int) bool {
@@ -131,7 +146,7 @@ func safeFileClose(t *testing.T, fd *os.File) {
 }
 
 func compileRegexps(s []string) ([]*regexp.Regexp, error) {
-	var r []*regexp.Regexp
+	r := make([]*regexp.Regexp, 0, len(s))
 	for _, si := range s {
 		ri, err := regexp.Compile(si)
 		if err != nil {
@@ -191,6 +206,7 @@ func testFixture(t *testing.T, f fixtureSet) {
 	}()
 
 	var o kubernetes.Options
+	var cr *certregistry.CertRegistry
 	if f.kube != "" {
 		ko, err := os.Open(f.kube)
 		if err != nil {
@@ -208,15 +224,37 @@ func testFixture(t *testing.T, f fixtureSet) {
 			t.Fatal(err)
 		}
 
-		o.KubernetesIngressV1 = kop.IngressV1
+		if kop.KubernetesEnableTLS {
+			cr = certregistry.NewCertRegistry()
+		}
+
+		o.KubernetesEnableEndpointslices = kop.KubernetesEnableEndpointSlices
 		o.KubernetesEnableEastWest = kop.EastWest
 		o.KubernetesEastWestDomain = kop.EastWestDomain
 		o.KubernetesEastWestRangeDomains = kop.EastWestRangeDomains
 		o.KubernetesEastWestRangePredicates = kop.EastWestRangePredicates
+		o.KubernetesAnnotationPredicates = kop.KubernetesAnnotationPredicates
+		o.KubernetesAnnotationFiltersAppend = kop.KubernetesAnnotationFiltersAppend
+		o.KubernetesEastWestRangeAnnotationPredicates = kop.KubernetesEastWestRangeAnnotationPredicates
+		o.KubernetesEastWestRangeAnnotationFiltersAppend = kop.KubernetesEastWestRangeAnnotationFiltersAppend
 		o.ProvideHTTPSRedirect = kop.HTTPSRedirect
 		o.HTTPSRedirectCode = kop.HTTPSRedirectCode
+		o.DisableCatchAllRoutes = kop.DisableCatchAllRoutes
 		o.BackendNameTracingTag = kop.BackendNameTracingTag
 		o.IngressClass = kop.IngressClass
+		o.CertificateRegistry = cr
+		o.IngressLabelSelectors = kop.IngressesLabels
+		o.ServicesLabelSelectors = kop.ServicesLabels
+		o.EndpointsLabelSelectors = kop.EndpointsLabels
+		o.ForceKubernetesService = kop.ForceKubernetesService
+		o.DefaultLoadBalancerAlgorithm = kop.DefaultLoadBalancerAlgorithm
+
+		if kop.BackendTrafficAlgorithm != "" {
+			o.BackendTrafficAlgorithm, err = kubernetes.ParseBackendTrafficAlgorithm(kop.BackendTrafficAlgorithm)
+			if err != nil {
+				t.Fatal(err)
+			}
+		}
 
 		aen, err := compileRegexps(kop.AllowedExternalNames)
 		if err != nil {
@@ -236,6 +274,10 @@ func testFixture(t *testing.T, f fixtureSet) {
 	defer c.Close()
 
 	routes, err := c.LoadAll()
+	if f.api == "" && err != nil {
+		t.Fatalf("LoadAll failed: %v", err)
+	}
+
 	if f.eskip != "" {
 		eskp, err := os.Open(f.eskip)
 		if err != nil {
@@ -264,7 +306,7 @@ func testFixture(t *testing.T, f fixtureSet) {
 			t.Logf("routes: %d, expected: %d", len(routes), len(expectedRoutes))
 			t.Logf("got:\n%s", eskip.String(eskip.CanonicalList(routes)...))
 			t.Logf("expected:\n%s", eskip.String(eskip.CanonicalList(expectedRoutes)...))
-			t.Logf("diff\n%s:", cmp.Diff(
+			t.Logf("diff:\n%s", cmp.Diff(
 				eskip.Print(eskip.PrettyPrintInfo{Pretty: true}, eskip.CanonicalList(expectedRoutes)...),
 				eskip.Print(eskip.PrettyPrintInfo{Pretty: true}, eskip.CanonicalList(routes)...),
 			))
@@ -292,6 +334,7 @@ func testFixture(t *testing.T, f fixtureSet) {
 			}
 
 			t.Errorf("Failed to match log: %v.", err)
+			t.Logf("Got: %s", logBuf.String())
 			t.Logf("Expected: %s", string(b))
 		}
 	}
@@ -319,7 +362,7 @@ func FixturesToTest(t *testing.T, dirs ...string) {
 			t.Fatal(err)
 		}
 
-		rangeOverFixtures(t, dir, fs, func(f fixtureSet) {
+		rangeOverFixtures(dir, fs, func(f fixtureSet) {
 			t.Run(f.name, func(t *testing.T) {
 				testFixture(t, f)
 			})

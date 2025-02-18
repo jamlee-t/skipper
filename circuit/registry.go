@@ -12,8 +12,8 @@ const DefaultIdleTTL = time.Hour
 type Registry struct {
 	defaults     BreakerSettings
 	hostSettings map[string]BreakerSettings
+	mu           sync.Mutex
 	lookup       map[BreakerSettings]*Breaker
-	mx           *sync.Mutex
 }
 
 // NewRegistry initializes a registry with the provided default settings. Settings with an empty Host field are
@@ -50,7 +50,6 @@ func NewRegistry(settings ...BreakerSettings) *Registry {
 		defaults:     defaults,
 		hostSettings: hs,
 		lookup:       make(map[BreakerSettings]*Breaker),
-		mx:           &sync.Mutex{},
 	}
 }
 
@@ -72,8 +71,8 @@ func (r *Registry) dropIdle(now time.Time) {
 }
 
 func (r *Registry) get(s BreakerSettings) *Breaker {
-	r.mx.Lock()
-	defer r.mx.Unlock()
+	r.mu.Lock()
+	defer r.mu.Unlock()
 
 	now := time.Now()
 
@@ -96,7 +95,7 @@ func (r *Registry) get(s BreakerSettings) *Breaker {
 // Get returns a circuit breaker for the provided settings. The BreakerSettings object is used here as a key,
 // but typically it is enough to just set its Host field:
 //
-// 	r.Get(BreakerSettings{Host: backendHost})
+//	r.Get(BreakerSettings{Host: backendHost})
 //
 // The key will be filled up with the defaults and the matching circuit breaker will be returned if it exists,
 // or a new one will be created if not.

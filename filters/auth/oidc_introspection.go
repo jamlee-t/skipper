@@ -19,7 +19,7 @@ const (
 	oidcClaimsCacheKey = "oidcclaimscachekey"
 )
 
-var gjsonModifierMutex = sync.RWMutex{}
+var gjsonMu sync.RWMutex
 
 type (
 	oidcIntrospectionSpec struct {
@@ -39,6 +39,14 @@ type (
 func NewOIDCQueryClaimsFilter() filters.Spec {
 	return &oidcIntrospectionSpec{
 		typ: checkOIDCQueryClaims,
+	}
+}
+
+// Sets OIDC claims in the state bag.
+// Intended for use with the oidcClaimsQuery filter.
+func SetOIDCClaims(ctx filters.FilterContext, claims map[string]interface{}) {
+	ctx.StateBag()[oidcClaimsCacheKey] = tokenContainer{
+		Claims: claims,
 	}
 }
 
@@ -64,39 +72,39 @@ func (spec *oidcIntrospectionSpec) CreateFilter(args []interface{}) (filters.Fil
 	switch filter.typ {
 	case checkOIDCQueryClaims:
 		for _, arg := range sargs {
-			slice := strings.SplitN(arg, ":", 2)
-			if len(slice) != 2 {
+			path, queries, found := strings.Cut(arg, ":")
+			if !found || path == "" {
 				return nil, fmt.Errorf("%v: malformatted filter arg %s", filters.ErrInvalidFilterParameters, arg)
 			}
-			pq := pathQuery{path: slice[0]}
-			for _, query := range splitQueries(slice[1]) {
+			pq := pathQuery{path: path}
+			for _, query := range splitQueries(queries) {
 				if query == "" {
-					return nil, fmt.Errorf("%v: %s", errUnsupportedClaimSpecified, arg)
+					return nil, fmt.Errorf("%w: %s", errUnsupportedClaimSpecified, arg)
 				}
 				pq.queries = append(pq.queries, trimQuotes(query))
 			}
 			if len(pq.queries) == 0 {
-				return nil, fmt.Errorf("%v: %s", errUnsupportedClaimSpecified, arg)
+				return nil, fmt.Errorf("%w: %s", errUnsupportedClaimSpecified, arg)
 			}
 			filter.paths = append(filter.paths, pq)
 		}
 		if len(filter.paths) == 0 {
-			return nil, fmt.Errorf("%v: no queries could be parsed", errUnsupportedClaimSpecified)
+			return nil, fmt.Errorf("%w: no queries could be parsed", errUnsupportedClaimSpecified)
 		}
 	default:
 		return nil, filters.ErrInvalidFilterParameters
 	}
 
-	gjsonModifierMutex.RLock()
+	gjsonMu.RLock()
 	// method is not thread safe
 	modExists := gjson.ModifierExists("_", gjsonThisModifier)
-	gjsonModifierMutex.RUnlock()
+	gjsonMu.RUnlock()
 
 	if !modExists {
-		gjsonModifierMutex.Lock()
+		gjsonMu.Lock()
 		// method is not thread safe
 		gjson.AddModifier("_", gjsonThisModifier)
-		gjsonModifierMutex.Unlock()
+		gjsonMu.Unlock()
 	}
 
 	return filter, nil
@@ -115,7 +123,7 @@ func (filter *oidcIntrospectionFilter) Request(ctx filters.FilterContext) {
 
 	token, ok := ctx.StateBag()[oidcClaimsCacheKey].(tokenContainer)
 	if !ok || &token == (&tokenContainer{}) || len(token.Claims) == 0 {
-		log.Errorf("Error retrieving %s for OIDC token introspection", oidcClaimsCacheKey)
+		ctx.Logger().Errorf("Error retrieving %s for OIDC token introspection", oidcClaimsCacheKey)
 		unauthorized(ctx, "", missingToken, r.Host, oidcClaimsCacheKey+" is unavailable in StateBag")
 		return
 	}

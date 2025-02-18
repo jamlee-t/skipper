@@ -12,7 +12,11 @@ import (
 	"github.com/zalando/skipper/eskip"
 	"github.com/zalando/skipper/filters"
 	"github.com/zalando/skipper/filters/filtertest"
+	"github.com/zalando/skipper/net"
 	"github.com/zalando/skipper/proxy/proxytest"
+	"github.com/zalando/skipper/routing"
+	"github.com/zalando/skipper/routing/testdataclient"
+	"github.com/zalando/skipper/tracing/tracers/basic"
 )
 
 var (
@@ -144,7 +148,7 @@ func TestTeeEndToEndBody(t *testing.T) {
 
 	routeStr := fmt.Sprintf(`route1: * -> tee("%v") -> "%v";`, shadowUrl, originalUrl)
 
-	route, _ := eskip.Parse(routeStr)
+	route := eskip.MustParse(routeStr)
 	registry := make(filters.Registry)
 	registry.Register(NewTee())
 	p := proxytest.New(registry, route...)
@@ -167,6 +171,105 @@ func TestTeeEndToEndBody(t *testing.T) {
 
 	rsp.Body.Close()
 	if shadowHandler.body != testingStr || originalHandler.body != testingStr {
+		t.Error("Bodies are not equal")
+	}
+}
+
+func TestTeeEndToEndBody2TeeRoutesAndClosing(t *testing.T) {
+	tracer, err := basic.InitTracer([]string{"recorder=in-memory"})
+	if err != nil {
+		t.Fatalf("Failed to get a tracer: %v", err)
+	}
+	defer tracer.Close()
+
+	shadowHandler := newTestHandler(t, "shadow")
+	shadowServer := httptest.NewServer(shadowHandler)
+	shadowUrl := shadowServer.URL
+	defer shadowServer.Close()
+
+	originalHandler := newTestHandler(t, "original")
+	originalServer := httptest.NewServer(originalHandler)
+	originalUrl := originalServer.URL
+	defer originalServer.Close()
+
+	routeStrNoShadow := fmt.Sprintf(`route1: * -> "%v";`, originalUrl)
+	routeStr := fmt.Sprintf(`route1: * -> tee("%v") -> "%v";`, shadowUrl, originalUrl)
+	routesStr := fmt.Sprintf(`route1: * -> tee("%v") -> "%v";route2: Path("/") -> tee("%v") -> "%v";`, shadowUrl, originalUrl, shadowUrl, originalUrl)
+
+	routeNoShadow := eskip.MustParse(routeStrNoShadow)
+	route := eskip.MustParse(routeStr)
+	routes := eskip.MustParse(routesStr)
+
+	registry := make(filters.Registry)
+	registry.Register(WithOptions(Options{
+		Tracer:   tracer,
+		NoFollow: false,
+	}))
+
+	dc := testdataclient.New(routes)
+	defer dc.Close()
+	p := proxytest.WithRoutingOptions(registry, routing.Options{
+		DataClients: []routing.DataClient{dc},
+	}, nil)
+	defer p.Close()
+
+	testFunc := func() {
+		testingStr := "TESTEST"
+		req, err := http.NewRequest("GET", p.URL, strings.NewReader(testingStr))
+		if err != nil {
+			t.Error(err)
+		}
+
+		req.Host = "www.example.org"
+		req.Close = true
+		rsp, err := (&http.Client{}).Do(req)
+		if err != nil {
+			t.Error(err)
+		}
+
+		<-shadowHandler.served
+
+		rsp.Body.Close()
+		if shadowHandler.body != testingStr || originalHandler.body != testingStr {
+			t.Error("Bodies are not equal")
+		}
+	}
+
+	testFunc()
+	dc.Update(route, []string{"route2"})
+
+	shadowHandler.served = make(chan struct{})
+	originalHandler.served = make(chan struct{})
+	testFunc()
+
+	dc.Update(routeNoShadow, nil)
+	originalHandler.served = make(chan struct{})
+	shadowHandler.served = make(chan struct{})
+
+	// test shadow do not get anything
+	testingStr := "TESTEST"
+	req, err := http.NewRequest("GET", p.URL, strings.NewReader(testingStr))
+	if err != nil {
+		t.Error(err)
+	}
+
+	req.Host = "www.example.org"
+	req.Close = true
+	rt := net.NewTransport(net.Options{})
+	defer rt.Close()
+	rsp, err := rt.RoundTrip(req)
+	if err != nil {
+		t.Error(err)
+	}
+
+	select {
+	case <-shadowHandler.served:
+		t.Fatal("shadow handler got a request, but should not")
+	default:
+	}
+
+	rsp.Body.Close()
+	if originalHandler.body != testingStr {
 		t.Error("Bodies are not equal")
 	}
 }
@@ -247,7 +350,7 @@ func TestTeeHeaders(t *testing.T) {
 
 	routeStr := fmt.Sprintf(`route1: * -> tee("%v") -> "%v";`, shadowServer.URL, originalServer.URL)
 
-	route, _ := eskip.Parse(routeStr)
+	route := eskip.MustParse(routeStr)
 	registry := make(filters.Registry)
 	registry.Register(NewTee())
 	p := proxytest.New(registry, route...)
@@ -341,20 +444,17 @@ func TestTeeArgsForFailure(t *testing.T) {
 			true,
 		},
 	} {
-		_, err := NewTee().CreateFilter(ti.args)
+		t.Run(ti.msg, func(t *testing.T) {
+			_, err := NewTee().CreateFilter(ti.args)
 
-		if ti.err && err == nil {
-			t.Error(ti.msg, "was expecting error")
-		}
+			if ti.err && err == nil {
+				t.Error(ti.msg, "was expecting error")
+			}
 
-		if !ti.err && err != nil {
-			t.Error(ti.msg, "get unexpected error")
-		}
-
-		if err != nil {
-			continue
-		}
-
+			if !ti.err && err != nil {
+				t.Error(ti.msg, "get unexpected error")
+			}
+		})
 	}
 }
 

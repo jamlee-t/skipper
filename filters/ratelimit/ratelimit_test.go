@@ -77,8 +77,9 @@ func (l *testLimit) get(s ratelimit.Settings) limit {
 	}
 	return l
 }
-func (l *testLimit) AllowContext(context.Context, string) bool { return false }
-func (l *testLimit) RetryAfter(string) int                     { return 31415 }
+
+func (l *testLimit) Allow(context.Context, string) bool { return false }
+func (l *testLimit) RetryAfter(string) int              { return 31415 }
 
 func TestRateLimit(t *testing.T) {
 	test := func(
@@ -310,7 +311,7 @@ func TestRateLimit(t *testing.T) {
 			MaxHits:    1,
 			TimeWindow: 1 * time.Second,
 			Lookuper:   ratelimit.NewRoundRobinLookuper(3),
-			Group:      "mygroup",
+			Group:      "mygroup.3",
 		},
 		&http.Response{
 			StatusCode: http.StatusTooManyRequests,
@@ -411,12 +412,12 @@ func (n *noLimit) get(ratelimit.Settings) limit {
 	}
 	return n
 }
-func (n *noLimit) AllowContext(context.Context, string) bool { return true }
-func (n *noLimit) RetryAfter(string) int                     { panic("unexpected RetryAfter call") }
+func (n *noLimit) Allow(context.Context, string) bool { return true }
+func (n *noLimit) RetryAfter(string) int              { panic("unexpected RetryAfter call") }
 
 func TestNilLimit(t *testing.T) {
 	f := &filter{provider: &noLimit{nilLimit: true}}
-	ctx := &filtertest.Context{}
+	ctx := &filtertest.Context{FRequest: &http.Request{}}
 
 	f.Request(ctx)
 
@@ -427,7 +428,7 @@ func TestNilLimit(t *testing.T) {
 
 func TestNilSettingsLookuper(t *testing.T) {
 	f := &filter{settings: ratelimit.Settings{Lookuper: nil}, provider: &noLimit{}}
-	ctx := &filtertest.Context{}
+	ctx := &filtertest.Context{FRequest: &http.Request{}}
 
 	f.Request(ctx)
 
@@ -444,7 +445,7 @@ func (l *lookuper) Lookup(*http.Request) string { return l.s }
 
 func TestLookuperNoData(t *testing.T) {
 	f := &filter{settings: ratelimit.Settings{Lookuper: &lookuper{""}}, provider: &noLimit{}}
-	ctx := &filtertest.Context{}
+	ctx := &filtertest.Context{FRequest: &http.Request{}}
 
 	f.Request(ctx)
 

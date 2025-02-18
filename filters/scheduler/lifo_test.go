@@ -13,15 +13,13 @@ import (
 	"github.com/stretchr/testify/require"
 
 	"github.com/aryszka/jobqueue"
-	"github.com/opentracing/opentracing-go/mocktracer"
-	"github.com/zalando/skipper/eskip"
 	"github.com/zalando/skipper/filters"
 	"github.com/zalando/skipper/metrics/metricstest"
 	"github.com/zalando/skipper/proxy"
-	"github.com/zalando/skipper/proxy/proxytest"
 	"github.com/zalando/skipper/routing"
 	"github.com/zalando/skipper/routing/testdataclient"
 	"github.com/zalando/skipper/scheduler"
+	"github.com/zalando/skipper/tracing/tracingtest"
 )
 
 func TestNewLIFO(t *testing.T) {
@@ -92,10 +90,94 @@ func TestNewLIFO(t *testing.T) {
 			wantCode: http.StatusOK,
 		},
 		{
+			name: "lifo with invalid first arg fails",
+			args: []interface{}{
+				"a",
+				0,
+			},
+			schedFunc: NewLIFO,
+			wantName:  filters.LifoName,
+			wantErr:   true,
+		},
+		{
+			name: "lifo with invalid second arg fails",
+			args: []interface{}{
+				0,
+				"a",
+			},
+			schedFunc: NewLIFO,
+			wantName:  filters.LifoName,
+			wantErr:   true,
+		},
+		{
+			name: "lifo with invalid third arg fails",
+			args: []interface{}{
+				0,
+				0,
+				"a",
+			},
+			schedFunc: NewLIFO,
+			wantName:  filters.LifoName,
+			wantErr:   true,
+		},
+		{
+			name: "lifogroup with invalid first arg fails",
+			args: []interface{}{
+				5,
+				0,
+			},
+			schedFunc: NewLIFOGroup,
+			wantName:  filters.LifoGroupName,
+			wantErr:   true,
+		},
+		{
+			name: "lifogroup with invalid third arg fails",
+			args: []interface{}{
+				"foo",
+				0,
+				"a",
+			},
+			schedFunc: NewLIFOGroup,
+			wantName:  filters.LifoGroupName,
+			wantErr:   true,
+		},
+		{
+			name: "lifo with too many args fails",
+			args: []interface{}{
+				0,
+				0,
+				"1s",
+				"foo",
+			},
+			schedFunc: NewLIFO,
+			wantName:  filters.LifoName,
+			wantErr:   true,
+		},
+		{
+			name: "lifoGroup with too many args fails",
+			args: []interface{}{
+				"foo",
+				0,
+				0,
+				"1s",
+				"foo",
+			},
+			schedFunc: NewLIFOGroup,
+			wantName:  filters.LifoGroupName,
+			wantErr:   true,
+		},
+		{
+			name:      "lifoGroup with no args fails",
+			args:      []interface{}{},
+			schedFunc: NewLIFOGroup,
+			wantName:  filters.LifoGroupName,
+			wantErr:   true,
+		},
+		{
 			name: "lifo with partial invalid configuration, applies defaults",
 			args: []interface{}{
-				-1,
-				-15,
+				0,
+				0,
 			},
 			schedFunc: NewLIFO,
 			wantName:  filters.LifoName,
@@ -103,7 +185,7 @@ func TestNewLIFO(t *testing.T) {
 			wantErr:   false,
 			wantConfig: scheduler.Config{
 				MaxConcurrency: defaultMaxConcurreny,
-				MaxQueueSize:   defaultMaxQueueSize,
+				MaxQueueSize:   0,
 				Timeout:        defaultTimeout,
 			},
 			wantCode: http.StatusOK,
@@ -112,8 +194,9 @@ func TestNewLIFO(t *testing.T) {
 			name: "lifogroup with partial invalid configuration, applies defaults",
 			args: []interface{}{
 				"mygroup",
-				-1,
-				-15,
+				0,
+				0,
+				"-1s",
 			},
 			schedFunc: NewLIFOGroup,
 			wantName:  filters.LifoGroupName,
@@ -129,8 +212,8 @@ func TestNewLIFO(t *testing.T) {
 		{
 			name: "lifo with invalid configuration, does not create filter",
 			args: []interface{}{
-				-1,
-				-15,
+				0,
+				0,
 				"4a",
 			},
 			schedFunc: NewLIFO,
@@ -139,7 +222,7 @@ func TestNewLIFO(t *testing.T) {
 			wantErr:   true,
 			wantConfig: scheduler.Config{
 				MaxConcurrency: defaultMaxConcurreny,
-				MaxQueueSize:   defaultMaxQueueSize,
+				MaxQueueSize:   0,
 				Timeout:        defaultTimeout,
 			},
 			wantCode: http.StatusOK,
@@ -148,8 +231,8 @@ func TestNewLIFO(t *testing.T) {
 			name: "lifogroup with invalid configuration, does not create filter",
 			args: []interface{}{
 				"mygroup",
-				-1,
-				-15,
+				0,
+				0,
 				"4a",
 			},
 			schedFunc: NewLIFOGroup,
@@ -158,7 +241,7 @@ func TestNewLIFO(t *testing.T) {
 			wantErr:   true,
 			wantConfig: scheduler.Config{
 				MaxConcurrency: defaultMaxConcurreny,
-				MaxQueueSize:   defaultMaxQueueSize,
+				MaxQueueSize:   0,
 				Timeout:        defaultTimeout,
 			},
 			wantCode: http.StatusOK,
@@ -167,8 +250,8 @@ func TestNewLIFO(t *testing.T) {
 			name: "lifogroup with invalid duration type, does not create filter",
 			args: []interface{}{
 				"mygroup",
-				-1,
-				-15,
+				0,
+				0,
 				4.5,
 			},
 			schedFunc: NewLIFOGroup,
@@ -177,7 +260,7 @@ func TestNewLIFO(t *testing.T) {
 			wantErr:   true,
 			wantConfig: scheduler.Config{
 				MaxConcurrency: defaultMaxConcurreny,
-				MaxQueueSize:   defaultMaxQueueSize,
+				MaxQueueSize:   0,
 				Timeout:        defaultTimeout,
 			},
 			wantCode: http.StatusOK,
@@ -187,7 +270,7 @@ func TestNewLIFO(t *testing.T) {
 			args: []interface{}{
 				"mygroup",
 				"foo",
-				-15,
+				0,
 				"4s",
 			},
 			schedFunc: NewLIFOGroup,
@@ -196,7 +279,7 @@ func TestNewLIFO(t *testing.T) {
 			wantErr:   true,
 			wantConfig: scheduler.Config{
 				MaxConcurrency: defaultMaxConcurreny,
-				MaxQueueSize:   defaultMaxQueueSize,
+				MaxQueueSize:   0,
 				Timeout:        defaultTimeout,
 			},
 			wantCode: http.StatusOK,
@@ -210,6 +293,9 @@ func TestNewLIFO(t *testing.T) {
 			fl, err := l.CreateFilter(tt.args)
 			if err != nil && !tt.wantErr {
 				t.Fatalf("Failed to create filter: %v", err)
+			}
+			if err == nil && tt.wantErr {
+				t.Fatal("Failed to get wanted error on create filter")
 			}
 			if tt.wantErr {
 				t.Skip("want error on filter creation skip rest")
@@ -249,23 +335,76 @@ func TestNewLIFO(t *testing.T) {
 					t.Errorf("Queue should not be nil, got: %v", q)
 				}
 			} else {
-				t.Fatalf("Failed to get lifoFilter ot lifoGroupFilter from filter: %v, ok: %v", f, ok)
+				t.Fatalf("Failed to get lifoFilter or lifoGroupFilter from filter: %v, ok: %v", f, ok)
 			}
 
-			backend := httptest.NewServer(http.HandlerFunc(func(_ http.ResponseWriter, r *http.Request) {}))
+			backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				w.WriteHeader(tt.wantCode)
+				w.Write([]byte("Hello"))
+			}))
+			defer backend.Close()
+
+			args := append(tt.args, backend.URL)
+			args = append([]interface{}{l.Name()}, args...)
+
+			var doc string
+			switch len(args) {
+			case 2:
+				doc = fmt.Sprintf(`aroute: * -> %s() -> "%s"`, args...)
+			case 3:
+				doc = fmt.Sprintf(`aroute: * -> %s(%v) -> "%s"`, args...)
+			case 4:
+				doc = fmt.Sprintf(`aroute: * -> %s(%v, %v) -> "%s"`, args...)
+			case 5:
+				doc = fmt.Sprintf(`aroute: * -> %s(%v, %v, "%v") -> "%s"`, args...)
+			case 6:
+				doc = fmt.Sprintf(`aroute: * -> %s("%v", %v, %v, "%v") -> "%s"`, args...)
+			default:
+				t.Fatalf("(%d): %v", len(args), args)
+			}
+			println("doc:", doc)
+			t.Logf("doc: %s", doc)
+
+			dc, err := testdataclient.NewDoc(doc)
+			if err != nil {
+				t.Fatalf("Failed to create testdataclient: %v", err)
+			}
+			defer dc.Close()
+
+			metrics := &metricstest.MockMetrics{}
+			reg := scheduler.RegistryWith(scheduler.Options{
+				Metrics:                metrics,
+				EnableRouteLIFOMetrics: true,
+			})
+			defer reg.Close()
+
 			fr := make(filters.Registry)
 			fr.Register(l)
-			r := &eskip.Route{Filters: []*eskip.Filter{{Name: l.Name(), Args: tt.args}}, Backend: backend.URL}
 
-			proxy := proxytest.New(fr, r)
-			reqURL, err := url.Parse(proxy.URL)
-			if err != nil {
-				t.Errorf("Failed to parse url %s: %v", proxy.URL, err)
+			ro := routing.Options{
+				SignalFirstLoad: true,
+				FilterRegistry:  fr,
+				DataClients:     []routing.DataClient{dc},
+				PostProcessors:  []routing.PostProcessor{reg},
 			}
+			rt := routing.New(ro)
+			defer rt.Close()
+			<-rt.FirstLoad()
+
+			pr := proxy.WithParams(proxy.Params{Routing: rt})
+			defer pr.Close()
+
+			ts := httptest.NewServer(pr)
+			defer ts.Close()
+
+			reqURL, err := url.Parse(ts.URL)
+			if err != nil {
+				t.Fatalf("Failed to parse url %s: %v", ts.URL, err)
+			}
+
 			req, err := http.NewRequest("GET", reqURL.String(), nil)
 			if err != nil {
-				t.Error(err)
-				return
+				t.Fatal(err)
 			}
 
 			for i := 0; i < config.MaxQueueSize+config.MaxConcurrency+1; i++ {
@@ -277,7 +416,7 @@ func TestNewLIFO(t *testing.T) {
 				defer rsp.Body.Close()
 
 				if rsp.StatusCode != tt.wantCode {
-					t.Errorf("lifo filter failed got=%d, expected=%d, route=%s", rsp.StatusCode, tt.wantCode, r)
+					t.Errorf("lifo filter failed got=%d, expected=%d", rsp.StatusCode, tt.wantCode)
 					buf := make([]byte, rsp.ContentLength)
 					if n, err := rsp.Body.Read(buf); err != nil || int64(n) != rsp.ContentLength {
 						t.Errorf("Failed to read content: %v, %d, want: %d", err, int64(n), rsp.ContentLength)
@@ -311,6 +450,7 @@ func TestLifoErrors(t *testing.T) {
 
 	dc, err := testdataclient.NewDoc(doc)
 	require.NoError(t, err)
+	defer dc.Close()
 
 	metrics := &metricstest.MockMetrics{}
 	reg := scheduler.RegistryWith(scheduler.Options{
@@ -334,7 +474,7 @@ func TestLifoErrors(t *testing.T) {
 
 	<-rt.FirstLoad()
 
-	tracer := mocktracer.New()
+	tracer := tracingtest.NewTracer()
 	pr := proxy.WithParams(proxy.Params{
 		Routing:     rt,
 		OpenTracing: &proxy.OpenTracingParams{Tracer: tracer},
@@ -365,6 +505,8 @@ func TestLifoErrors(t *testing.T) {
 		502: 7, // were queued and timed out as backend latency is greater than scheduling timeout
 		503: 8, // were refused due to full queue
 	}, codes)
+
+	reg.UpdateMetrics()
 
 	metrics.WithCounters(func(counters map[string]int64) {
 		assert.Equal(t, int64(7), counters["lifo.aroute.error.timeout"])

@@ -4,6 +4,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"math"
 	"net"
 	"time"
 
@@ -31,7 +32,7 @@ func (st swarmType) String() string {
 	case swarmFake:
 		return "fake Swarm"
 	}
-	return "unkwown Swarm"
+	return "unknown Swarm"
 }
 
 func getSwarmType(o Options) swarmType {
@@ -152,12 +153,12 @@ func newKubernetesSwarm(o Options) (*Swarm, error) {
 
 	u, err := buildAPIURL(o.KubernetesOptions.KubernetesInCluster, o.KubernetesOptions.KubernetesAPIBaseURL)
 	if err != nil {
-		return nil, fmt.Errorf("failed to build kubernetes API url from url %s running in cluster %v: %v", o.KubernetesOptions.KubernetesAPIBaseURL, o.KubernetesOptions.KubernetesInCluster, err)
+		return nil, fmt.Errorf("failed to build kubernetes API url from url %s running in cluster %v: %w", o.KubernetesOptions.KubernetesAPIBaseURL, o.KubernetesOptions.KubernetesInCluster, err)
 	}
 	o.KubernetesOptions.KubernetesAPIBaseURL = u
 
-	if o.SwarmPort == 0 || o.SwarmPort >= 65535 {
-		log.Errorf("Wrong SwarmPort %d, set to default %d instead", o.SwarmPort, DefaultMaxMessageBuffer)
+	if o.SwarmPort == 0 || o.SwarmPort == math.MaxUint16 {
+		log.Errorf("Wrong SwarmPort %d, set to default %d instead", o.SwarmPort, DefaultPort)
 		o.SwarmPort = DefaultPort
 	}
 
@@ -197,9 +198,12 @@ func Start(o Options) (*Swarm, error) {
 	return Join(o, knownEntryPoint.Node(), knownEntryPoint.Nodes(), cleanupF)
 }
 
-// Join will join given Swarm peers and return an initialiazed Swarm
+// Join will join given Swarm peers and return an initialized Swarm
 // object if successful.
 func Join(o Options, self *NodeInfo, nodes []*NodeInfo, cleanupF func()) (*Swarm, error) {
+	if self == nil {
+		return nil, fmt.Errorf("cannot join node to swarm, NodeInfo pointer is nil")
+	}
 	log.Infof("SWARM: %s is going to join swarm of %d nodes (%v)", self, len(nodes), nodes)
 	cfg := memberlist.DefaultLocalConfig()
 	if !o.Debug {
@@ -359,6 +363,9 @@ func (s *Swarm) Local() *NodeInfo {
 }
 
 func (s *Swarm) broadcast(m *message) error {
+	if s == nil {
+		return fmt.Errorf("cannot broadcast message, swarm is nil")
+	}
 	m.Source = s.Local().Name
 	b, err := encodeMessage(m)
 	if err != nil {

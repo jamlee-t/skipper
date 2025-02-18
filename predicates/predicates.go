@@ -33,6 +33,7 @@ const (
 	JWTPayloadAllKVName       = "JWTPayloadAllKV"
 	JWTPayloadAnyKVRegexpName = "JWTPayloadAnyKVRegexp"
 	JWTPayloadAllKVRegexpName = "JWTPayloadAllKVRegexp"
+	HeaderSHA256Name          = "HeaderSHA256"
 	AfterName                 = "After"
 	BeforeName                = "Before"
 	BetweenName               = "Between"
@@ -43,4 +44,6 @@ const (
 	ClientIPName              = "ClientIP"
 	TeeName                   = "Tee"
 	TrafficName               = "Traffic"
+	TrafficSegmentName        = "TrafficSegment"
+	ContentLengthBetweenName  = "ContentLengthBetween"
 )

@@ -20,10 +20,16 @@ const (
 	maxCalculatedQueueSize          = 50_000
 	acceptedConnectionsKey          = "listener.accepted.connections"
 	queuedConnectionsKey            = "listener.queued.connections"
+	acceptLatencyKey                = "listener.accept.latency"
 )
 
+type external struct {
+	net.Conn
+	accepted time.Time
+}
+
 type connection struct {
-	net           net.Conn
+	*external
 	queueDeadline time.Time
 	release       chan<- struct{}
 	quit          <-chan struct{}
@@ -52,7 +58,7 @@ type Options struct {
 	// 150MB.
 	//
 	// When MaxConcurrency is set, this field is ignored.
-	MemoryLimitBytes int
+	MemoryLimitBytes int64
 
 	// ConnectionBytes is used to calculate the MaxConcurrency when MaxConcurrency is
 	// not set explicitly but calculated from MemoryLimitBytes.
@@ -74,12 +80,12 @@ type Options struct {
 
 type listener struct {
 	options           Options
-	maxConcurrency    int
-	maxQueueSize      int
+	maxConcurrency    int64
+	maxQueueSize      int64
 	externalListener  net.Listener
-	acceptExternal    chan net.Conn
+	acceptExternal    chan *external
 	externalError     chan error
-	acceptInternal    chan net.Conn
+	acceptInternal    chan *connection
 	internalError     chan error
 	releaseConnection chan struct{}
 	quit              chan struct{}
@@ -92,14 +98,6 @@ var (
 	errListenerClosed = errors.New("listener closed")
 )
 
-func (c *connection) Read(b []byte) (n int, err error)   { return c.net.Read(b) }
-func (c *connection) Write(b []byte) (n int, err error)  { return c.net.Write(b) }
-func (c *connection) LocalAddr() net.Addr                { return c.net.LocalAddr() }
-func (c *connection) RemoteAddr() net.Addr               { return c.net.RemoteAddr() }
-func (c *connection) SetDeadline(t time.Time) error      { return c.net.SetDeadline(t) }
-func (c *connection) SetReadDeadline(t time.Time) error  { return c.net.SetReadDeadline(t) }
-func (c *connection) SetWriteDeadline(t time.Time) error { return c.net.SetWriteDeadline(t) }
-
 func (c *connection) Close() error {
 	c.once.Do(func() {
 		select {
@@ -107,18 +105,18 @@ func (c *connection) Close() error {
 		case <-c.quit:
 		}
 
-		c.closeErr = c.net.Close()
+		c.closeErr = c.external.Close()
 	})
 
 	return c.closeErr
 }
 
-func (o Options) maxConcurrency() int {
+func (o Options) maxConcurrency() int64 {
 	if o.MaxConcurrency > 0 {
-		return o.MaxConcurrency
+		return int64(o.MaxConcurrency)
 	}
 
-	maxConcurrency := o.MemoryLimitBytes / o.ConnectionBytes
+	maxConcurrency := o.MemoryLimitBytes / int64(o.ConnectionBytes)
 
 	// theoretical minimum, but rather only for testing. When the max concurrency is not set, then the
 	// TCP-LIFO should not be used, at all.
@@ -129,9 +127,9 @@ func (o Options) maxConcurrency() int {
 	return maxConcurrency
 }
 
-func (o Options) maxQueueSize() int {
+func (o Options) maxQueueSize() int64 {
 	if o.MaxQueueSize > 0 {
-		return o.MaxQueueSize
+		return int64(o.MaxQueueSize)
 	}
 
 	maxQueueSize := 10 * o.maxConcurrency()
@@ -160,9 +158,9 @@ func listenWith(nl net.Listener, o Options) (net.Listener, error) {
 		maxConcurrency:    o.maxConcurrency(),
 		maxQueueSize:      o.maxQueueSize(),
 		externalListener:  nl,
-		acceptExternal:    make(chan net.Conn),
+		acceptExternal:    make(chan *external),
 		externalError:     make(chan error),
-		acceptInternal:    make(chan net.Conn),
+		acceptInternal:    make(chan *connection),
 		internalError:     make(chan error),
 		releaseConnection: make(chan struct{}),
 		quit:              make(chan struct{}),
@@ -220,9 +218,10 @@ func (l *listener) String() string {
 func (l *listener) listenExternal() {
 	var (
 		c              net.Conn
+		ex             *external
 		err            error
 		delay          time.Duration
-		acceptExternal chan<- net.Conn
+		acceptExternal chan<- *external
 		externalError  chan<- error
 		retry          <-chan time.Time
 	)
@@ -231,6 +230,7 @@ func (l *listener) listenExternal() {
 		c, err = l.externalListener.Accept()
 		if err != nil {
 			// based on net/http.Server.Serve():
+			//lint:ignore SA1019 Temporary is deprecated in Go 1.18, but keep it for now (https://github.com/zalando/skipper/issues/1992)
 			if nerr, ok := err.(net.Error); ok && nerr.Temporary() {
 				delay = bounce(delay)
 				l.options.Log.Errorf(
@@ -251,13 +251,14 @@ func (l *listener) listenExternal() {
 			}
 		} else {
 			acceptExternal = l.acceptExternal
+			ex = &external{c, time.Now()}
 			externalError = nil
 			retry = nil
 			delay = 0
 		}
 
 		select {
-		case acceptExternal <- c:
+		case acceptExternal <- ex:
 		case externalError <- err:
 			// we cannot accept anymore, but we have returned the permanent error
 			return
@@ -274,20 +275,20 @@ func (l *listener) listenExternal() {
 
 func (l *listener) listenInternal() {
 	var (
-		concurrency    int
+		concurrency    int64
 		queue          *ring
 		err            error
-		acceptInternal chan<- net.Conn
+		acceptInternal chan<- *connection
 		internalError  chan<- error
 		nextTimeout    <-chan time.Time
 	)
 
 	queue = newRing(l.maxQueueSize)
 	for {
-		var nextConn net.Conn
+		var nextConn *connection
 		if queue.size > 0 && concurrency < l.maxConcurrency {
 			acceptInternal = l.acceptInternal
-			nextConn = queue.peek()
+			nextConn = queue.peek().(*connection)
 		} else {
 			acceptInternal = nil
 		}
@@ -316,10 +317,10 @@ func (l *listener) listenInternal() {
 		select {
 		case conn := <-l.acceptExternal:
 			cc := &connection{
-				net:     conn,
-				release: l.releaseConnection,
-				quit:    l.quit,
-				once:    sync.Once{},
+				external: conn,
+				release:  l.releaseConnection,
+				quit:     l.quit,
+				once:     sync.Once{},
 			}
 
 			if l.options.QueueTimeout > 0 {
@@ -328,7 +329,7 @@ func (l *listener) listenInternal() {
 
 			drop := queue.enqueue(cc)
 			if drop != nil {
-				drop.(*connection).net.Close()
+				drop.(*connection).external.Close()
 			}
 
 			l.testNotifyQueueChange()
@@ -347,7 +348,7 @@ func (l *listener) listenInternal() {
 			var dropped int
 			for queue.size > 0 && queue.peekOldest().(*connection).queueDeadline.Before(now) {
 				drop := queue.dequeueOldest()
-				drop.(*connection).net.Close()
+				drop.(*connection).external.Close()
 			}
 
 			nextTimeout = nil
@@ -356,7 +357,7 @@ func (l *listener) listenInternal() {
 				l.testNotifyQueueChange()
 			}
 		case <-l.quit:
-			queue.rangeOver(func(c net.Conn) { c.(*connection).net.Close() })
+			queue.rangeOver(func(c net.Conn) { c.(*connection).external.Close() })
 
 			// Closing the real listener in a separate goroutine is based on inspecting the
 			// stdlib. It's fair to just log the errors.
@@ -376,6 +377,9 @@ func (l *listener) listenInternal() {
 func (l *listener) Accept() (net.Conn, error) {
 	select {
 	case c := <-l.acceptInternal:
+		if l.options.Metrics != nil {
+			l.options.Metrics.MeasureSince(acceptLatencyKey, c.external.accepted)
+		}
 		return c, nil
 	case err := <-l.internalError:
 		return nil, err

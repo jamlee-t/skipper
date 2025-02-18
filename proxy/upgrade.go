@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"crypto/tls"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net"
@@ -132,6 +133,13 @@ func (p *upgradeProxy) serveHTTP(w http.ResponseWriter, req *http.Request) {
 		return
 	}
 
+	// Backend sent Connection: close
+	if resp.Close {
+		w.WriteHeader(http.StatusServiceUnavailable)
+		w.Write([]byte(http.StatusText(http.StatusServiceUnavailable)))
+		return
+	}
+
 	requestHijackedConn, _, err := w.(http.Hijacker).Hijack()
 	if err != nil {
 		log.Errorf("Error hijacking request connection: %s", err)
@@ -153,7 +161,7 @@ func (p *upgradeProxy) serveHTTP(w http.ResponseWriter, req *http.Request) {
 	done := make(chan struct{}, 2)
 
 	if p.useAuditLog {
-		copyAsync("backend->request+audit", backendConn, io.MultiWriter(requestHijackedConn, p.auditLogOut), done)
+		copyAsync("backend->request+audit", backendConn, io.MultiWriter(p.auditLogOut, requestHijackedConn), done)
 	} else {
 		copyAsync("backend->request", backendConn, requestHijackedConn, done)
 	}
@@ -208,8 +216,7 @@ func (p *upgradeProxy) dialBackend(req *http.Request) (net.Conn, error) {
 func copyAsync(dir string, src io.Reader, dst io.Writer, done chan<- struct{}) {
 	go func() {
 		_, err := io.Copy(dst, src)
-		// net: errClosing not exported https://github.com/golang/go/issues/4373
-		if err != nil && !strings.Contains(err.Error(), "use of closed network connection") {
+		if err != nil && !errors.Is(err, net.ErrClosed) {
 			log.Errorf("error copying data %s: %v", dir, err)
 		}
 		done <- struct{}{}

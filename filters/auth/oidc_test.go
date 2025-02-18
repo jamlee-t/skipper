@@ -24,13 +24,12 @@ import (
 
 	"golang.org/x/oauth2"
 	"golang.org/x/oauth2/google"
-	"gopkg.in/square/go-jose.v2"
+	"gopkg.in/go-jose/go-jose.v2"
 
 	"github.com/golang-jwt/jwt/v4"
 	"github.com/stretchr/testify/assert"
 	"github.com/zalando/skipper/eskip"
 	"github.com/zalando/skipper/filters"
-	"github.com/zalando/skipper/logging/loggingtest"
 	"github.com/zalando/skipper/net/dnstest"
 	"github.com/zalando/skipper/proxy/proxytest"
 	"github.com/zalando/skipper/routing"
@@ -128,17 +127,17 @@ var testOpenIDConfig = `{
 // returns a localhost instance implementation of an OpenID Connect
 // server with configendpoint, tokenendpoint, authenticationserver endpoint, userinfor
 // endpoint, jwks endpoint
-func createOIDCServer(cb, client, clientsecret string) *httptest.Server {
+func createOIDCServer(cb, client, clientsecret string, extraClaims jwt.MapClaims) *httptest.Server {
 	var oidcServer *httptest.Server
 	oidcServer = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch r.URL.Path {
 		case "/.well-known/openid-configuration":
 			// dynamic config handling
 			// set oidcServer local dynamic listener to us
-			st := strings.Replace(testOpenIDConfig, "https://accounts.google.com", oidcServer.URL, -1)
-			st = strings.Replace(st, "https://oauth2.googleapis.com", oidcServer.URL, -1)
-			st = strings.Replace(st, "https://www.googleapis.com", oidcServer.URL, -1)
-			st = strings.Replace(st, "https://openidconnect.googleapis.com", oidcServer.URL, -1)
+			st := strings.ReplaceAll(testOpenIDConfig, "https://accounts.google.com", oidcServer.URL)
+			st = strings.ReplaceAll(st, "https://oauth2.googleapis.com", oidcServer.URL)
+			st = strings.ReplaceAll(st, "https://www.googleapis.com", oidcServer.URL)
+			st = strings.ReplaceAll(st, "https://openidconnect.googleapis.com", oidcServer.URL)
 			_, _ = w.Write([]byte(st))
 		case "/o/oauth2/v2/auth":
 			// https://openid.net/specs/openid-connect-core-1_0.html#CodeFlowSteps
@@ -222,21 +221,19 @@ func createOIDCServer(cb, client, clientsecret string) *httptest.Server {
 				w.Header().Set("Cache-Control", "no-store")
 				w.Header().Set("Pragma", "no-cache")
 
-				token := jwt.NewWithClaims(jwt.SigningMethodRS256, jwt.MapClaims{
+				claims := jwt.MapClaims{
 					testKey: testValue, // claims to check
 					"iss":   oidcServer.URL,
 					"sub":   testSub,
 					"aud":   validClient,
 					"iat":   time.Now().Add(-time.Minute).UTC().Unix(),
 					"exp":   time.Now().Add(tokenExp).UTC().Unix(),
-					"groups": []string{
-						"CD-Administrators",
-						"Purchasing-Department",
-						"AppX-Test-Users",
-						"white space",
-					},
 					"email": "someone@example.org",
-				})
+				}
+				for k, v := range extraClaims {
+					claims[k] = v
+				}
+				token := jwt.NewWithClaims(jwt.SigningMethodRS256, claims)
 
 				privKey, err := os.ReadFile(keyPath)
 				if err != nil {
@@ -317,7 +314,44 @@ func createOIDCServer(cb, client, clientsecret string) *httptest.Server {
 			if err != nil {
 				log.Fatalf("Failed to write: %v", err)
 			}
-
+		case "/v1.0/users/me/transitiveMemberOf":
+			if r.Header.Get(authHeaderName) == authHeaderPrefix+validAccessToken &&
+				r.URL.Query().Get("$select") == "onPremisesSamAccountName,id" {
+				body, err := json.Marshal(azureGraphGroups{
+					OdataNextLink: fmt.Sprintf("http://%s/v1.0/users/paginatedresponse", r.Host),
+					Value: []struct {
+						OnPremisesSamAccountName string `json:"onPremisesSamAccountName"`
+						ID                       string `json:"id"`
+					}{
+						{OnPremisesSamAccountName: "CD-Administrators", ID: "1"},
+						{OnPremisesSamAccountName: "Purchasing-Department", ID: "2"},
+					}})
+				if err != nil {
+					log.Fatalf("Failed to marshal to json: %v", err)
+				}
+				w.Write(body)
+			} else {
+				w.WriteHeader(401)
+			}
+		case "/v1.0/users/paginatedresponse":
+			if r.Header.Get(authHeaderName) == authHeaderPrefix+validAccessToken {
+				body, err := json.Marshal(azureGraphGroups{
+					OdataNextLink: "",
+					Value: []struct {
+						OnPremisesSamAccountName string `json:"onPremisesSamAccountName"`
+						ID                       string `json:"id"`
+					}{
+						{OnPremisesSamAccountName: "AppX-Test-Users", ID: "3"},
+						{OnPremisesSamAccountName: "white space", ID: "4"},
+						{ID: "5"}, // null value
+					}})
+				if err != nil {
+					log.Fatalf("Failed to marshal to json: %v", err)
+				}
+				w.Write(body)
+			} else {
+				w.WriteHeader(401)
+			}
 		default:
 			w.WriteHeader(http.StatusNotFound)
 		}
@@ -458,32 +492,63 @@ func TestExtractDomainFromHost(t *testing.T) {
 func TestNewOidc(t *testing.T) {
 	reg := secrets.NewRegistry()
 	for _, tt := range []struct {
-		name string
-		args string
-		f    func(string, secrets.EncrypterCreator) filters.Spec
-		want *tokenOidcSpec
+		name    string
+		args    string
+		f       func(string, secrets.EncrypterCreator, OidcOptions) filters.Spec
+		options OidcOptions
+		want    *tokenOidcSpec
 	}{
 		{
-			name: "test UserInfo",
-			args: "/foo",
-			f:    NewOAuthOidcUserInfos,
-			want: &tokenOidcSpec{typ: checkOIDCUserInfo, SecretsFile: "/foo", secretsRegistry: reg},
+			name:    "test UserInfo",
+			args:    "/foo",
+			f:       NewOAuthOidcUserInfosWithOptions,
+			options: OidcOptions{},
+			want:    &tokenOidcSpec{typ: checkOIDCUserInfo, SecretsFile: "/foo", secretsRegistry: reg},
 		},
 		{
-			name: "test AnyClaims",
-			args: "/foo",
-			f:    NewOAuthOidcAnyClaims,
-			want: &tokenOidcSpec{typ: checkOIDCAnyClaims, SecretsFile: "/foo", secretsRegistry: reg},
+			name:    "test AnyClaims",
+			args:    "/foo",
+			f:       NewOAuthOidcAnyClaimsWithOptions,
+			options: OidcOptions{},
+			want:    &tokenOidcSpec{typ: checkOIDCAnyClaims, SecretsFile: "/foo", secretsRegistry: reg},
 		},
 		{
-			name: "test AllClaims",
+			name:    "test AllClaims",
+			args:    "/foo",
+			f:       NewOAuthOidcAllClaimsWithOptions,
+			options: OidcOptions{},
+			want:    &tokenOidcSpec{typ: checkOIDCAllClaims, SecretsFile: "/foo", secretsRegistry: reg},
+		},
+		{
+			name: "test UserInfo with options",
 			args: "/foo",
-			f:    NewOAuthOidcAllClaims,
-			want: &tokenOidcSpec{typ: checkOIDCAllClaims, SecretsFile: "/foo", secretsRegistry: reg},
+			f:    NewOAuthOidcUserInfosWithOptions,
+			options: OidcOptions{
+				CookieValidity: 6 * time.Hour,
+			},
+			want: &tokenOidcSpec{typ: checkOIDCUserInfo, SecretsFile: "/foo", secretsRegistry: reg, options: OidcOptions{CookieValidity: 6 * time.Hour}},
+		},
+		{
+			name: "test AnyClaims with options",
+			args: "/foo",
+			f:    NewOAuthOidcAnyClaimsWithOptions,
+			options: OidcOptions{
+				CookieValidity: 6 * time.Hour,
+			},
+			want: &tokenOidcSpec{typ: checkOIDCAnyClaims, SecretsFile: "/foo", secretsRegistry: reg, options: OidcOptions{CookieValidity: 6 * time.Hour}},
+		},
+		{
+			name: "test AllClaims with options",
+			args: "/foo",
+			f:    NewOAuthOidcAllClaimsWithOptions,
+			options: OidcOptions{
+				CookieValidity: 6 * time.Hour,
+			},
+			want: &tokenOidcSpec{typ: checkOIDCAllClaims, SecretsFile: "/foo", secretsRegistry: reg, options: OidcOptions{CookieValidity: 6 * time.Hour}},
 		},
 	} {
 		t.Run(tt.name, func(t *testing.T) {
-			if got := tt.f(tt.args, reg); !reflect.DeepEqual(got, tt.want) {
+			if got := tt.f(tt.args, reg, tt.options); !reflect.DeepEqual(got, tt.want) {
 				t.Errorf("Failed to create object: Want %v, got %v", tt.want, got)
 			}
 		})
@@ -492,7 +557,7 @@ func TestNewOidc(t *testing.T) {
 }
 
 func TestCreateFilterOIDC(t *testing.T) {
-	oidcServer := createOIDCServer("", "", "")
+	oidcServer := createOIDCServer("", "", "", nil)
 	defer oidcServer.Close()
 
 	for _, tt := range []struct {
@@ -592,6 +657,17 @@ func TestCreateFilterOIDC(t *testing.T) {
 			},
 			wantErr: true,
 		},
+		{
+			name: "missing claims result in error",
+			args: []interface{}{
+				oidcServer.URL, // provider/issuer
+				"cliendId",
+				"clientSecret",
+				oidcServer.URL + "/redirect", // redirect URL
+				"email name",
+			},
+			wantErr: true,
+		},
 	} {
 		t.Run(tt.name, func(t *testing.T) {
 			spec := &tokenOidcSpec{
@@ -633,6 +709,9 @@ func TestOIDCSetup(t *testing.T) {
 		expectRequest      string
 		expectNoCookies    bool
 		expectCookieDomain string
+		filterCookies      []string
+		extraClaims        jwt.MapClaims
+		expectCookieName   string
 	}{{
 		msg:             "wrong provider",
 		filter:          `oauthOidcAnyClaims("no url", "", "", "{{ .RedirectURL }}", "", "")`,
@@ -692,8 +771,42 @@ func TestOIDCSetup(t *testing.T) {
 		filter: `oauthOidcAllClaims("{{ .OIDCServerURL }}", "valid-client", "mysec", "{{ .RedirectURL }}", "uid", "sub uid", "",
 			"x-auth-email:claims.email x-auth-something:claims.sub x-auth-groups:claims.groups.#[%\"*-Users\"]"
 		)`,
+		extraClaims:   jwt.MapClaims{"groups": []string{"CD-Administrators", "Purchasing-Department", "AppX-Test-Users", "white space"}},
 		expected:      200,
 		expectRequest: "X-Auth-Email: someone@example.org\r\nX-Auth-Groups: AppX-Test-Users\r\nX-Auth-Something: somesub",
+	}, {
+		msg: "distributed Azure claims looked up in Microsoft Graph ",
+		filter: `oauthOidcAllClaims("{{ .OIDCServerURL }}", "valid-client", "mysec", "{{ .RedirectURL }}", "uid", "sub uid", "",
+		"x-auth-email:claims.email x-auth-something:claims.sub x-auth-groups:claims.groups.#[%\"*-Users\"]")`,
+		extraClaims: jwt.MapClaims{
+			"oid":            "me",
+			"_claim_names":   map[string]string{"groups": "src1"},
+			"_claim_sources": map[string]map[string]string{"src1": {"endpoint": "http://graph.windows.net/distributedClaims/getMemberObjects"}},
+		},
+		expected:      200,
+		expectRequest: "X-Auth-Email: someone@example.org\r\nX-Auth-Groups: AppX-Test-Users\r\nX-Auth-Something: somesub\r\n\r\n",
+	}, {
+		msg: "distributed Azure claims with pagination resolved",
+		filter: `oauthOidcAllClaims("{{ .OIDCServerURL }}", "valid-client", "mysec", "{{ .RedirectURL }}", "uid", "sub uid", "",
+		"x-auth-groups:claims.groups")`,
+		extraClaims: jwt.MapClaims{
+			"oid":            "me",
+			"_claim_names":   map[string]string{"groups": "src1"},
+			"_claim_sources": map[string]map[string]string{"src1": {"endpoint": "http://graph.windows.net/distributedClaims/getMemberObjects"}},
+		},
+		expected:      200,
+		expectRequest: "X-Auth-Groups: [\"CD-Administrators\",\"Purchasing-Department\",\"AppX-Test-Users\",\"white space\"]\r\n\r\n",
+	}, {
+		msg: "distributed claims on unsupported IdP no groups claim returned",
+		filter: `oauthOidcAllClaims("{{ .OIDCServerURL }}", "valid-client", "mysec", "{{ .RedirectURL }}", "uid", "sub uid", "",
+	"x-auth-email:claims.email x-auth-something:claims.sub x-auth-groups:claims.groups.#[%\"*-Users\"]")`,
+		extraClaims: jwt.MapClaims{
+			"oid":            "me",
+			"_claim_names":   map[string]string{"groups": "src1"},
+			"_claim_sources": map[string]map[string]string{"src1": {"endpoint": "http://unknown.com/someendpoint"}},
+		},
+		expected:        401,
+		expectNoCookies: true,
 	}, {
 		msg:      "auth code with a placeholder and a regular option",
 		filter:   `oauthOidcAnyClaims("{{ .OIDCServerURL }}", "valid-client", "mysec", "{{ .RedirectURL }}", "", "", "foo=skipper-request-query bar=baz")`,
@@ -729,6 +842,23 @@ func TestOIDCSetup(t *testing.T) {
 		filter:             `oauthOidcAnyClaims("{{ .OIDCServerURL }}", "valid-client", "mysec", "{{ .RedirectURL }}", "uid email", "", "", "", "3")`,
 		expected:           200,
 		expectCookieDomain: "bar.foo.skipper.test",
+	}, {
+		msg:                "remove unverified cookies",
+		hostname:           "bar.foo.skipper.test",
+		filter:             `oauthOidcAnyClaims("{{ .OIDCServerURL }}", "valid-client", "mysec", "{{ .RedirectURL }}", "uid email", "", "", "", "3")`,
+		expected:           200,
+		expectCookieDomain: "bar.foo.skipper.test",
+		filterCookies:      []string{"badheader", "malformed"},
+	}, {
+		msg:              "custom cookie name",
+		filter:           `oauthOidcUserInfo("{{ .OIDCServerURL }}", "valid-client", "mysec", "{{ .RedirectURL }}", "", "", "", "", "", "custom-cookie")`,
+		expected:         200,
+		expectCookieName: "custom-cookie",
+	}, {
+		msg:              "default cookie name when not specified",
+		filter:           `oauthOidcUserInfo("{{ .OIDCServerURL }}", "valid-client", "mysec", "{{ .RedirectURL }}", "", "")`,
+		expected:         200,
+		expectCookieName: "skipperOauthOidc",
 	}} {
 		t.Run(tc.msg, func(t *testing.T) {
 			backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -749,14 +879,15 @@ func TestOIDCSetup(t *testing.T) {
 			secretsRegistry := secrettest.NewTestRegistry()
 
 			fr := make(filters.Registry)
-			fr.Register(NewOAuthOidcUserInfos(secretsFile, secretsRegistry))
-			fr.Register(NewOAuthOidcAnyClaims(secretsFile, secretsRegistry))
-			fr.Register(NewOAuthOidcAllClaims(secretsFile, secretsRegistry))
+			fr.Register(NewOAuthOidcUserInfosWithOptions(secretsFile, secretsRegistry, OidcOptions{}))
+			fr.Register(NewOAuthOidcAnyClaimsWithOptions(secretsFile, secretsRegistry, OidcOptions{}))
+			fr.Register(NewOAuthOidcAllClaimsWithOptions(secretsFile, secretsRegistry, OidcOptions{}))
 
 			dc := testdataclient.New(nil)
+			defer dc.Close()
+
 			proxy := proxytest.WithRoutingOptions(fr, routing.Options{
 				DataClients: []routing.DataClient{dc},
-				Log:         loggingtest.New(),
 			})
 			defer proxy.Close()
 
@@ -769,15 +900,19 @@ func TestOIDCSetup(t *testing.T) {
 
 			t.Logf("redirect URL: %s", redirectURL.String())
 
-			oidcServer := createOIDCServer(redirectURL.String(), "valid-client", "mysec")
+			oidcServer := createOIDCServer(redirectURL.String(), "valid-client", "mysec", tc.extraClaims)
 			defer oidcServer.Close()
 			t.Logf("oidc server URL: %s", oidcServer.URL)
+
+			oidcsrv, err := url.Parse(oidcServer.URL)
+			assert.NoError(t, err)
+			microsoftGraphHost = oidcsrv.Host
 
 			if tc.queries != nil {
 				q := reqURL.Query()
 				for _, rq := range tc.queries {
-					splitRQ := strings.Split(rq, "=")
-					q.Add(splitRQ[0], splitRQ[1])
+					k, v, _ := strings.Cut(rq, "=")
+					q.Add(k, v)
 				}
 				reqURL.RawQuery = q.Encode()
 			}
@@ -804,6 +939,10 @@ func TestOIDCSetup(t *testing.T) {
 				return
 			}
 			req.Header.Set(authHeaderName, authHeaderPrefix+testToken)
+
+			for _, v := range tc.filterCookies {
+				req.Header.Set("Set-Cookie", v)
+			}
 
 			// client with cookie handling to support 127.0.0.1 with ports
 			client := http.Client{
@@ -842,6 +981,18 @@ func TestOIDCSetup(t *testing.T) {
 					left, right := tokenExp-time.Minute, tokenExp
 					maxAge := time.Duration(c.MaxAge) * time.Second
 					assert.True(t, left <= maxAge && maxAge <= right, "maxAge has to be within [%v, %v]", left, right)
+
+					for _, v := range tc.filterCookies {
+						if v == c.Name {
+							assert.True(t, c.Value == "")
+						}
+					}
+
+					// Check for custom cookie name
+					if tc.expectCookieName != "" {
+						assert.True(t, strings.HasPrefix(c.Name, tc.expectCookieName),
+							"Cookie name should start with %s, but got %s", tc.expectCookieName, c.Name)
+					}
 				}
 			}
 		})
@@ -869,7 +1020,7 @@ func parseFilter(def, oidcServerURL, redirectURL string) ([]*eskip.Filter, error
 }
 
 func TestChunkAndMergerCookie(t *testing.T) {
-	rand.Seed(time.Now().UnixNano())
+	r := rand.New(rand.NewSource(time.Now().UnixNano()))
 	tinyCookie := http.Cookie{
 		Name:     "skipperOauthOidcHASHHASH-",
 		Value:    "eyJ0eXAiOiJKV1QiLCJhbGciO",
@@ -883,7 +1034,7 @@ func TestChunkAndMergerCookie(t *testing.T) {
 	emptyCookie.Value = ""
 	largeCookie := tinyCookie
 	for i := 0; i < 5*cookieMaxSize; i++ {
-		largeCookie.Value += string(rune(rand.Intn('Z'-'A') + 'A' + i%2*32))
+		largeCookie.Value += string(rune(r.Intn('Z'-'A') + 'A' + i%2*32))
 	}
 	oneCookie := largeCookie
 	oneCookie.Value = oneCookie.Value[:len(oneCookie.Value)-(len(oneCookie.String())-cookieMaxSize)-1]
@@ -903,16 +1054,16 @@ func TestChunkAndMergerCookie(t *testing.T) {
 	} {
 		t.Run(fmt.Sprintf("test:%v", ht.name), func(t *testing.T) {
 			assert := assert.New(t)
-			got := chunkCookie(ht.given)
+			got := chunkCookie(&ht.given)
 			assert.NotNil(t, got, "it should not be empty")
 			// shuffle the order of response cookies
-			rand.Shuffle(len(got), func(i, j int) {
+			r.Shuffle(len(got), func(i, j int) {
 				got[i], got[j] = got[j], got[i]
 			})
 			assert.Len(got, ht.num, "should result in a different number of chunks")
 			mergedCookie := mergerCookies(got)
 			assert.NotNil(mergedCookie, "should receive a valid cookie")
-			assert.Equal(ht.given, mergedCookie, "after chunking and remerging the content must be equal")
+			assert.Equal(ht.given, *mergedCookie, "after chunking and remerging the content must be equal")
 			// verify no cookie exceeds limits
 			for _, ck := range got {
 				assert.True(func() bool {

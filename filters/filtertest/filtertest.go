@@ -9,6 +9,8 @@ import (
 
 	"github.com/opentracing/opentracing-go"
 	"github.com/zalando/skipper/filters"
+
+	log "github.com/sirupsen/logrus"
 )
 
 // Noop filter, used to verify the filter name and the args in the route.
@@ -21,6 +23,7 @@ type Filter struct {
 // Simple FilterContext implementation.
 type Context struct {
 	FResponseWriter     http.ResponseWriter
+	FOriginalRequest    *http.Request
 	FRequest            *http.Request
 	FResponse           *http.Response
 	FServed             bool
@@ -44,20 +47,30 @@ func (fc *Context) MarkServed()                         { fc.FServed = true }
 func (fc *Context) Served() bool                        { return fc.FServed }
 func (fc *Context) PathParam(key string) string         { return fc.FParams[key] }
 func (fc *Context) StateBag() map[string]interface{}    { return fc.FStateBag }
-func (fc *Context) OriginalRequest() *http.Request      { return nil }
+func (fc *Context) OriginalRequest() *http.Request      { return fc.FOriginalRequest }
 func (fc *Context) OriginalResponse() *http.Response    { return nil }
 func (fc *Context) BackendUrl() string                  { return fc.FBackendUrl }
 func (fc *Context) OutgoingHost() string                { return fc.FOutgoingHost }
 func (fc *Context) SetOutgoingHost(h string)            { fc.FOutgoingHost = h }
 func (fc *Context) Metrics() filters.Metrics            { return fc.FMetrics }
+
+func (fc *Context) ResponseController() *http.ResponseController {
+	return http.NewResponseController(fc.FResponseWriter)
+}
+
 func (fc *Context) Tracer() opentracing.Tracer {
 	if fc.FTracer != nil {
 		return fc.FTracer
 	}
 	return &opentracing.NoopTracer{}
 }
+
 func (fc *Context) ParentSpan() opentracing.Span {
 	return opentracing.StartSpan("test_span")
+}
+
+func (fc *Context) Logger() filters.FilterContextLogger {
+	return log.StandardLogger()
 }
 
 func (fc *Context) Serve(resp *http.Response) {

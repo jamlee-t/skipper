@@ -10,7 +10,6 @@ import (
 	"time"
 
 	"github.com/opentracing/opentracing-go"
-	log "github.com/sirupsen/logrus"
 	"github.com/zalando/skipper/filters"
 )
 
@@ -149,7 +148,7 @@ func NewOAuthTokenintrospectionAllClaims(timeout time.Duration) filters.Spec {
 	return newOAuthTokenintrospectionFilter(checkOAuthTokenintrospectionAllClaims, timeout)
 }
 
-//Secure Introspection Point
+// Secure Introspection Point
 func NewSecureOAuthTokenintrospectionAnyKV(timeout time.Duration) filters.Spec {
 	return newSecureOAuthTokenintrospectionFilter(checkSecureOAuthTokenintrospectionAnyKV, timeout)
 }
@@ -318,7 +317,7 @@ func (s *tokenIntrospectionSpec) CreateFilter(args []interface{}) (filters.Filte
 	case checkOAuthTokenintrospectionAnyClaims:
 		f.claims = sargs
 		if !all(f.claims, cfg.ClaimsSupported) {
-			return nil, fmt.Errorf("%v: %s, supported Claims: %v", errUnsupportedClaimSpecified, strings.Join(f.claims, ","), cfg.ClaimsSupported)
+			return nil, fmt.Errorf("%w: %s, supported Claims: %v", errUnsupportedClaimSpecified, strings.Join(f.claims, ","), cfg.ClaimsSupported)
 		}
 
 	// key value pairs
@@ -433,7 +432,7 @@ func (f *tokenintrospectFilter) Request(ctx filters.FilterContext) {
 			if err == errInvalidToken {
 				reason = invalidToken
 			} else {
-				log.Errorf("Error while calling token introspection: %v.", err)
+				ctx.Logger().Errorf("Error while calling token introspection: %v", err)
 			}
 
 			unauthorized(ctx, "", reason, f.authClient.url.Hostname(), "")
@@ -446,7 +445,7 @@ func (f *tokenintrospectFilter) Request(ctx filters.FilterContext) {
 	sub, err := info.Sub()
 	if err != nil {
 		if err != errInvalidTokenintrospectionData {
-			log.Errorf("Error while reading token: %v.", err)
+			ctx.Logger().Errorf("Error while reading token: %v", err)
 		}
 
 		unauthorized(ctx, sub, invalidSub, f.authClient.url.Hostname(), "")
@@ -469,7 +468,7 @@ func (f *tokenintrospectFilter) Request(ctx filters.FilterContext) {
 	case checkOAuthTokenintrospectionAllKV, checkSecureOAuthTokenintrospectionAllKV:
 		allowed = f.validateAllKV(info)
 	default:
-		log.Errorf("Wrong tokenintrospectionFilter type: %s.", f)
+		ctx.Logger().Errorf("Wrong tokenintrospectionFilter type: %s", f)
 	}
 
 	if !allowed {
@@ -482,8 +481,3 @@ func (f *tokenintrospectFilter) Request(ctx filters.FilterContext) {
 }
 
 func (f *tokenintrospectFilter) Response(filters.FilterContext) {}
-
-// Close cleans-up the authClient
-func (f *tokenintrospectFilter) Close() {
-	f.authClient.Close()
-}

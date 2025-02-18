@@ -4,10 +4,14 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"regexp"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
 
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 	"github.com/zalando/skipper/metrics"
 )
 
@@ -66,6 +70,29 @@ func TestPrometheusMetrics(t *testing.T) {
 				`skipper_route_lookup_duration_seconds_bucket{le="+Inf"} 2`,
 				`skipper_route_lookup_duration_seconds_sum 0.018`,
 				`skipper_route_lookup_duration_seconds_count 2`,
+			},
+			expCode: http.StatusOK,
+		},
+		{
+			name: "Filter creation latency",
+			addMetrics: func(pm *metrics.Prometheus) {
+				pm.MeasureFilterCreate("filter1", time.Now().Add(-15*time.Millisecond))
+			},
+			expMetrics: []string{
+				`skipper_filter_create_duration_seconds_bucket{filter="filter1",le="0.005"} 0`,
+				`skipper_filter_create_duration_seconds_bucket{filter="filter1",le="0.01"} 0`,
+				`skipper_filter_create_duration_seconds_bucket{filter="filter1",le="0.025"} 1`,
+				`skipper_filter_create_duration_seconds_bucket{filter="filter1",le="0.05"} 1`,
+				`skipper_filter_create_duration_seconds_bucket{filter="filter1",le="0.1"} 1`,
+				`skipper_filter_create_duration_seconds_bucket{filter="filter1",le="0.25"} 1`,
+				`skipper_filter_create_duration_seconds_bucket{filter="filter1",le="0.5"} 1`,
+				`skipper_filter_create_duration_seconds_bucket{filter="filter1",le="1"} 1`,
+				`skipper_filter_create_duration_seconds_bucket{filter="filter1",le="2.5"} 1`,
+				`skipper_filter_create_duration_seconds_bucket{filter="filter1",le="5"} 1`,
+				`skipper_filter_create_duration_seconds_bucket{filter="filter1",le="10"} 1`,
+				`skipper_filter_create_duration_seconds_bucket{filter="filter1",le="+Inf"} 1`,
+				`skipper_filter_create_duration_seconds_sum{filter="filter1"} 0.015`,
+				`skipper_filter_create_duration_seconds_count{filter="filter1"} 1`,
 			},
 			expCode: http.StatusOK,
 		},
@@ -514,7 +541,7 @@ func TestPrometheusMetrics(t *testing.T) {
 			expCode: http.StatusOK,
 		},
 		{
-			name: "Measuring all serves by the hosts splitted by route, only should measure served latency by route.",
+			name: "Measuring all serves by the hosts split by route, only should measure served latency by route.",
 			opts: metrics.Options{
 				EnableServeRouteMetrics:     true,
 				EnableServeRouteCounter:     true,
@@ -560,7 +587,7 @@ func TestPrometheusMetrics(t *testing.T) {
 			expCode: http.StatusOK,
 		},
 		{
-			name: "Measuring all serves by the hosts splitted by route, only should measure served latency by route without method.",
+			name: "Measuring all serves by the hosts split by route, only should measure served latency by route without method.",
 			opts: metrics.Options{
 				EnableServeRouteMetrics:     true,
 				EnableServeRouteCounter:     true,
@@ -608,7 +635,7 @@ func TestPrometheusMetrics(t *testing.T) {
 			expCode: http.StatusOK,
 		},
 		{
-			name: "Measuring all serves by the hosts splitted by route, only should measure served latency by route without code.",
+			name: "Measuring all serves by the hosts split by route, only should measure served latency by route without code.",
 			opts: metrics.Options{
 				EnableServeRouteMetrics:     true,
 				EnableServeRouteCounter:     true,
@@ -656,7 +683,7 @@ func TestPrometheusMetrics(t *testing.T) {
 			expCode: http.StatusOK,
 		},
 		{
-			name: "Measuring all serves by the hosts splitted by route, only should measure served latency by route without method and code.",
+			name: "Measuring all serves by the hosts split by route, only should measure served latency by route without method and code.",
 			opts: metrics.Options{
 				EnableServeRouteMetrics:     true,
 				EnableServeRouteCounter:     true,
@@ -704,7 +731,7 @@ func TestPrometheusMetrics(t *testing.T) {
 			expCode: http.StatusOK,
 		},
 		{
-			name: "Measuring all serves by the hosts splitted by route, should measure served latency by host.",
+			name: "Measuring all serves by the hosts split by route, should measure served latency by host.",
 			opts: metrics.Options{
 				EnableServeRouteMetrics:     false,
 				EnableServeRouteCounter:     false,
@@ -750,7 +777,7 @@ func TestPrometheusMetrics(t *testing.T) {
 			expCode: http.StatusOK,
 		},
 		{
-			name: "Measuring all serves by the hosts splitted by hosts, only should measure served latency by route without method.",
+			name: "Measuring all serves by the hosts split by hosts, only should measure served latency by route without method.",
 			opts: metrics.Options{
 				EnableServeRouteMetrics:     false,
 				EnableServeRouteCounter:     false,
@@ -798,7 +825,7 @@ func TestPrometheusMetrics(t *testing.T) {
 			expCode: http.StatusOK,
 		},
 		{
-			name: "Measuring all serves by the hosts splitted by hosts, only should measure served latency by route without code.",
+			name: "Measuring all serves by the hosts split by hosts, only should measure served latency by route without code.",
 			opts: metrics.Options{
 				EnableServeRouteMetrics:     false,
 				EnableServeRouteCounter:     false,
@@ -846,7 +873,7 @@ func TestPrometheusMetrics(t *testing.T) {
 			expCode: http.StatusOK,
 		},
 		{
-			name: "Measuring all serves by the hosts splitted by hosts, only should measure served latency by route without method and code.",
+			name: "Measuring all serves by the hosts split by hosts, only should measure served latency by route without method and code.",
 			opts: metrics.Options{
 				EnableServeRouteMetrics:     false,
 				EnableServeRouteCounter:     false,
@@ -1052,4 +1079,62 @@ func TestPrometheusMetrics(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestPrometheusMetricsStartTimestamp(t *testing.T) {
+	pm := metrics.NewPrometheus(metrics.Options{
+		EnablePrometheusStartLabel: true,
+		EnableServeHostCounter:     true,
+	})
+	path := "/awesome-metrics"
+
+	mux := http.NewServeMux()
+	pm.RegisterHandler(path, mux)
+
+	before := time.Now()
+
+	pm.MeasureServe("route1", "foo.test", "GET", 200, time.Now().Add(-15*time.Millisecond))
+	pm.MeasureServe("route1", "bar.test", "POST", 201, time.Now().Add(-15*time.Millisecond))
+	pm.MeasureServe("route1", "bar.test", "POST", 201, time.Now().Add(-15*time.Millisecond))
+	pm.IncRoutingFailures()
+	pm.IncRoutingFailures()
+	pm.IncRoutingFailures()
+
+	after := time.Now()
+
+	req := httptest.NewRequest("GET", path, nil)
+	w := httptest.NewRecorder()
+	mux.ServeHTTP(w, req)
+
+	resp := w.Result()
+	require.Equal(t, http.StatusOK, resp.StatusCode)
+
+	body, err := io.ReadAll(resp.Body)
+	require.NoError(t, err)
+
+	t.Logf("Metrics response:\n%s", body)
+
+	// Prometheus client does not allow to mock counter creation timestamps,
+	// see https://github.com/prometheus/client_golang/issues/1354
+	//
+	// checkMetric tests that timestamp is within [before, after] range.
+	checkMetric := func(pattern string) {
+		t.Helper()
+
+		re := regexp.MustCompile(pattern)
+
+		matches := re.FindSubmatch(body)
+		require.NotNil(t, matches, "Metrics response does not match: %s", pattern)
+		require.Len(t, matches, 2)
+
+		ts, err := strconv.ParseInt(string(matches[1]), 10, 64)
+		require.NoError(t, err)
+
+		assert.GreaterOrEqual(t, ts, before.UnixNano())
+		assert.LessOrEqual(t, ts, after.UnixNano())
+	}
+
+	checkMetric(`skipper_serve_host_count{code="200",host="foo_test",method="GET",start="(\d+)"} 1`)
+	checkMetric(`skipper_serve_host_count{code="201",host="bar_test",method="POST",start="(\d+)"} 2`)
+	checkMetric(`skipper_route_error_total{start="(\d+)"} 3`)
 }

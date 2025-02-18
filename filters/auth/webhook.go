@@ -7,7 +7,6 @@ import (
 	"time"
 
 	"github.com/opentracing/opentracing-go"
-	log "github.com/sirupsen/logrus"
 	"golang.org/x/net/http/httpguts"
 
 	"github.com/zalando/skipper/filters"
@@ -34,6 +33,8 @@ type (
 	}
 )
 
+var webhookAuthClient map[string]*authClient = make(map[string]*authClient)
+
 // NewWebhook creates a new auth filter specification
 // to validate authorization for requests via an
 // external web hook.
@@ -56,14 +57,14 @@ func (*webhookSpec) Name() string {
 // string. The second, optional, argument is a comma separated list of
 // headers to forward from from webhook response.
 //
-//     s.CreateFilter("https://my-auth-service.example.org/auth")
-//     s.CreateFilter("https://my-auth-service.example.org/auth", "X-Auth-User,X-Auth-User-Roles")
-//
+//	s.CreateFilter("https://my-auth-service.example.org/auth")
+//	s.CreateFilter("https://my-auth-service.example.org/auth", "X-Auth-User,X-Auth-User-Roles")
 func (ws *webhookSpec) CreateFilter(args []interface{}) (filters.Filter, error) {
 	if l := len(args); l == 0 || l > 2 {
 		return nil, filters.ErrInvalidFilterParameters
 	}
 
+	var ok bool
 	s, ok := args[0].(string)
 	if !ok {
 		return nil, filters.ErrInvalidFilterParameters
@@ -89,9 +90,14 @@ func (ws *webhookSpec) CreateFilter(args []interface{}) (filters.Filter, error) 
 		}
 	}
 
-	ac, err := newAuthClient(s, webhookSpanName, ws.options.Timeout, ws.options.MaxIdleConns, ws.options.Tracer)
-	if err != nil {
-		return nil, filters.ErrInvalidFilterParameters
+	var ac *authClient
+	var err error
+	if ac, ok = webhookAuthClient[s]; !ok {
+		ac, err = newAuthClient(s, webhookSpanName, ws.options.Timeout, ws.options.MaxIdleConns, ws.options.Tracer)
+		if err != nil {
+			return nil, filters.ErrInvalidFilterParameters
+		}
+		webhookAuthClient[s] = ac
 	}
 
 	return &webhookFilter{authClient: ac, forwardResponseHeaderKeys: forwardResponseHeaderKeys}, nil
@@ -106,7 +112,7 @@ func copyHeader(to, from http.Header) {
 func (f *webhookFilter) Request(ctx filters.FilterContext) {
 	resp, err := f.authClient.getWebhook(ctx)
 	if err != nil {
-		log.Errorf("Failed to make authentication webhook request: %v.", err)
+		ctx.Logger().Errorf("Failed to make authentication webhook request: %v.", err)
 	}
 
 	// forbidden
@@ -132,8 +138,3 @@ func (f *webhookFilter) Request(ctx filters.FilterContext) {
 }
 
 func (*webhookFilter) Response(filters.FilterContext) {}
-
-// Close cleans-up the authClient
-func (f *webhookFilter) Close() {
-	f.authClient.Close()
-}

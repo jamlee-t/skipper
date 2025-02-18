@@ -6,7 +6,6 @@ import (
 	"net/http"
 	"strings"
 
-	log "github.com/sirupsen/logrus"
 	"github.com/zalando/skipper/filters"
 	logfilter "github.com/zalando/skipper/filters/log"
 )
@@ -18,6 +17,7 @@ const (
 	checkOAuthTokeninfoAllScopes
 	checkOAuthTokeninfoAnyKV
 	checkOAuthTokeninfoAllKV
+	checkOAuthTokeninfoValidate
 	checkOAuthTokenintrospectionAnyClaims
 	checkOAuthTokenintrospectionAllClaims
 	checkOAuthTokenintrospectionAnyKV
@@ -107,12 +107,12 @@ func reject(
 	debuginfo string,
 ) {
 	if debuginfo == "" {
-		log.Debugf(
+		ctx.Logger().Debugf(
 			"Rejected: status: %d, username: %s, reason: %s.",
 			status, username, reason,
 		)
 	} else {
-		log.Debugf(
+		ctx.Logger().Debugf(
 			"Rejected: status: %d, username: %s, reason: %s, info: %s.",
 			status, username, reason, debuginfo,
 		)
@@ -174,17 +174,4 @@ func all(left, right []string) bool {
 		}
 	}
 	return true
-}
-
-// intersect checks that one string in the left is also in the right
-func intersect(left, right []string) bool {
-	for _, l := range left {
-		for _, r := range right {
-			if l == r {
-				return true
-			}
-		}
-	}
-
-	return false
 }

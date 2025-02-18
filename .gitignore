@@ -4,12 +4,9 @@ bin
 pkg
 src/github.com/mailgun
 default.etcd
-oauth/client.json
-oauth/user.json
 .idea
 *.iml
 *.xcf
-example.eskip
 Godeps/_workspace
 packaging/skipper
 packaging/eskip
@@ -25,3 +22,6 @@ _test_plugins_fail/*.so
 opentracingplugin/build
 build/
 skptesting/lorem.html
+.vscode/*
+*.test
+

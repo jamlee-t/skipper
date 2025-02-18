@@ -47,97 +47,97 @@ func parseOptions(opts []string) (lightstep.Options, error) {
 	propagators[opentracing.HTTPHeaders] = defPropagator
 
 	for _, o := range opts {
-		parts := strings.SplitN(o, "=", 2)
-		switch parts[0] {
+		key, val, _ := strings.Cut(o, "=")
+		switch key {
 		case "component-name":
-			if len(parts) > 1 {
-				componentName = parts[1]
+			if val != "" {
+				componentName = val
 			}
 		case "token":
-			token = parts[1]
+			token = val
 		case "grpc-max-msg-size":
-			v, err := strconv.Atoi(parts[1])
+			v, err := strconv.Atoi(val)
 			if err != nil {
-				return lightstep.Options{}, fmt.Errorf("failed to parse %s as int grpc-max-msg-size: %v", parts[1], err)
+				return lightstep.Options{}, fmt.Errorf("failed to parse %s as int grpc-max-msg-size: %w", val, err)
 			}
 			grpcMaxMsgSize = v
 		case "min-period":
-			v, err := time.ParseDuration(parts[1])
+			v, err := time.ParseDuration(val)
 			if err != nil {
-				return lightstep.Options{}, fmt.Errorf("failed to parse %s as time.Duration min-period : %v", parts[1], err)
+				return lightstep.Options{}, fmt.Errorf("failed to parse %s as time.Duration min-period : %w", val, err)
 			}
 			minReportingPeriod = v
 		case "max-period":
-			v, err := time.ParseDuration(parts[1])
+			v, err := time.ParseDuration(val)
 			if err != nil {
-				return lightstep.Options{}, fmt.Errorf("failed to parse %s as time.Duration max-period: %v", parts[1], err)
+				return lightstep.Options{}, fmt.Errorf("failed to parse %s as time.Duration max-period: %w", val, err)
 			}
 			maxReportingPeriod = v
 		case "tag":
-			if len(parts) > 1 {
-				tags := strings.SplitN(parts[1], "=", 2)
-				if len(tags) != 2 {
-					return lightstep.Options{}, fmt.Errorf("missing value for tag %s", tags[0])
+			if val != "" {
+				tag, tagVal, found := strings.Cut(val, "=")
+				if !found {
+					return lightstep.Options{}, fmt.Errorf("missing value for tag %s", val)
 				}
-				globalTags[tags[0]] = tags[1]
+				globalTags[tag] = tagVal
 			}
 		case "collector":
 			var err error
 			var sport string
 
-			host, sport, err = net.SplitHostPort(parts[1])
+			host, sport, err = net.SplitHostPort(val)
 			if err != nil {
 				return lightstep.Options{}, err
 			}
 
 			port, err = strconv.Atoi(sport)
 			if err != nil {
-				return lightstep.Options{}, fmt.Errorf("failed to parse %s as int: %v", sport, err)
+				return lightstep.Options{}, fmt.Errorf("failed to parse %s as int: %w", sport, err)
 			}
 		case "plaintext":
 			var err error
-			plaintext, err = strconv.ParseBool(parts[1])
+			plaintext, err = strconv.ParseBool(val)
 			if err != nil {
-				return lightstep.Options{}, fmt.Errorf("failed to parse %s as bool: %v", parts[1], err)
+				return lightstep.Options{}, fmt.Errorf("failed to parse %s as bool: %w", val, err)
 			}
 		case "cmd-line":
-			cmdLine = parts[1]
+			cmdLine = val
 			logCmdLine = true
 		case "protocol":
-			switch parts[1] {
+			switch val {
 			case "http":
 				useGRPC = false
 			case "grpc":
 				useGRPC = true
 			default:
-				return lightstep.Options{}, fmt.Errorf("failed to parse protocol allowed 'http' or 'grpc', got: %s", parts[1])
+				return lightstep.Options{}, fmt.Errorf("failed to parse protocol allowed 'http' or 'grpc', got: %s", val)
 			}
 		case "log-events":
 			logEvents = true
 		case "max-buffered-spans":
 			var err error
-			if maxBufferedSpans, err = strconv.Atoi(parts[1]); err != nil {
-				return lightstep.Options{}, fmt.Errorf("failed to parse max buffered spans: %v", err)
+			if maxBufferedSpans, err = strconv.Atoi(val); err != nil {
+				return lightstep.Options{}, fmt.Errorf("failed to parse max buffered spans: %w", err)
 			}
 		case "max-log-key-len":
 			var err error
-			if maxLogKeyLen, err = strconv.Atoi(parts[1]); err != nil {
-				return lightstep.Options{}, fmt.Errorf("failed to parse max log key length: %v", err)
+			if maxLogKeyLen, err = strconv.Atoi(val); err != nil {
+				return lightstep.Options{}, fmt.Errorf("failed to parse max log key length: %w", err)
 			}
 		case "max-log-value-len":
 			var err error
-			if maxLogValueLen, err = strconv.Atoi(parts[1]); err != nil {
-				return lightstep.Options{}, fmt.Errorf("failed to parse max log value length: %v", err)
+			if maxLogValueLen, err = strconv.Atoi(val); err != nil {
+				return lightstep.Options{}, fmt.Errorf("failed to parse max log value length: %w", err)
 			}
 		case "max-logs-per-span":
 			var err error
-			if maxLogsPerSpan, err = strconv.Atoi(parts[1]); err != nil {
-				return lightstep.Options{}, fmt.Errorf("failed to parse max logs per span: %v", err)
+			if maxLogsPerSpan, err = strconv.Atoi(val); err != nil {
+				return lightstep.Options{}, fmt.Errorf("failed to parse max logs per span: %w", err)
 			}
 		case "propagators":
-			if len(parts) > 1 {
+			if val != "" {
 				prStack := lightstep.PropagatorStack{}
-				prs := strings.SplitN(parts[1], ",", 2)
+				prs := strings.SplitN(val, ",", 2)
 				for _, pr := range prs {
 					switch pr {
 					case "lightstep", "ls":

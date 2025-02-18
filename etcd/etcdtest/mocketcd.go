@@ -16,6 +16,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"time"
 )
@@ -23,6 +24,7 @@ import (
 var Urls []string
 
 var etcd *exec.Cmd
+var etcdDataDir string
 
 func makeLocalUrls(ports ...int) []string {
 	urls := make([]string, len(ports))
@@ -54,6 +56,12 @@ func StartProjectRoot(projectRoot string) error {
 	Urls = makeLocalUrls(randPort(), randPort())
 	clientUrlsString := strings.Join(Urls, ",")
 
+	dir, err := os.MkdirTemp("", "etcdtest")
+	if err != nil {
+		return err
+	}
+	etcdDataDir = dir
+
 	var binary string
 	if projectRoot != "" {
 		binary = filepath.Join(projectRoot, ".bin/etcd")
@@ -69,6 +77,7 @@ func StartProjectRoot(projectRoot string) error {
 
 	/* #nosec */
 	e := exec.Command(binary,
+		"-data-dir", etcdDataDir,
 		"-listen-client-urls", clientUrlsString,
 		"-advertise-client-urls", clientUrlsString)
 	stderr, err := e.StderrPipe()
@@ -115,6 +124,11 @@ func Stop() error {
 	if etcd == nil {
 		return nil
 	}
+
+	defer func() {
+		os.RemoveAll(etcdDataDir)
+		etcdDataDir = ""
+	}()
 
 	return etcd.Process.Kill()
 }
@@ -169,8 +183,16 @@ func PutData(key, data string) error {
 
 // Saves a route in etcd with the specified prefix.
 func PutDataTo(prefix, key, data string) error {
+	return PutDataToTTL(prefix, key, data, 0)
+}
+
+// Saves a route with TTL in etcd with the specified prefix.
+func PutDataToTTL(prefix, key, data string, ttl int) error {
 	v := make(url.Values)
 	v.Add("value", data)
+	if ttl > 0 {
+		v.Add("ttl", strconv.Itoa(ttl))
+	}
 	req, err := http.NewRequest("PUT",
 		Urls[0]+"/v2/keys/skippertest/routes/"+key,
 		bytes.NewBufferString(v.Encode()))

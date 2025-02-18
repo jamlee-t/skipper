@@ -1,16 +1,18 @@
 package main
 
 import (
+	"context"
+	"flag"
 	"net/http"
 	"os"
 	"os/signal"
 	"syscall"
+	"time"
 
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 	log "github.com/sirupsen/logrus"
 	"github.com/zalando/skipper/cmd/webhook/admission"
-	"golang.org/x/net/context"
-	"gopkg.in/alecthomas/kingpin.v2"
+	"github.com/zalando/skipper/dataclients/kubernetes/definitions"
 )
 
 const (
@@ -26,12 +28,11 @@ type config struct {
 }
 
 func (c *config) parse() {
-	kingpin.Flag("debug", "Enable debug logging").BoolVar(&c.debug)
-	kingpin.Flag("tls-cert-file", "File containing the certificate for HTTPS").Envar("CERT_FILE").StringVar(&c.certFile)
-	kingpin.Flag("tls-key-file", "File containing the private key for HTTPS").Envar("KEY_FILE").StringVar(&c.keyFile)
-	kingpin.Flag("address", "The address to listen on").Default(defaultHTTPSAddress).StringVar(&c.address)
-
-	kingpin.Parse()
+	flag.BoolVar(&c.debug, "debug", false, "Enable debug logging")
+	flag.StringVar(&c.certFile, "tls-cert-file", os.Getenv("CERT_FILE"), "File containing the certificate for HTTPS")
+	flag.StringVar(&c.keyFile, "tls-key-file", os.Getenv("KEY_FILE"), "File containing the private key for HTTPS")
+	flag.StringVar(&c.address, "address", defaultHTTPSAddress, "The address to listen on")
+	flag.Parse()
 
 	if (c.certFile != "" || c.keyFile != "") && !(c.certFile != "" && c.keyFile != "") {
 		log.Fatal("Config parse error: both of TLS cert & key must be provided or neither (for testing )")
@@ -52,9 +53,11 @@ func main() {
 	var cfg = &config{}
 	cfg.parse()
 
-	rgAdmitter := admission.RouteGroupAdmitter{}
+	rgAdmitter := &admission.RouteGroupAdmitter{RouteGroupValidator: &definitions.RouteGroupValidator{}}
+	ingressAdmitter := &admission.IngressAdmitter{IngressValidator: &definitions.IngressV1Validator{}}
 	handler := http.NewServeMux()
 	handler.Handle("/routegroups", admission.Handler(rgAdmitter))
+	handler.Handle("/ingresses", admission.Handler(ingressAdmitter))
 	handler.Handle("/metrics", promhttp.Handler())
 	handler.HandleFunc("/healthz", healthCheck)
 
@@ -73,8 +76,10 @@ func healthCheck(writer http.ResponseWriter, _ *http.Request) {
 
 func serve(cfg *config, handler http.Handler) {
 	server := &http.Server{
-		Addr:    cfg.address,
-		Handler: handler,
+		Addr:              cfg.address,
+		Handler:           handler,
+		ReadTimeout:       1 * time.Minute,
+		ReadHeaderTimeout: 1 * time.Minute,
 	}
 
 	log.Infof("Starting server on %s", cfg.address)

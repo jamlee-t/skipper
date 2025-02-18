@@ -13,6 +13,8 @@ import (
 
 // Tracer is an implementation of opentracing.Tracer for testing. It records
 // the defined spans during a series of operations.
+//
+// Deprecated: use [NewTracer] instead.
 type Tracer struct {
 
 	// TraceContent represents the tracing content passed along the wire.
@@ -44,6 +46,7 @@ type Span struct {
 	tracer        *Tracer
 }
 
+// Deprecated: use [NewTracer] and [MockTracer.StartSpan] instead.
 func NewSpan(operation string) *Span {
 	return &Span{
 		operationName: operation,
@@ -102,6 +105,9 @@ func (t *Tracer) StartSpan(operationName string, opts ...tracing.StartSpanOption
 	s := t.createSpanBase()
 	s.operationName = operationName
 	s.Refs = sso.References
+	for k, v := range sso.Tags {
+		s.Tags[k] = v
+	}
 	return s
 }
 

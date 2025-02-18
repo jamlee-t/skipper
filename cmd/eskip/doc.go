@@ -18,41 +18,41 @@ formatted routes from and to different data sources.
 
 For command line help, enter:
 
-    eskip -help
+	eskip -help
 
-Examples
+# Examples
 
 Check if an eskip file has valid syntax:
 
-    eskip check routes.eskip
+	eskip check routes.eskip
 
 Print routes stored in etcd:
 
-    eskip print -etcd-urls https://etcd.example.org
+	eskip print -etcd-urls https://etcd.example.org
 
 Print routes as JSON:
 
-    eskip print -json
+	eskip print -json
 
 Insert/update routes in etcd from an eskip file:
 
-    eskip upsert routes.eskip
+	eskip upsert routes.eskip
 
 Sync routes from an eskip file to etcd:
 
-    eskip reset routes.eskip
+	eskip reset routes.eskip
 
 Delete routes from etcd:
 
-    eskip delete -ids route1,route2,route3
+	eskip delete -ids route1,route2,route3
 
 Delete all routes from etcd:
 
-    eskip print | eskip delete
+	eskip print | eskip delete
 
 Copy all routes in etcd under a different prefix:
 
-    eskip print | eskip upsert -etcd-prefix /skipper-backup
+	eskip print | eskip upsert -etcd-prefix /skipper-backup
 
 (Where -etcd-urls is not set for write operations like upsert, reset and
 delete, the default etcd cluster urls are used:
@@ -112,6 +112,7 @@ append file   a file containing a chain of filters to be appended to the
               filter chain in each route
 
 Media flags:
+
 `
 
 	/* position for generated flags */
@@ -146,7 +147,8 @@ patch    takes a list of routes as input from any media except of inline
 		 route. Example:
 		 eskip patch -append 'filter1() -> filter2()'
 
-version  print eskip version`
+version  print eskip version
+`
 )
 
 // simplified check for help request:
@@ -162,9 +164,9 @@ func isHelp() bool {
 
 // print command line help:
 func usage() {
-	fmt.Println(help1)
+	fmt.Print(help1)
 	flags.SetOutput(os.Stdout)
 	flags.PrintDefaults()
 	flags.SetOutput(nowrite)
-	fmt.Println(help2)
+	fmt.Print(help2)
 }

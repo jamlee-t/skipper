@@ -2,14 +2,12 @@ package fadein
 
 import (
 	"fmt"
-	"net"
-	"net/url"
-	"strings"
 	"time"
 
 	log "github.com/sirupsen/logrus"
 	"github.com/zalando/skipper/eskip"
 	"github.com/zalando/skipper/filters"
+	snet "github.com/zalando/skipper/net"
 	"github.com/zalando/skipper/routing"
 )
 
@@ -38,6 +36,7 @@ type (
 	}
 
 	postProcessor struct {
+		endpointRegisty *routing.EndpointRegistry
 		// "http://10.2.1.53:1234": {t0 60s t0-10s}
 		detected map[string]detectedFadeIn
 	}
@@ -100,42 +99,6 @@ func NewEndpointCreated() filters.Spec {
 
 func (endpointCreated) Name() string { return filters.EndpointCreatedName }
 
-func normalizeSchemeHost(s, h string) (string, string, error) {
-	// endpoint address cannot contain path, the rest is not case sensitive
-	s, h = strings.ToLower(s), strings.ToLower(h)
-
-	hh, p, err := net.SplitHostPort(h)
-	if err != nil {
-		// what is the actual right way of doing this, considering IPv6 addresses, too?
-		if !strings.Contains(err.Error(), "missing port") {
-			return "", "", err
-		}
-
-		p = ""
-	} else {
-		h = hh
-	}
-
-	switch {
-	case p == "" && s == "http":
-		p = "80"
-	case p == "" && s == "https":
-		p = "443"
-	}
-
-	h = net.JoinHostPort(h, p)
-	return s, h, nil
-}
-
-func normalizeEndpoint(e string) (string, string, error) {
-	u, err := url.Parse(e)
-	if err != nil {
-		return "", "", err
-	}
-
-	return normalizeSchemeHost(u.Scheme, u.Host)
-}
-
 func endpointKey(scheme, host string) string {
 	return fmt.Sprintf("%s://%s", scheme, host)
 }
@@ -150,7 +113,7 @@ func (endpointCreated) CreateFilter(args []interface{}) (filters.Filter, error) 
 		return nil, filters.ErrInvalidFilterParameters
 	}
 
-	s, h, err := normalizeEndpoint(e)
+	s, h, err := snet.SchemeHost(e)
 	if err != nil {
 		return nil, err
 	}
@@ -174,7 +137,7 @@ func (endpointCreated) CreateFilter(args []interface{}) (filters.Filter, error) 
 		return nil, filters.ErrInvalidFilterParameters
 	}
 
-	// mitigate potential flakyness caused by clock skew. When the created time is in the future based on
+	// mitigate potential flakiness caused by clock skew. When the created time is in the future based on
 	// the local clock, we ignore it.
 	now := time.Now()
 	if ec.when.After(now) {
@@ -192,16 +155,20 @@ func (endpointCreated) CreateFilter(args []interface{}) (filters.Filter, error) 
 func (endpointCreated) Request(filters.FilterContext)  {}
 func (endpointCreated) Response(filters.FilterContext) {}
 
+type PostProcessorOptions struct {
+	EndpointRegistry *routing.EndpointRegistry
+}
+
 // NewPostProcessor creates post-processor for maintaining the detection time of LB endpoints with fade-in
 // behavior.
-func NewPostProcessor() routing.PostProcessor {
+func NewPostProcessor(options PostProcessorOptions) routing.PostProcessor {
 	return &postProcessor{
-		detected: make(map[string]detectedFadeIn),
+		endpointRegisty: options.EndpointRegistry,
+		detected:        make(map[string]detectedFadeIn),
 	}
 }
 
 func (p *postProcessor) Do(r []*routing.Route) []*routing.Route {
-	const configErrFmt = "Error while processing endpoint fade-in settings: %s, %s, %v."
 	now := time.Now()
 
 	for _, ri := range r {
@@ -229,19 +196,18 @@ func (p *postProcessor) Do(r []*routing.Route) []*routing.Route {
 		for i := range ri.LBEndpoints {
 			ep := &ri.LBEndpoints[i]
 
-			s, h, err := normalizeSchemeHost(ep.Scheme, ep.Host)
-			if err != nil {
-				log.Errorf(configErrFmt, ep.Scheme, ep.Host, err)
-				continue
-			}
-
-			key := endpointKey(s, h)
+			key := endpointKey(ep.Scheme, ep.Host)
 			detected := p.detected[key].when
 			if detected.IsZero() || endpointsCreated[key].After(detected) {
 				detected = now
 			}
 
-			ep.Detected = detected
+			if p.endpointRegisty != nil {
+				metrics := p.endpointRegisty.GetMetrics(ep.Host)
+				if endpointsCreated[key].After(metrics.DetectedTime()) {
+					metrics.SetDetected(endpointsCreated[key])
+				}
+			}
 			p.detected[key] = detectedFadeIn{
 				when:       detected,
 				duration:   ri.LBFadeInDuration,

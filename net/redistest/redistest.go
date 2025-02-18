@@ -3,56 +3,103 @@ package redistest
 import (
 	"context"
 	"net"
-	"os/exec"
-	"strconv"
 	"testing"
 	"time"
 
-	"github.com/go-redis/redis/v8"
+	"github.com/docker/go-connections/nat"
+	"github.com/redis/go-redis/v9"
+	"github.com/testcontainers/testcontainers-go"
+	"github.com/testcontainers/testcontainers-go/wait"
 )
 
-func NewTestRedis(t *testing.T) (address string, done func()) {
-	return NewTestRedisWithPassword(t, "")
+type options struct {
+	password string
+	image    string
 }
 
-func NewTestRedisWithPassword(t *testing.T, password string) (address string, done func()) {
-	l, err := net.Listen("tcp", "127.0.0.1:0")
+func NewTestRedis(t testing.TB) (address string, done func()) {
+	return newTestRedisWithOptions(t, options{})
+}
+
+func NewTestRedisWithPassword(t testing.TB, password string) (address string, done func()) {
+	return newTestRedisWithOptions(t, options{password: password})
+}
+
+func newTestRedisWithOptions(t testing.TB, opts options) (address string, done func()) {
+	var args []string
+	if opts.password != "" {
+		args = append(args, "--requirepass", opts.password)
+	}
+
+	start := time.Now()
+
+	network, err := redisTestNetwork.acquire()
 	if err != nil {
-		t.Fatal(err)
-	}
-	address = l.Addr().String()
-	port := strconv.Itoa(l.Addr().(*net.TCPAddr).Port)
-	l.Close()
-
-	args := []string{"--port", port}
-	if password != "" {
-		args = append(args, "--requirepass", password)
+		t.Fatalf("Failed to get redis test network: %v", err)
 	}
 
-	ctx, stop := context.WithCancel(context.Background())
+	// first testcontainer start takes longer than subsequent
+	ctx, cancel := context.WithTimeout(context.Background(), 40*time.Second)
+	defer cancel()
 
-	cmd := exec.CommandContext(ctx, "redis-server", args...) // #nosec
-	if err := cmd.Start(); err != nil {
+	port, err := nat.NewPort("tcp", "6379")
+	if err != nil {
+		t.Fatalf("Failed to get new nat port: %v", err)
+	}
+
+	image := "redis:7-alpine"
+	if opts.image != "" {
+		image = opts.image
+	}
+
+	container, err := testcontainers.GenericContainer(ctx, testcontainers.GenericContainerRequest{
+		ContainerRequest: testcontainers.ContainerRequest{
+			Image:        image,
+			Cmd:          args,
+			ExposedPorts: []string{"6379/tcp"},
+			Networks:     []string{network.Name},
+			WaitingFor: wait.ForAll(
+				wait.ForLog("* Ready to accept connections"),
+				wait.NewHostPortStrategy(port),
+			),
+		},
+		Started: true,
+	})
+	if err != nil {
 		t.Fatalf("Failed to start redis server: %v", err)
 	}
 
-	if err := ping(address, password); err != nil {
+	ctx, cancel = context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	ip, err := container.ContainerIP(ctx)
+	if err != nil {
+		t.Fatalf("Failed to get redis container ip: %v", err)
+	}
+	address = net.JoinHostPort(ip, "6379")
+
+	t.Logf("Started redis server at %s in %v", address, time.Since(start))
+
+	if err := ping(ctx, address, opts.password); err != nil {
 		t.Fatalf("Failed to ping redis server: %v", err)
 	}
 
-	t.Logf("Started redis server at %s", address)
 	done = func() {
 		t.Logf("Stopping redis server at %s", address)
-		stop()
-		cmd.Wait()
+
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+
+		if err := container.Terminate(ctx); err != nil {
+			t.Fatalf("Failed to stop redis: %v", err)
+		}
+
+		redisTestNetwork.release()
 	}
 	return
 }
 
-func ping(address, password string) error {
-	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
-	defer cancel()
-
+func ping(ctx context.Context, address, password string) error {
 	rdb := redis.NewClient(&redis.Options{Addr: address, Password: password})
 	defer rdb.Close()
 

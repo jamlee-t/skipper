@@ -87,8 +87,9 @@ func testLoopback(
 
 		w.Header().Set("X-Backend-Done", "true")
 	}))
+	defer backend.Close()
 
-	routes = strings.Replace(routes, "$backend", backend.URL, -1)
+	routes = strings.ReplaceAll(routes, "$backend", backend.URL)
 
 	fr := builtin.MakeRegistry()
 	fr.Register(&preserveOriginalSpec{})

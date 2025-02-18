@@ -2,9 +2,11 @@ package filters
 
 import (
 	"errors"
-	log "github.com/sirupsen/logrus"
+	"io"
 	"net/http"
 	"time"
+
+	log "github.com/sirupsen/logrus"
 
 	"github.com/opentracing/opentracing-go"
 )
@@ -25,11 +27,17 @@ const (
 	// BackendTimeout is the key used in the state bag to configure backend timeout in proxy
 	BackendTimeout = "backend:timeout"
 
+	// ReadTimeout is the key used in the state bag to configure read request body timeout in proxy
+	ReadTimeout = "read:timeout"
+
+	// WriteTimeout is the key used in the state bag to configure write response body timeout in proxy
+	WriteTimeout = "write:timeout"
+
 	// BackendRatelimit is the key used in the state bag to configure backend ratelimit in proxy
 	BackendRatelimit = "backend:ratelimit"
 )
 
-// Context object providing state and information that is unique to a request.
+// FilterContext object providing state and information that is unique to a request.
 type FilterContext interface {
 	// The response writer object belonging to the incoming request. Used by
 	// filters that handle the requests themselves.
@@ -100,9 +108,16 @@ type FilterContext interface {
 	Metrics() Metrics
 
 	// Allow filters to add Tags, Baggage to the trace or set the ComponentName.
+	//
+	// Deprecated: OpenTracing is deprecated, see https://github.com/zalando/skipper/issues/2104.
+	// Use opentracing.SpanFromContext(ctx.Request().Context()).Tracer() to get the Tracer.
 	Tracer() opentracing.Tracer
 
 	// Allow filters to create their own spans
+	//
+	// Deprecated: OpenTracing is deprecated, see https://github.com/zalando/skipper/issues/2104.
+	// Filter spans should be children of the request span,
+	// use opentracing.SpanFromContext(ctx.Request().Context()) to get it.
 	ParentSpan() opentracing.Span
 
 	// Returns a clone of the FilterContext including a brand new request object.
@@ -115,6 +130,16 @@ type FilterContext interface {
 
 	// Performs a new route lookup and executes the matched route if any
 	Loopback()
+
+	Logger() FilterContextLogger
+}
+
+// FilterContextLogger is the logger which logs messages with additional context information.
+type FilterContextLogger interface {
+	Debugf(format string, args ...interface{})
+	Infof(format string, args ...interface{})
+	Warnf(format string, args ...interface{})
+	Errorf(format string, args ...interface{})
 }
 
 // Metrics provides possibility to use custom metrics from filter implementations. The custom metrics will
@@ -150,6 +175,15 @@ type Filter interface {
 	Response(FilterContext)
 }
 
+// FilterCloser are Filters that need to cleanup resources after
+// filter termination. For example Filters, that create a goroutine
+// for some reason need to cleanup their goroutine or they would leak
+// goroutines.
+type FilterCloser interface {
+	Filter
+	io.Closer
+}
+
 // Spec objects are specifications for filters. When initializing the routes,
 // the Filter instances are created using the Spec objects found in the
 // registry.
@@ -180,10 +214,13 @@ func (r Registry) Register(s Spec) {
 // All Skipper filter names
 const (
 	BackendIsProxyName                         = "backendIsProxy"
+	CommentName                                = "comment"
+	AnnotateName                               = "annotate"
 	ModRequestHeaderName                       = "modRequestHeader"
 	SetRequestHeaderName                       = "setRequestHeader"
 	AppendRequestHeaderName                    = "appendRequestHeader"
 	DropRequestHeaderName                      = "dropRequestHeader"
+	ModResponseHeaderName                      = "modResponseHeader"
 	SetResponseHeaderName                      = "setResponseHeader"
 	AppendResponseHeaderName                   = "appendResponseHeader"
 	DropResponseHeaderName                     = "dropResponseHeader"
@@ -212,19 +249,30 @@ const (
 	XforwardFirstName                          = "xforwardFirst"
 	RandomContentName                          = "randomContent"
 	RepeatContentName                          = "repeatContent"
+	RepeatContentHexName                       = "repeatContentHex"
+	WrapContentName                            = "wrapContent"
+	WrapContentHexName                         = "wrapContentHex"
 	BackendTimeoutName                         = "backendTimeout"
+	ReadTimeoutName                            = "readTimeout"
+	WriteTimeoutName                           = "writeTimeout"
+	BlockName                                  = "blockContent"
+	BlockHexName                               = "blockContentHex"
 	LatencyName                                = "latency"
 	BandwidthName                              = "bandwidth"
 	ChunksName                                 = "chunks"
 	BackendLatencyName                         = "backendLatency"
 	BackendBandwidthName                       = "backendBandwidth"
 	BackendChunksName                          = "backendChunks"
+	TarpitName                                 = "tarpit"
 	AbsorbName                                 = "absorb"
 	AbsorbSilentName                           = "absorbSilent"
 	UniformRequestLatencyName                  = "uniformRequestLatency"
-	NormalRequestLatencyName                   = "normalRequestLatency"
 	UniformResponseLatencyName                 = "uniformResponseLatency"
+	NormalRequestLatencyName                   = "normalRequestLatency"
 	NormalResponseLatencyName                  = "normalResponseLatency"
+	HistogramRequestLatencyName                = "histogramRequestLatency"
+	HistogramResponseLatencyName               = "histogramResponseLatency"
+	LogBodyName                                = "logBody"
 	LogHeaderName                              = "logHeader"
 	TeeName                                    = "tee"
 	TeenfName                                  = "teenf"
@@ -239,6 +287,7 @@ const (
 	OAuthTokeninfoAllScopeName                 = "oauthTokeninfoAllScope"
 	OAuthTokeninfoAnyKVName                    = "oauthTokeninfoAnyKV"
 	OAuthTokeninfoAllKVName                    = "oauthTokeninfoAllKV"
+	OAuthTokeninfoValidateName                 = "oauthTokeninfoValidate"
 	OAuthTokenintrospectionAnyClaimsName       = "oauthTokenintrospectionAnyClaims"
 	OAuthTokenintrospectionAllClaimsName       = "oauthTokenintrospectionAllClaims"
 	OAuthTokenintrospectionAnyKVName           = "oauthTokenintrospectionAnyKV"
@@ -254,21 +303,27 @@ const (
 	GrantLogoutName                            = "grantLogout"
 	GrantClaimsQueryName                       = "grantClaimsQuery"
 	JwtValidationName                          = "jwtValidation"
+	JwtMetricsName                             = "jwtMetrics"
 	OAuthOidcUserInfoName                      = "oauthOidcUserInfo"
 	OAuthOidcAnyClaimsName                     = "oauthOidcAnyClaims"
 	OAuthOidcAllClaimsName                     = "oauthOidcAllClaims"
-	RequestCookieName                          = "requestCookie"
 	OidcClaimsQueryName                        = "oidcClaimsQuery"
+	DropRequestCookieName                      = "dropRequestCookie"
+	DropResponseCookieName                     = "dropResponseCookie"
+	RequestCookieName                          = "requestCookie"
 	ResponseCookieName                         = "responseCookie"
 	JsCookieName                               = "jsCookie"
 	ConsecutiveBreakerName                     = "consecutiveBreaker"
 	RateBreakerName                            = "rateBreaker"
 	DisableBreakerName                         = "disableBreaker"
+	AdmissionControlName                       = "admissionControl"
 	ClientRatelimitName                        = "clientRatelimit"
 	RatelimitName                              = "ratelimit"
 	ClusterClientRatelimitName                 = "clusterClientRatelimit"
 	ClusterRatelimitName                       = "clusterRatelimit"
+	ClusterLeakyBucketRatelimitName            = "clusterLeakyBucketRatelimit"
 	BackendRateLimitName                       = "backendRatelimit"
+	RatelimitFailClosedName                    = "ratelimitFailClosed"
 	LuaName                                    = "lua"
 	CorsOriginName                             = "corsOrigin"
 	HeaderToQueryName                          = "headerToQuery"
@@ -284,20 +339,31 @@ const (
 	SetDynamicBackendScheme                    = "setDynamicBackendScheme"
 	SetDynamicBackendUrl                       = "setDynamicBackendUrl"
 	ApiUsageMonitoringName                     = "apiUsageMonitoring"
+	FifoName                                   = "fifo"
+	FifoWithBodyName                           = "fifoWithBody"
 	LifoName                                   = "lifo"
 	LifoGroupName                              = "lifoGroup"
 	RfcPathName                                = "rfcPath"
 	RfcHostName                                = "rfcHost"
 	BearerInjectorName                         = "bearerinjector"
+	SetRequestHeaderFromSecretName             = "setRequestHeaderFromSecret"
 	TracingBaggageToTagName                    = "tracingBaggageToTag"
 	StateBagToTagName                          = "stateBagToTag"
 	TracingTagName                             = "tracingTag"
+	TracingTagFromResponseName                 = "tracingTagFromResponse"
+	TracingTagFromResponseIfStatusName         = "tracingTagFromResponseIfStatus"
 	TracingSpanNameName                        = "tracingSpanName"
 	OriginMarkerName                           = "originMarker"
 	FadeInName                                 = "fadeIn"
 	EndpointCreatedName                        = "endpointCreated"
 	ConsistentHashKeyName                      = "consistentHashKey"
 	ConsistentHashBalanceFactorName            = "consistentHashBalanceFactor"
+	OpaAuthorizeRequestName                    = "opaAuthorizeRequest"
+	OpaAuthorizeRequestWithBodyName            = "opaAuthorizeRequestWithBody"
+	OpaServeResponseName                       = "opaServeResponse"
+	OpaServeResponseWithReqBodyName            = "opaServeResponseWithReqBody"
+	TLSName                                    = "tlsPassClientCertificates"
+	AWSSigV4Name                               = "awsSigv4"
 
 	// Undocumented filters
 	HealthCheckName        = "healthcheck"

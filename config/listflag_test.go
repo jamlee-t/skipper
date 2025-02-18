@@ -107,4 +107,24 @@ func TestListFlag(t *testing.T) {
 			t.Error("unexpected string representation from yaml", output, input)
 		}
 	})
+
+	t.Run("unmarshal error", func(t *testing.T) {
+		const input = "invalid yaml"
+		current := commaListFlag()
+		if err := yaml.Unmarshal([]byte(input), current); err == nil {
+			t.Errorf("Failed to get error from Unmarshal() for invalid input: %q", input)
+		}
+
+	})
+
+	t.Run("empty value", func(t *testing.T) {
+		f := commaListFlag()
+		if err := f.Set(""); err != nil {
+			t.Fatal(err)
+		}
+
+		if f.value != "" || f.values != nil {
+			t.Errorf("failed to parse flags: %q %v (%d)", f.value, f.values, len(f.values))
+		}
+	})
 }

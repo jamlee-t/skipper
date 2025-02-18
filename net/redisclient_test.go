@@ -2,6 +2,8 @@ package net
 
 import (
 	"context"
+	"fmt"
+	"sync"
 	"testing"
 	"time"
 
@@ -10,14 +12,124 @@ import (
 	"github.com/zalando/skipper/tracing/tracers/basic"
 )
 
+func TestRedisContainer(t *testing.T) {
+	redisAddr, done := redistest.NewTestRedis(t)
+	defer done()
+	if redisAddr == "" {
+		t.Fatal("Failed to create redis 1")
+	}
+	redisAddr2, done2 := redistest.NewTestRedis(t)
+	defer done2()
+	if redisAddr2 == "" {
+		t.Fatal("Failed to create redis 2")
+	}
+}
+
+func Test_hasAll(t *testing.T) {
+	for _, tt := range []struct {
+		name string
+		a    []string
+		h    map[string]struct{}
+		want bool
+	}{
+		{
+			name: "both empty",
+			a:    nil,
+			h:    nil,
+			want: true,
+		},
+		{
+			name: "a empty",
+			a:    nil,
+			h: map[string]struct{}{
+				"foo": {},
+			},
+			want: false,
+		},
+		{
+			name: "h empty",
+			a:    []string{"foo"},
+			h:    nil,
+			want: false,
+		},
+		{
+			name: "both set equal",
+			a:    []string{"foo"},
+			h: map[string]struct{}{
+				"foo": {},
+			},
+			want: true,
+		},
+		{
+			name: "both set notequal",
+			a:    []string{"fo"},
+			h: map[string]struct{}{
+				"foo": {},
+			},
+			want: false,
+		},
+		{
+			name: "both set multiple equal",
+			a:    []string{"bar", "foo"},
+			h: map[string]struct{}{
+				"foo": {},
+				"bar": {},
+			},
+			want: true,
+		}} {
+		t.Run(tt.name, func(t *testing.T) {
+			got := hasAll(tt.a, tt.h)
+			if tt.want != got {
+				t.Fatalf("Failed to get %v for hasall(%v, %v)", tt.want, tt.a, tt.h)
+			}
+		})
+	}
+}
+
+type addressUpdater struct {
+	addrs []string
+	mu    sync.Mutex
+	n     int
+}
+
+// update returns non empty subsequences of addrs,
+// e.g. for [foo bar baz] it returns:
+// 1: [foo]
+// 2: [foo bar]
+// 3: [foo bar baz]
+// 4: [foo]
+// 5: [foo bar]
+// 6: [foo bar baz]
+// ...
+func (u *addressUpdater) update() ([]string, error) {
+	u.mu.Lock()
+	defer u.mu.Unlock()
+
+	result := u.addrs[0 : 1+u.n%len(u.addrs)]
+	u.n++
+	return result, nil
+}
+
+func (u *addressUpdater) calls() int {
+	u.mu.Lock()
+	defer u.mu.Unlock()
+
+	return u.n
+}
+
 func TestRedisClient(t *testing.T) {
 	tracer, err := basic.InitTracer([]string{"recorder=in-memory"})
 	if err != nil {
 		t.Fatalf("Failed to get a tracer: %v", err)
 	}
+	defer tracer.Close()
 
 	redisAddr, done := redistest.NewTestRedis(t)
 	defer done()
+	redisAddr2, done2 := redistest.NewTestRedis(t)
+	defer done2()
+
+	updater := &addressUpdater{addrs: []string{redisAddr, redisAddr2}}
 
 	for _, tt := range []struct {
 		name    string
@@ -28,6 +140,14 @@ func TestRedisClient(t *testing.T) {
 			name: "All defaults",
 			options: &RedisOptions{
 				Addrs: []string{redisAddr},
+			},
+			wantErr: false,
+		},
+		{
+			name: "With AddrUpdater",
+			options: &RedisOptions{
+				AddrUpdater:    updater.update,
+				UpdateInterval: 10 * time.Millisecond,
 			},
 			wantErr: false,
 		},
@@ -51,16 +171,49 @@ func TestRedisClient(t *testing.T) {
 		tt := tt
 		t.Run(tt.name, func(t *testing.T) {
 			cli := NewRedisRingClient(tt.options)
+			defer func() {
+				if !cli.closed {
+					t.Error("Failed to close redis ring client")
+				}
+			}()
 			defer cli.Close()
 
 			if !cli.RingAvailable() {
-				t.Errorf("Failed to have a connected redis client, ring not available")
+				t.Error("Failed to have a connected redis client, ring not available")
 			}
 
-			// can't compare these
-			// if tt.options.Tracer != opentracing.Tracer{} { // cli.tracer == opentracing.Tracer{}{
-			// 	t.Errorf("Found an unexpected tracer, want: %v, got: %v", tt.options.Tracer, cli.tracer)
-			// }
+			if tt.options.AddrUpdater != nil {
+				// test address updater is called
+				initial := updater.calls()
+
+				time.Sleep(2 * cli.options.UpdateInterval)
+
+				if updater.calls() == initial {
+					t.Errorf("expected updater call")
+				}
+
+				// test close stops background update
+				cli.Close()
+
+				time.Sleep(2 * cli.options.UpdateInterval)
+
+				afterClose := updater.calls()
+
+				time.Sleep(2 * cli.options.UpdateInterval)
+
+				if updater.calls() != afterClose {
+					t.Errorf("expected no updater call")
+				}
+
+				if !cli.closed {
+					t.Error("Failed to close")
+				}
+			}
+
+			if tt.options.Tracer != nil {
+				span := cli.StartSpan("test")
+				span.Finish()
+			}
 
 			if tt.options.ConnMetricsInterval != defaultConnMetricsInterval {
 				cli.StartMetricsCollection()
@@ -874,5 +1027,75 @@ func TestRedisClientZRangeByScoreWithScoresFirst(t *testing.T) {
 			}
 
 		})
+	}
+}
+
+func TestRedisClientSetAddr(t *testing.T) {
+	redisAddr1, done1 := redistest.NewTestRedis(t)
+	defer done1()
+	redisAddr2, done2 := redistest.NewTestRedis(t)
+	defer done2()
+
+	for _, tt := range []struct {
+		name        string
+		options     *RedisOptions
+		redisUpdate []string
+		keys        []string
+		vals        []string
+	}{
+		{
+			name: "no redis change",
+			options: &RedisOptions{
+				Addrs: []string{redisAddr1, redisAddr2},
+			},
+			keys: []string{"foo1", "foo2", "foo3", "foo4", "foo5"},
+			vals: []string{"bar1", "bar2", "bar3", "bar4", "bar5"},
+		},
+		{
+			name: "with redis change",
+			options: &RedisOptions{
+				Addrs: []string{redisAddr1},
+			},
+			redisUpdate: []string{
+				redisAddr1,
+				redisAddr2,
+			},
+			keys: []string{"foo1", "foo2", "foo3", "foo4", "foo5"},
+			vals: []string{"bar1", "bar2", "bar3", "bar4", "bar5"},
+		},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			r := NewRedisRingClient(tt.options)
+			defer r.Close()
+			for i := 0; i < len(tt.keys); i++ {
+				r.Set(context.Background(), tt.keys[i], tt.vals[i], time.Second)
+			}
+			if len(tt.redisUpdate) != len(tt.options.Addrs) {
+				r.SetAddrs(context.Background(), tt.redisUpdate)
+			}
+			for i := 0; i < len(tt.keys); i++ {
+				got, err := r.Get(context.Background(), tt.keys[i])
+				if err != nil {
+					t.Fatal(err)
+				}
+				if got != tt.vals[i] {
+					t.Errorf("Failed to get key '%s' wanted '%s', got '%s'", tt.keys[i], tt.vals[i], got)
+				}
+			}
+		})
+	}
+}
+
+func TestRedisClientFailingAddrUpdater(t *testing.T) {
+	cli := NewRedisRingClient(&RedisOptions{
+		AddrUpdater: func() ([]string, error) {
+			return nil, fmt.Errorf("failed to get addresses")
+		},
+		UpdateInterval: 1 * time.Second,
+	})
+	defer cli.Close()
+
+	if cli.RingAvailable() {
+		t.Error("Unexpected available ring")
 	}
 }

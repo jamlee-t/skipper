@@ -3,6 +3,7 @@ package eskipfile
 import (
 	"os"
 	"reflect"
+	"sync"
 
 	"github.com/zalando/skipper/eskip"
 )
@@ -21,6 +22,7 @@ type WatchClient struct {
 	getAll     chan (chan<- watchResponse)
 	getUpdates chan (chan<- watchResponse)
 	quit       chan struct{}
+	once       sync.Once
 }
 
 // Watch creates a route configuration client with file watching. Watch doesn't follow file system nodes, it
@@ -31,6 +33,7 @@ func Watch(name string) *WatchClient {
 		getAll:     make(chan (chan<- watchResponse)),
 		getUpdates: make(chan (chan<- watchResponse)),
 		quit:       make(chan struct{}),
+		once:       sync.Once{},
 	}
 
 	go c.watch()
@@ -142,7 +145,11 @@ func (c *WatchClient) watch() {
 // LoadAll returns the parsed route definitions found in the file.
 func (c *WatchClient) LoadAll() ([]*eskip.Route, error) {
 	req := make(chan watchResponse)
-	c.getAll <- req
+	select {
+	case c.getAll <- req:
+	case <-c.quit:
+		return nil, nil
+	}
 	rsp := <-req
 	return rsp.routes, rsp.err
 }
@@ -150,12 +157,18 @@ func (c *WatchClient) LoadAll() ([]*eskip.Route, error) {
 // LoadUpdate returns differential updates when a watched file has changed.
 func (c *WatchClient) LoadUpdate() ([]*eskip.Route, []string, error) {
 	req := make(chan watchResponse)
-	c.getUpdates <- req
+	select {
+	case c.getUpdates <- req:
+	case <-c.quit:
+		return nil, nil, nil
+	}
 	rsp := <-req
 	return rsp.routes, rsp.deletedIDs, rsp.err
 }
 
 // Close stops watching the configured file and providing updates.
 func (c *WatchClient) Close() {
-	close(c.quit)
+	c.once.Do(func() {
+		close(c.quit)
+	})
 }

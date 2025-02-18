@@ -3,8 +3,8 @@ Package source implements a custom predicate to match routes
 based on the source IP of a request.
 
 It is similar in function and usage to the header predicate but
-has explicit support for IP adresses and netmasks to conveniently
-create routes based on a whole network of adresses, like a company
+has explicit support for IP addresses and netmasks to conveniently
+create routes based on a whole network of addresses, like a company
 network or something similar.
 
 It is important to note, that this predicate should not be used as
@@ -25,17 +25,17 @@ the X-Forwarded-For header and SourceFromLast() as last entry.
 
 Examples:
 
-    // only match requests from 1.2.3.4
-    example1: Source("1.2.3.4") -> "http://example.org";
+	// only match requests from 1.2.3.4
+	example1: Source("1.2.3.4") -> "http://example.org";
 
-    // only match requests from 1.2.3.0 - 1.2.3.255
-    example2: Source("1.2.3.0/24") -> "http://example.org";
+	// only match requests from 1.2.3.0 - 1.2.3.255
+	example2: Source("1.2.3.0/24") -> "http://example.org";
 
-    // only match requests from 1.2.3.4 and the 2.2.2.0/24 network
-    example3: Source("1.2.3.4", "2.2.2.0/24") -> "http://example.org";
+	// only match requests from 1.2.3.4 and the 2.2.2.0/24 network
+	example3: Source("1.2.3.4", "2.2.2.0/24") -> "http://example.org";
 
-    // same as example3, only match requests from 1.2.3.4 and the 2.2.2.0/24 network
-    example4: SourceFromLast("1.2.3.4", "2.2.2.0/24") -> "http://example.org";
+	// same as example3, only match requests from 1.2.3.4 and the 2.2.2.0/24 network
+	example4: SourceFromLast("1.2.3.4", "2.2.2.0/24") -> "http://example.org";
 */
 package source
 
@@ -43,10 +43,12 @@ import (
 	"errors"
 	"net"
 	"net/http"
+	"net/netip"
 
 	snet "github.com/zalando/skipper/net"
 	"github.com/zalando/skipper/predicates"
 	"github.com/zalando/skipper/routing"
+	"go4.org/netipx"
 )
 
 const (
@@ -58,7 +60,7 @@ const (
 	NameClientIP = predicates.ClientIPName
 )
 
-var InvalidArgsError = errors.New("invalid arguments")
+var errInvalidArgs = errors.New("invalid arguments")
 
 type sourcePred int
 
@@ -74,7 +76,7 @@ type spec struct {
 
 type predicate struct {
 	typ  sourcePred
-	nets snet.IPNets
+	nets *netipx.IPSet
 }
 
 func New() routing.PredicateSpec         { return &spec{typ: source} }
@@ -94,7 +96,7 @@ func (s *spec) Name() string {
 
 func (s *spec) Create(args []interface{}) (routing.Predicate, error) {
 	if len(args) == 0 {
-		return nil, InvalidArgsError
+		return nil, errInvalidArgs
 	}
 
 	var cidrs []string
@@ -102,11 +104,11 @@ func (s *spec) Create(args []interface{}) (routing.Predicate, error) {
 		if s, ok := args[i].(string); ok {
 			cidrs = append(cidrs, s)
 		} else {
-			return nil, InvalidArgsError
+			return nil, errInvalidArgs
 		}
 	}
 
-	nets, err := snet.ParseCIDRs(cidrs)
+	nets, err := snet.ParseIPCIDRs(cidrs)
 	if err != nil {
 		return nil, err
 	}
@@ -115,15 +117,15 @@ func (s *spec) Create(args []interface{}) (routing.Predicate, error) {
 }
 
 func (p *predicate) Match(r *http.Request) bool {
-	var src net.IP
+	var src netip.Addr
 	switch p.typ {
 	case sourceFromLast:
-		src = snet.RemoteHostFromLast(r)
+		src = snet.RemoteAddrFromLast(r)
 	case clientIP:
 		h, _, _ := net.SplitHostPort(r.RemoteAddr)
-		src = net.ParseIP(h)
+		src, _ = netip.ParseAddr(h)
 	default:
-		src = snet.RemoteHost(r)
+		src = snet.RemoteAddr(r)
 	}
-	return p.nets.Contain(src)
+	return p.nets.Contains(src)
 }

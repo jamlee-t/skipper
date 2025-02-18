@@ -1,6 +1,3 @@
-//go:build !race
-// +build !race
-
 package routestring_test
 
 import (
@@ -28,19 +25,18 @@ func Example() {
 			CustomDataClients: []routing.DataClient{rs},
 		})
 	}()
-	time.Sleep(1 * time.Millisecond)
+	// Wait for Skipper to start
+	time.Sleep(100 * time.Millisecond)
 
 	rsp, err := http.Get("http://localhost:9999")
 	if err != nil {
-		log.Println(err)
-		return
+		log.Fatal(err)
 	}
-
 	defer rsp.Body.Close()
+
 	content, err := io.ReadAll(rsp.Body)
 	if err != nil {
-		log.Println(err)
-		return
+		log.Fatal(err)
 	}
 
 	fmt.Println(string(content))

@@ -3,13 +3,15 @@ package routesrv
 import (
 	"context"
 	"fmt"
+	"sort"
 	"sync"
 	"time"
 
 	ot "github.com/opentracing/opentracing-go"
-	"github.com/prometheus/client_golang/prometheus"
-	"github.com/prometheus/client_golang/prometheus/promauto"
 	log "github.com/sirupsen/logrus"
+	"github.com/zalando/skipper/eskip"
+	"github.com/zalando/skipper/filters/auth"
+	"github.com/zalando/skipper/metrics"
 	"github.com/zalando/skipper/routing"
 	"github.com/zalando/skipper/tracing"
 )
@@ -23,53 +25,43 @@ const (
 	LogRoutesUpdated        = "routes updated"
 )
 
-var (
-	pollingStarted = promauto.NewGauge(prometheus.GaugeOpts{
-		Namespace: "routesrv",
-		Name:      "polling_started_timestamp",
-		Help:      "UNIX time when the routes polling has started",
-	})
-	routesInitialized = promauto.NewGauge(prometheus.GaugeOpts{
-		Namespace: "routesrv",
-		Name:      "routes_initialized_timestamp",
-		Help:      "UNIX time when the first routes were received and stored",
-	})
-	routesUpdated = promauto.NewGauge(prometheus.GaugeOpts{
-		Namespace: "routesrv",
-		Name:      "routes_updated_timestamp",
-		Help:      "UNIX time of the last routes update (initial load counts as well)",
-	})
-)
-
 type poller struct {
 	client  routing.DataClient
 	b       *eskipBytes
 	timeout time.Duration
 	quit    chan struct{}
 
-	tracer ot.Tracer
+	// Preprocessors
+	defaultFilters *eskip.DefaultFilters
+	oauth2Config   *auth.OAuthConfig
+	editRoute      []*eskip.Editor
+	cloneRoute     []*eskip.Clone
+
+	// visibility
+	tracer  ot.Tracer
+	metrics metrics.Metrics
 }
 
 func (p *poller) poll(wg *sync.WaitGroup) {
 	defer wg.Done()
 
-	var (
-		routesCount, routesBytes int
-		initialized              bool
-		msg                      string
-	)
-
 	log.WithField("timeout", p.timeout).Info(LogPollingStarted)
-	pollingStarted.SetToCurrentTime()
+	ticker := time.NewTicker(p.timeout)
+	defer ticker.Stop()
+	p.setGaugeToCurrentTime("polling_started_timestamp")
+
+	var lastRoutesById map[string]string
 	for {
 		span := tracing.CreateSpan("poll_routes", context.TODO(), p.tracer)
 
 		routes, err := p.client.LoadAll()
-		routesCount = len(routes)
+		routes = p.process(routes)
+		routesCount := len(routes)
 
 		switch {
 		case err != nil:
 			log.WithError(err).Error(LogRoutesFetchingFailed)
+			p.metrics.IncCounter("routes.fetch_errors")
 
 			span.SetTag("error", true)
 			span.LogKV(
@@ -77,26 +69,33 @@ func (p *poller) poll(wg *sync.WaitGroup) {
 				"message", fmt.Sprintf("%s: %s", LogRoutesFetchingFailed, err),
 			)
 		case routesCount == 0:
-			log.Error(LogRoutesEmpty)
-
-			span.SetTag("error", true)
-			span.LogKV(
-				"event", "error",
-				"message", msg,
-			)
+			log.Info(LogRoutesEmpty)
+			p.metrics.IncCounter("routes.empty")
+			span.SetTag("routes.count", routesCount)
 		case routesCount > 0:
-			routesBytes, initialized = p.b.formatAndSet(routes)
-			logger := log.WithFields(log.Fields{"count": routesCount, "bytes": routesBytes})
+			routesBytes, routesHash, initialized, updated := p.b.formatAndSet(routes)
+			logger := log.WithFields(log.Fields{"count": routesCount, "bytes": routesBytes, "hash": routesHash})
 			if initialized {
 				logger.Info(LogRoutesInitialized)
 				span.SetTag("routes.initialized", true)
-				routesInitialized.SetToCurrentTime()
-			} else {
-				logger.Info(LogRoutesUpdated)
+				p.setGaugeToCurrentTime("routes.initialized_timestamp")
 			}
-			routesUpdated.SetToCurrentTime()
+			if updated {
+				logger.Info(LogRoutesUpdated)
+				span.SetTag("routes.updated", true)
+				p.setGaugeToCurrentTime("routes.updated_timestamp")
+				p.metrics.UpdateGauge("routes.total", float64(routesCount))
+				p.metrics.UpdateGauge("routes.byte", float64(routesBytes))
+			}
 			span.SetTag("routes.count", routesCount)
 			span.SetTag("routes.bytes", routesBytes)
+			span.SetTag("routes.hash", routesHash)
+
+			if updated && log.IsLevelEnabled(log.DebugLevel) {
+				routesById := mapRoutes(routes)
+				logChanges(routesById, lastRoutesById)
+				lastRoutesById = routesById
+			}
 		}
 
 		span.Finish()
@@ -105,7 +104,91 @@ func (p *poller) poll(wg *sync.WaitGroup) {
 		case <-p.quit:
 			log.Info(LogPollingStopped)
 			return
-		case <-time.After(p.timeout):
+		case <-ticker.C:
 		}
 	}
+}
+
+func (p *poller) process(routes []*eskip.Route) []*eskip.Route {
+
+	if p.defaultFilters != nil {
+		routes = p.defaultFilters.Do(routes)
+	}
+	if p.oauth2Config != nil {
+		routes = p.oauth2Config.NewGrantPreprocessor().Do(routes)
+	}
+	for _, editor := range p.editRoute {
+		routes = editor.Do(routes)
+	}
+
+	for _, cloner := range p.cloneRoute {
+		routes = cloner.Do(routes)
+	}
+
+	// sort the routes, otherwise it will lead to different etag values for the same route list for different orders
+	sort.SliceStable(routes, func(i, j int) bool {
+		return routes[i].Id < routes[j].Id
+	})
+
+	return routes
+}
+
+func (p *poller) setGaugeToCurrentTime(name string) {
+	p.metrics.UpdateGauge(name, (float64(time.Now().UnixNano()) / 1e9))
+}
+
+func mapRoutes(routes []*eskip.Route) map[string]string {
+	byId := make(map[string]string)
+	for _, r := range routes {
+		byId[r.Id] = r.String()
+	}
+	return byId
+}
+
+func logChanges(routesById map[string]string, lastRoutesById map[string]string) {
+	logf := func(op string, id string, format string, args ...any) {
+		level := log.GetLevel()
+		fields := log.Fields{"op": op, "id": id}
+		if level == log.TraceLevel {
+			fields["route"] = routesById[id]
+		}
+		log.WithFields(fields).Logf(level, format, args...)
+	}
+
+	inserted := notIn(routesById, lastRoutesById)
+	for i, id := range inserted {
+		logf("inserted", id, "Inserted route %d of %d", i+1, len(inserted))
+	}
+
+	deleted := notIn(lastRoutesById, routesById)
+	for i, id := range deleted {
+		logf("deleted", id, "Deleted route %d of %d", i+1, len(deleted))
+	}
+
+	updated := valueMismatch(routesById, lastRoutesById)
+	for i, id := range updated {
+		logf("updated", id, "Updated route %d of %d", i+1, len(updated))
+	}
+}
+
+func notIn(a, b map[string]string) []string {
+	var ids []string
+	for id := range a {
+		if _, ok := b[id]; !ok {
+			ids = append(ids, id)
+		}
+	}
+	sort.Strings(ids)
+	return ids
+}
+
+func valueMismatch(a, b map[string]string) []string {
+	var ids []string
+	for id, va := range a {
+		if vb, ok := b[id]; ok && va != vb {
+			ids = append(ids, id)
+		}
+	}
+	sort.Strings(ids)
+	return ids
 }

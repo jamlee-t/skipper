@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"io"
 	"math"
+	"sort"
 	"strings"
 )
 
@@ -14,17 +15,17 @@ type PrettyPrintInfo struct {
 }
 
 func escape(s string, chars string) string {
-	s = strings.Replace(s, `\`, `\\`, -1) // escape backslash before others
-	s = strings.Replace(s, "\a", `\a`, -1)
-	s = strings.Replace(s, "\b", `\b`, -1)
-	s = strings.Replace(s, "\f", `\f`, -1)
-	s = strings.Replace(s, "\n", `\n`, -1)
-	s = strings.Replace(s, "\r", `\r`, -1)
-	s = strings.Replace(s, "\t", `\t`, -1)
-	s = strings.Replace(s, "\v", `\v`, -1)
+	s = strings.ReplaceAll(s, `\`, `\\`) // escape backslash before others
+	s = strings.ReplaceAll(s, "\a", `\a`)
+	s = strings.ReplaceAll(s, "\b", `\b`)
+	s = strings.ReplaceAll(s, "\f", `\f`)
+	s = strings.ReplaceAll(s, "\n", `\n`)
+	s = strings.ReplaceAll(s, "\r", `\r`)
+	s = strings.ReplaceAll(s, "\t", `\t`)
+	s = strings.ReplaceAll(s, "\v", `\v`)
 	for i := 0; i < len(chars); i++ {
 		c := chars[i : i+1]
-		s = strings.Replace(s, c, `\`+c, -1)
+		s = strings.ReplaceAll(s, c, `\`+c)
 	}
 
 	return s
@@ -78,6 +79,12 @@ func argsString(args []interface{}) string {
 	return strings.Join(sargs, ", ")
 }
 
+func sortTail(s []string, from int) {
+	if len(s)-from > 1 {
+		sort.Strings(s[from:])
+	}
+}
+
 func (r *Route) predicateString() string {
 	var predicates []string
 
@@ -97,15 +104,19 @@ func (r *Route) predicateString() string {
 		predicates = appendFmtEscape(predicates, `Method("%s")`, `"`, r.Method)
 	}
 
+	from := len(predicates)
 	for k, v := range r.Headers {
 		predicates = appendFmtEscape(predicates, `Header("%s", "%s")`, `"`, k, v)
 	}
+	sortTail(predicates, from)
 
+	from = len(predicates)
 	for k, rxs := range r.HeaderRegexps {
 		for _, rx := range rxs {
 			predicates = appendFmt(predicates, `HeaderRegexp("%s", /%s/)`, escape(k, `"`), escape(rx, "/"))
 		}
 	}
+	sortTail(predicates, from)
 
 	for _, p := range r.Predicates {
 		if p.Name != "Any" {

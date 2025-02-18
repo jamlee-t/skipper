@@ -23,14 +23,14 @@ accessible from JS code running in web browsers.
 
 Examples:
 
-    requestCookie("test-session", "abc")
+	requestCookie("test-session", "abc")
 
-    responseCookie("test-session", "abc", 31536000)
+	responseCookie("test-session", "abc", 31536000)
 
-    responseCookie("test-session", "abc", 31536000, "change-only")
+	responseCookie("test-session", "abc", 31536000, "change-only")
 
-    // response cookie without HttpOnly:
-    jsCookie("test-session-info", "abc-debug", 31536000, "change-only")
+	// response cookie without HttpOnly:
+	jsCookie("test-session-info", "abc-debug", 31536000, "change-only")
 */
 package cookie
 
@@ -38,7 +38,6 @@ import (
 	"net"
 	"net/http"
 	"strings"
-	"time"
 
 	"github.com/zalando/skipper/filters"
 )
@@ -72,8 +71,107 @@ type filter struct {
 	typ        direction
 	name       string
 	value      string
-	ttl        time.Duration
+	maxAge     int
 	changeOnly bool
+}
+
+type dropCookie struct {
+	typ  direction
+	name string
+}
+
+func NewDropRequestCookie() filters.Spec {
+	return &dropCookie{
+		typ: request,
+	}
+}
+
+func NewDropResponseCookie() filters.Spec {
+	return &dropCookie{
+		typ: response,
+	}
+}
+
+func (d *dropCookie) Name() string {
+	switch d.typ {
+	case request:
+		return filters.DropRequestCookieName
+	case response:
+		return filters.DropResponseCookieName
+	}
+	return "unknown"
+}
+
+func (d *dropCookie) CreateFilter(args []interface{}) (filters.Filter, error) {
+	if len(args) != 1 {
+		return nil, filters.ErrInvalidFilterParameters
+	}
+
+	s, ok := args[0].(string)
+	if !ok {
+		return nil, filters.ErrInvalidFilterParameters
+	}
+
+	return &dropCookie{
+		typ:  d.typ,
+		name: s,
+	}, nil
+}
+
+func removeCookie(request *http.Request, name string) bool {
+	cookies := request.Cookies()
+	hasCookie := false
+	for _, c := range cookies {
+		if c.Name == name {
+			hasCookie = true
+			break
+		}
+	}
+
+	if hasCookie {
+		request.Header.Del("Cookie")
+		for _, c := range cookies {
+			if c.Name != name {
+				request.AddCookie(c)
+			}
+		}
+	}
+	return hasCookie
+}
+
+func removeCookieResponse(rsp *http.Response, name string) bool {
+	cookies := rsp.Cookies()
+	hasCookie := false
+	for _, c := range cookies {
+		if c.Name == name {
+			hasCookie = true
+			break
+		}
+	}
+
+	if hasCookie {
+		rsp.Header.Del("Set-Cookie")
+		for _, c := range cookies {
+			if c.Name != name {
+				rsp.Header.Add("Set-Cookie", c.String())
+			}
+		}
+	}
+	return hasCookie
+}
+
+func (d *dropCookie) Request(ctx filters.FilterContext) {
+	if d.typ != request {
+		return
+	}
+	removeCookie(ctx.Request(), d.name)
+}
+
+func (d *dropCookie) Response(ctx filters.FilterContext) {
+	if d.typ != response {
+		return
+	}
+	removeCookieResponse(ctx.Response(), d.name)
 }
 
 // Creates a filter spec for appending cookies to requests.
@@ -117,8 +215,21 @@ func (s *spec) CreateFilter(args []interface{}) (filters.Filter, error) {
 	}
 
 	if len(args) >= 3 {
-		if ttl, ok := args[2].(float64); ok {
-			f.ttl = time.Duration(ttl) * time.Second
+		if maxAge, ok := args[2].(float64); ok {
+			// https://pkg.go.dev/net/http#Cookie uses zero to omit Max-Age attribute:
+			// > MaxAge=0 means no 'Max-Age' attribute specified.
+			// > MaxAge<0 means delete cookie now, equivalently 'Max-Age: 0'
+			// > MaxAge>0 means Max-Age attribute present and given in seconds
+			//
+			// Here we know user specified Max-Age explicitly, so we interpret zero
+			// as a signal to delete the cookie similar to what user would expect naturally,
+			// see https://developer.mozilla.org/en-US/docs/Web/HTTP/Headers/Set-Cookie#max-agenumber
+			// > A zero or negative number will expire the cookie immediately.
+			if maxAge == 0 {
+				f.maxAge = -1
+			} else {
+				f.maxAge = int(maxAge)
+			}
 		} else {
 			return nil, filters.ErrInvalidFilterParameters
 		}
@@ -142,7 +253,7 @@ func (f *filter) Request(ctx filters.FilterContext) {
 }
 
 func (f *filter) Response(ctx filters.FilterContext) {
-	var set func(filters.FilterContext, string, string, time.Duration)
+	var set func(filters.FilterContext, string, string, int)
 	switch f.typ {
 	case request:
 		return
@@ -157,7 +268,7 @@ func (f *filter) Response(ctx filters.FilterContext) {
 	ctx.StateBag()["CookieSet:"+f.name] = f.value
 
 	if !f.changeOnly {
-		set(ctx, f.name, f.value, f.ttl)
+		set(ctx, f.name, f.value, f.maxAge)
 		return
 	}
 
@@ -171,10 +282,10 @@ func (f *filter) Response(ctx filters.FilterContext) {
 		return
 	}
 
-	set(ctx, f.name, f.value, f.ttl)
+	set(ctx, f.name, f.value, f.maxAge)
 }
 
-func setCookie(ctx filters.FilterContext, name, value string, ttl time.Duration, jsEnabled bool) {
+func setCookie(ctx filters.FilterContext, name, value string, maxAge int, jsEnabled bool) {
 	var req = ctx.Request()
 	if ctx.OriginalRequest() != nil {
 		req = ctx.OriginalRequest()
@@ -187,14 +298,15 @@ func setCookie(ctx filters.FilterContext, name, value string, ttl time.Duration,
 		Secure:   true,
 		Domain:   d,
 		Path:     "/",
-		MaxAge:   int(ttl.Seconds())}
+		MaxAge:   maxAge,
+	}
 
 	ctx.Response().Header.Add(SetCookieHttpHeader, c.String())
 }
 
-func configSetCookie(jscookie bool) func(filters.FilterContext, string, string, time.Duration) {
-	return func(ctx filters.FilterContext, name, value string, ttl time.Duration) {
-		setCookie(ctx, name, value, ttl, jscookie)
+func configSetCookie(jscookie bool) func(filters.FilterContext, string, string, int) {
+	return func(ctx filters.FilterContext, name, value string, maxAge int) {
+		setCookie(ctx, name, value, maxAge, jscookie)
 	}
 }
 
